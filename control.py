@@ -342,9 +342,9 @@ class Controller:
         """源设备: ipconfig /renew 从目标 DHCP 获取 IP"""
         try:
             subprocess.run(["ipconfig", "/release"], capture_output=True, timeout=10,
-                           encoding="gbk", errors="replace")
+                           encoding="utf-8", errors="replace")
             subprocess.run(["ipconfig", "/renew"], capture_output=True, timeout=20,
-                           encoding="gbk", errors="replace")
+                           encoding="utf-8", errors="replace")
             time.sleep(2)
             ip = get_local_ip(adapter_desc)
             if ip and ip != "0.0.0.0":
@@ -370,11 +370,11 @@ class Controller:
         if not success:
             try:
                 subprocess.run(["ipconfig", "/release"], capture_output=True, timeout=10,
-                               encoding="gbk", errors="replace")
+                               encoding="utf-8", errors="replace")
                 subprocess.run(["netsh", "interface", "ip", "set", "address",
                                 f'"{adapter_desc}"', "static", SOURCE_IP, "255.255.255.0"],
                                capture_output=True, timeout=10,
-                               encoding="gbk", errors="replace")
+                               encoding="utf-8", errors="replace")
                 self.ui.after(0, lambda: self._log(f"目标 IP: {SOURCE_IP}"))
                 success = True
             except Exception:
@@ -518,28 +518,15 @@ class Controller:
         self._reset_progress("正在连接源设备...")
         self.ui.tk_button_mqfzl35t.config(text="连接中...", state="disabled")
 
-        # 读取用户选择的 IP (在主线程中读取 UI)
-        selected_source_ip = ""
-        if self._use_dhcp:
-            selected_text = self.ui.tk_select_box_discover.get()
-            if selected_text and "|" in selected_text:
-                # 格式: "169.254.100.3 | aa:bb:cc:dd:ee:ff | Hostname"
-                selected_source_ip = selected_text.split("|")[0].strip()
-
         def _connect_and_download():
             source_ip = ""
 
             if self._use_dhcp:
-                if selected_source_ip:
-                    source_ip = selected_source_ip
-                    self.ui.after(0, lambda: self._log(
-                        f"DHCP 模式: 直连选定源设备 {source_ip}:{TRANSFER_PORT}"
-                    ))
-                else:
-                    source_ip = DHCP_ASSIGNED_IP
-                    self.ui.after(0, lambda: self._log(
-                        f"DHCP 模式: 直连源设备 {DHCP_ASSIGNED_IP}:{TRANSFER_PORT}"
-                    ))
+                # DHCP 模式: 源 IP 由目标 DHCP 分配 (169.254.100.2)
+                self.ui.after(0, lambda: self._log(
+                    f"DHCP 模式: 直连源设备 {DHCP_ASSIGNED_IP}:{TRANSFER_PORT}"
+                ))
+                source_ip = DHCP_ASSIGNED_IP
             else:
                 # APIPA 扫描
                 self.ui.after(0, lambda: self._log("APIPA 模式: 扫描源设备..."))
@@ -673,46 +660,11 @@ class Controller:
         if log_msg:
             self._log(log_msg)
 
-    # 日志缓冲区：批量写入，防 after(0) 洪水
-    _log_buffer: list = []
-    _log_buffer_lock = None
-    _log_flush_scheduled = False
-    MAX_LOG_LINES = 3000  # 日志最大行数，超出从头部裁剪
-
     def _log(self, message: str):
-        """向 GUI 日志区域输出日志 (线程安全 + 批量刷新)"""
+        """向 GUI 日志区域输出日志"""
         try:
-            if self._log_buffer_lock is None:
-                import threading as _threading
-                self._log_buffer_lock = _threading.Lock()
-            with self._log_buffer_lock:
-                self._log_buffer.append(message)
-                if not self._log_flush_scheduled:
-                    self._log_flush_scheduled = True
-                    self.ui.after(500, self._flush_log_buffer)
-        except Exception:
-            pass
-
-    def _flush_log_buffer(self):
-        """批量将缓冲区消息写入 widget（始终在主线程执行）"""
-        try:
-            with self._log_buffer_lock:
-                messages = self._log_buffer[:]
-                self._log_buffer.clear()
-                self._log_flush_scheduled = False
-            if not messages:
-                return
-
             text_widget = self.ui.tk_text_mqg105ch
-            batch = "\n".join(messages) + "\n"
-            text_widget.insert("end", batch)
-
-            # 行数上限：超过上限从头部裁剪
-            line_count = int(text_widget.index("end-1c").split(".")[0])
-            if line_count > self.MAX_LOG_LINES:
-                overflow = line_count - self.MAX_LOG_LINES + 500  # 一次多删 500 行
-                text_widget.delete("1.0", f"{overflow}.0")
-
+            text_widget.insert("end", message + "\n")
             text_widget.see("end")
         except Exception:
             pass

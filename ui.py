@@ -3,6 +3,7 @@
 基于 Tkinter/ttk 布局
 """
 import random
+import tkinter as _tk
 from tkinter import *
 from tkinter.ttk import *
 
@@ -24,15 +25,30 @@ class WinGUI(Tk):
         self.tk_select_box_mqg0hm2h = self.__tk_select_box_mqg0hm2h(self)
         self.tk_label_discover = self.__tk_label_discover(self)
         self.tk_select_box_discover = self.__tk_select_box_discover(self)
+        self.tk_label_ip_manual = self.__tk_label_ip_manual(self)
+        self.ip_octet1_var = _tk.StringVar()
+        self.tk_ip_octet1 = self.__tk_ip_octet(self, self.ip_octet1_var, 100)
+        self.tk_label_dot1 = self.__tk_dot_label(self, 144)
+        self.ip_octet2_var = _tk.StringVar()
+        self.tk_ip_octet2 = self.__tk_ip_octet(self, self.ip_octet2_var, 156)
+        self.tk_label_dot2 = self.__tk_dot_label(self, 200)
+        self.ip_octet3_var = _tk.StringVar()
+        self.tk_ip_octet3 = self.__tk_ip_octet(self, self.ip_octet3_var, 212)
+        self.tk_label_dot3 = self.__tk_dot_label(self, 256)
+        self.ip_octet4_var = _tk.StringVar()
+        self.tk_ip_octet4 = self.__tk_ip_octet(self, self.ip_octet4_var, 268)
         self.tk_label_status = self.__tk_label_status(self)
         self.tk_progress_bar = self.__tk_progress_bar(self)
+        self.tk_file_progress_bar = self.__tk_file_progress_bar(self)
         self.tk_label_mqg0zfmi = self.__tk_label_mqg0zfmi(self)
         self.tk_text_mqg105ch = self.__tk_text_mqg105ch(self)
+        # 隐藏的线程进度显示区
+        self.tk_thread_progress_text = self.__tk_thread_progress_text(self)
 
     def __win(self):
         self.title("磁盘拷贝工具 By ZhiyuChen")
         width = 640
-        height = 570
+        height = 640
         screenwidth = self.winfo_screenwidth()
         screenheight = self.winfo_screenheight()
         x = (screenwidth - width) // 2
@@ -114,25 +130,79 @@ class WinGUI(Tk):
         btn.place(x=490, y=165, width=115, height=28)
         return btn
 
+    def __tk_label_ip_manual(self, parent):
+        label = Label(parent, text="手动输入IP:", anchor="w")
+        label.place(x=20, y=195, width=80, height=24)
+        return label
+
+    def __tk_ip_octet(self, parent, var, x):
+        entry = Entry(parent, textvariable=var, width=4, justify="center")
+        entry.place(x=x, y=195, width=42, height=28)
+        return entry
+
+    def __tk_dot_label(self, parent, x):
+        label = Label(parent, text=".", font=("Microsoft YaHei UI", 11, "bold"))
+        label.place(x=x, y=195, width=10, height=24)
+        return label
+
     def __tk_label_status(self, parent):
         label = Label(parent, text="就绪", anchor="w", foreground="#555555")
-        label.place(x=20, y=205, width=595, height=20)
+        label.place(x=20, y=235, width=595, height=20)
         return label
 
     def __tk_progress_bar(self, parent):
         pb = Progressbar(parent, mode="determinate", maximum=100, value=0)
-        pb.place(x=20, y=230, width=595, height=22)
+        pb.place(x=20, y=260, width=595, height=22)
+        return pb
+
+    def __tk_file_progress_bar(self, parent):
+        pb = Progressbar(parent, mode="determinate", maximum=100, value=0)
+        pb.place(x=20, y=288, width=595, height=22)
         return pb
 
     def __tk_label_mqg0zfmi(self, parent):
         label = Label(parent, text="日志", anchor="w")
-        label.place(x=20, y=260, width=50, height=24)
+        label.place(x=20, y=318, width=50, height=24)
         return label
 
     def __tk_text_mqg105ch(self, parent):
         text = Text(parent)
-        text.place(x=20, y=288, width=595, height=265)
+        text.place(x=20, y=346, width=595, height=265)
         return text
+
+    def __tk_thread_progress_text(self, parent):
+        """隐藏的线程进度显示区 (每线程一行)"""
+        text = Text(parent, state="disabled", bg="#F5F5F5", fg="#333333")
+        # 默认隐藏，place_forget 在 Win.__init__ 中调用
+        text.place(x=20, y=346, width=595, height=265)
+        return text
+
+    # ==================== 线程进度显示开关 ====================
+
+    def show_thread_progress(self):
+        """显示线程进度区，隐藏日志区"""
+        self.tk_label_mqg0zfmi.place_forget()
+        self.tk_text_mqg105ch.place_forget()
+        self.tk_thread_progress_text.place(x=20, y=346, width=595, height=265)
+        self.tk_thread_progress_text.configure(state="normal")
+        self.tk_thread_progress_text.delete("1.0", "end")
+        self.tk_thread_progress_text.configure(state="disabled")
+
+    def hide_thread_progress(self):
+        """隐藏线程进度区，恢复日志区"""
+        self.tk_thread_progress_text.place_forget()
+        self.tk_label_mqg0zfmi.place(x=20, y=318, width=50, height=24)
+        self.tk_text_mqg105ch.place(x=20, y=346, width=595, height=265)
+
+    def update_thread_progress(self, lines_text: str):
+        """刷新线程进度显示 (主线程调用, 无竞态)"""
+        try:
+            self.tk_thread_progress_text.configure(state="normal")
+            self.tk_thread_progress_text.delete("1.0", "end")
+            self.tk_thread_progress_text.insert("1.0", lines_text)
+            self.tk_thread_progress_text.configure(state="disabled")
+        except Exception:
+            pass
 
     # ==================== 滚动条 ====================
 
@@ -184,7 +254,7 @@ class Win(WinGUI):
         vbar = Scrollbar(self)
         vbar.config(command=self.tk_text_mqg105ch.yview)
         self.tk_text_mqg105ch.configure(yscrollcommand=vbar.set)
-        vbar.place(x=614, y=288, width=16, height=265)
+        vbar.place(x=614, y=346, width=16, height=265)
 
     def __style_config(self):
         """统一字体和样式"""

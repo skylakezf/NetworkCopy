@@ -105,7 +105,7 @@ def _format_speed(bps: int) -> str:
         gbps = bps / 1_000_000_000
         if gbps >= 10:
             return f"{gbps:.0f}Gbps"
-        return f"{gbps:.1f}Gbps".rstrip("0").rstrip(".") + "Gbps"
+        return f"{gbps:.1f}Gbps".rstrip("0").rstrip(".") + " Gbps协商速率"
     if bps >= 1_000_000:
         mbps = bps / 1_000_000
         return f"{mbps:.0f}Mbps"

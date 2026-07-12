@@ -54,7 +54,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8-sig"))
 
-    def _send_file(self, filepath):
+    def _send_file(self, filepath, file_info=""):
         if not os.path.isfile(filepath):
             self._send_json({"error": "文件不存在"}, 404)
             return
@@ -64,6 +64,13 @@ class FileServerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(file_size))
         self.end_headers()
+
+        # 源设备日志: 显示正在发送的文件
+        if FileServerHandler.log_callback:
+            display = file_info or os.path.basename(filepath)
+            FileServerHandler.log_callback(
+                f"[HTTP] 正在发送: {display} ({_fmt_size(file_size)})"
+            )
 
         with open(filepath, "rb") as f:
             while True:
@@ -182,7 +189,73 @@ class FileServerHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "路径解析失败"}, 400)
             return
 
-        self._send_file(full_path)
+        # 构建可读的文件信息供日志使用
+        file_info = f"{partition}:\\{rel_path.replace('/', '\\\\')}"
+        self._send_file(full_path, file_info=file_info)
+
+    # ---- 小文件批量下载 ----
+    def do_POST(self):
+        try:
+            path = self.path.split("?")[0]
+            if path == "/batch_get":
+                self._handle_batch_get()
+            else:
+                self._send_json({"error": "未知端点"}, 404)
+        except Exception as e:
+            try:
+                self._send_json({"error": str(e)}, 500)
+            except:
+                pass
+
+    def _handle_batch_get(self):
+        """一次 POST 请求下发多个小文件，减少小文件的 HTTP 往返开销"""
+        import struct as _struct
+
+        content_len = int(self.headers.get("Content-Length", 0))
+        if content_len == 0 or content_len > 2 * 1024 * 1024:
+            self._send_json({"error": "请求体为空或过大"}, 400)
+            return
+
+        body = self.rfile.read(content_len)
+        try:
+            req_data = json.loads(body.decode("utf-8-sig"))
+        except Exception:
+            self._send_json({"error": "JSON 解析失败"}, 400)
+            return
+
+        partition = req_data.get("partition", "").upper()
+        paths = req_data.get("paths", [])
+        if partition not in ("D", "E", "F") or not paths:
+            self._send_json({"error": "参数错误"}, 400)
+            return
+
+        # 在内存中读取所有请求的文件
+        file_entries = []  # [(path_bytes, data_bytes), ...]
+        total_body_size = 4  # 开头 4 字节存文件数量
+        for rel_path in paths:
+            full_path = self._resolve_path(partition, rel_path)
+            if not full_path or not os.path.isfile(full_path):
+                continue
+            try:
+                with open(full_path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            path_bytes = rel_path.encode("utf-8")
+            file_entries.append((path_bytes, data))
+            total_body_size += 4 + len(path_bytes) + 8 + len(data)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(total_body_size))
+        self.end_headers()
+
+        self.wfile.write(_struct.pack(">I", len(file_entries)))
+        for path_bytes, data in file_entries:
+            self.wfile.write(_struct.pack(">I", len(path_bytes)))
+            self.wfile.write(path_bytes)
+            self.wfile.write(_struct.pack(">Q", len(data)))
+            self.wfile.write(data)
 
 
 class ThreadingFileServer(ThreadingMixIn, HTTPServer):
@@ -252,6 +325,11 @@ class FileServer:
 # 多线程下载并发数（有线网络通常 4-8 线程最佳）
 DEFAULT_DOWNLOAD_WORKERS = 8
 
+# 小文件批量传输配置
+BATCH_SIZE_THRESHOLD = 1 * 1024 * 1024   # < 1MB 归入批次
+BATCH_MAX_FILES = 200                     # 每批次最多文件数
+BATCH_MAX_TOTAL = 20 * 1024 * 1024        # 每批次最大总字节数 (20MB)
+
 # 线程本地 HTTP 连接池: 每个线程持有一个持久连接，复用避免 TCP 握手开销
 # 关键设计: 连接断开后只标记为死，不立即重建 → 避免 Windows 临时端口耗尽
 import http.client as _http_client
@@ -297,13 +375,38 @@ def _download_single_file(
     completed_bytes_list: list,
     errors: list,
     log_callback=None,
+    file_progress_callback=None,
 ):
-    """下载单个文件（在线程池中执行，复用 HTTP 长连接，无重试防端口耗尽）"""
+    """下载单个文件（在线程池中执行，写 .tmp 后重命名防断点文件损坏）"""
     import urllib.parse as _urlparse
 
     def log(msg):
         if log_callback:
             log_callback(msg)
+
+    # 断点续传: 如果目标文件已存在且大小正确，直接跳过
+    if os.path.isfile(target_path):
+        existing_size = os.path.getsize(target_path)
+        if existing_size == fsize:
+            log(f"  [✓] 跳过(已存在): {rel_path}")
+            with stats_lock:
+                completed_files_list[0] += 1
+                completed_bytes_list[0] += fsize
+            return
+        else:
+            log(f"  [_] 大小不匹配, 重新下载: {rel_path} (已有{existing_size}, 期望{fsize})")
+            try:
+                os.remove(target_path)
+            except OSError:
+                pass
+
+    # 清理上一轮残留的 .tmp 文件
+    tmp_path = target_path + ".tmp"
+    if os.path.isfile(tmp_path):
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
     parsed = _urlparse.urlparse(base_url)
     host = parsed.hostname
@@ -319,26 +422,53 @@ def _download_single_file(
         if resp.status != 200:
             body = resp.read().decode("utf-8-sig", errors="replace")
             log(f"  [X] 下载失败 HTTP {resp.status}: {rel_path} - {body}")
-            # HTTP 错误不代表连接断开，但需要确保读完响应体才能复用
             with stats_lock:
                 errors.append(f"分区 {normal_partition}: {rel_path} HTTP {resp.status}")
             return
 
-        with open(target_path, "wb") as f:
+        # 大文件: 记录开始传输
+        if fsize >= BATCH_SIZE_THRESHOLD:
+            log(f"  [→] 正在拷贝: {rel_path} ({_fmt_size(fsize)})")
+
+        # 写入 .tmp 文件（断点保护: 只有完整下载后才重命名）
+        with open(tmp_path, "wb") as f:
+            file_done = 0
             while True:
                 chunk = resp.read(1024 * 1024)
                 if not chunk:
                     break
                 f.write(chunk)
+                file_done += len(chunk)
                 with stats_lock:
                     completed_bytes_list[0] += len(chunk)
+                if file_progress_callback and fsize > 0:
+                    file_progress_callback(rel_path, file_done, fsize)
 
         # 验证大小
-        actual_size = os.path.getsize(target_path)
+        actual_size = os.path.getsize(tmp_path)
         if actual_size != fsize:
             log(f"  [!] 大小不匹配: {rel_path} (期望{fsize}, 实际{actual_size})")
             with stats_lock:
                 errors.append(f"分区 {normal_partition}: {rel_path} 大小不匹配")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            return
+
+        # 验证通过 → 重命名 .tmp 为目标文件
+        try:
+            if os.path.isfile(target_path):
+                os.remove(target_path)
+            os.rename(tmp_path, target_path)
+        except OSError as e:
+            log(f"  [!] 重命名失败: {rel_path} - {e}")
+            with stats_lock:
+                errors.append(f"分区 {normal_partition}: {rel_path} 重命名失败")
+            return
+
+        if fsize >= BATCH_SIZE_THRESHOLD:
+            log(f"  [OK] {rel_path}")
 
         with stats_lock:
             completed_files_list[0] += 1
@@ -346,17 +476,215 @@ def _download_single_file(
     except (ConnectionError, TimeoutError, OSError,
             ConnectionAbortedError, ConnectionResetError,
             BrokenPipeError) as e:
-        # 连接断开 → 标记为死，不回立刻重建！下个请求才会惰性建连
-        # 这样不会因为某个线程疯狂重连耗尽 Windows 临时端口池
         _invalidate_thread_connection(host, port)
+        _handle_tmp_failure(log, tmp_path, rel_path)
         log(f"  [X] 下载失败(连接): {rel_path} - {e}")
         with stats_lock:
             errors.append(f"分区 {normal_partition}: {rel_path} 下载失败 - {e}")
 
     except Exception as e:
+        _handle_tmp_failure(log, tmp_path, rel_path)
         log(f"  [X] 下载失败: {rel_path} - {e}")
         with stats_lock:
             errors.append(f"分区 {normal_partition}: {rel_path} 下载失败 - {e}")
+
+
+def _handle_tmp_failure(log, tmp_path: str, rel_path: str):
+    """下载失败时清理残留 .tmp"""
+    if tmp_path and os.path.isfile(tmp_path):
+        try:
+            os.remove(tmp_path)
+            log(f"  [_] 已清理残留: {rel_path}.tmp")
+        except OSError:
+            pass
+
+
+def _download_batch(
+    base_url: str,
+    normal_partition: str,
+    batch_tasks: list,  # [(normal_partition, rel_path, fsize, target_path), ...]
+    stats_lock: threading.Lock,
+    completed_files_list: list,
+    completed_bytes_list: list,
+    errors: list,
+    log_callback=None,
+):
+    """批量下载小文件：一次 POST 请求获取多个文件，写 .tmp 后重命名防断点损坏"""
+    import struct as _struct
+    import urllib.parse as _urlparse
+
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    parsed = _urlparse.urlparse(base_url)
+    host = parsed.hostname
+    port = parsed.port or TRANSFER_PORT
+
+    # 断点续传: 跳过已存在且大小正确的文件
+    remaining_tasks = []  # [(rel_path, fsize, target_path), ...]
+    for item in batch_tasks:
+        _, rel_path, fsize, target_path = item
+        if os.path.isfile(target_path):
+            existing_size = os.path.getsize(target_path)
+            if existing_size == fsize:
+                log(f"  [✓] 跳过(已存在): {rel_path}")
+                with stats_lock:
+                    completed_files_list[0] += 1
+                    completed_bytes_list[0] += fsize
+                continue
+            else:
+                log(f"  [_] 大小不匹配, 重新下载: {rel_path}")
+                try:
+                    os.remove(target_path)
+                except OSError:
+                    pass
+        remaining_tasks.append((rel_path, fsize, target_path))
+
+    if not remaining_tasks:
+        return  # 本批次全部已存在
+
+    # 构建请求体：文件路径列表
+    paths = [t[0] for t in remaining_tasks]  # rel_path
+    expected = {t[0]: t[1] for t in remaining_tasks}  # {path: fsize}
+
+    try:
+        conn = _get_thread_connection(host, port)
+        body = json.dumps({
+            "partition": normal_partition,
+            "paths": paths,
+        }, ensure_ascii=False).encode("utf-8-sig")
+
+        conn.request("POST", "/batch_get", body=body, headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Connection": "keep-alive",
+        })
+        resp = conn.getresponse()
+
+        if resp.status != 200:
+            body_text = resp.read().decode("utf-8-sig", errors="replace")
+            log(f"  [X] 批次下载失败 HTTP {resp.status}: {body_text}")
+            with stats_lock:
+                for rel_path, fsize, target_path in remaining_tasks:
+                    errors.append(
+                        f"分区 {normal_partition}: {rel_path} 批次HTTP {resp.status}"
+                    )
+            return
+
+        # 解析二进制响应
+        raw = resp.read()
+        if len(raw) < 4:
+            log(f"  [X] 批次响应过短: {len(raw)} 字节")
+            with stats_lock:
+                for rel_path, fsize, target_path in remaining_tasks:
+                    errors.append(f"分区 {normal_partition}: {rel_path} 批次响应异常")
+            return
+
+        pos = 0
+        file_count = _struct.unpack_from(">I", raw, pos)[0]
+        pos += 4
+
+        received_files = 0
+        returned_paths = set()
+
+        for i in range(file_count):
+            if pos + 4 > len(raw):
+                break
+            path_len = _struct.unpack_from(">I", raw, pos)[0]
+            pos += 4
+
+            if pos + path_len > len(raw):
+                break
+            rel_path = raw[pos:pos + path_len].decode("utf-8")
+            pos += path_len
+
+            if pos + 8 > len(raw):
+                break
+            data_len = _struct.unpack_from(">Q", raw, pos)[0]
+            pos += 8
+
+            if pos + data_len > len(raw):
+                break
+            file_data = raw[pos:pos + data_len]
+            pos += data_len
+            returned_paths.add(rel_path)
+
+            # 查找对应任务
+            target_path = ""
+            exp_size = 0
+            for bp, bsize, tp in remaining_tasks:
+                if bp == rel_path:
+                    target_path = tp
+                    exp_size = bsize
+                    break
+
+            if not target_path:
+                log(f"  [_] 批次中未知文件: {rel_path}，跳过")
+                continue
+
+            # 写入 .tmp 文件
+            tmp_path = target_path + ".tmp"
+            try:
+                with open(tmp_path, "wb") as f:
+                    f.write(file_data)
+            except OSError as e:
+                log(f"  [X] 写入失败: {rel_path} - {e}")
+                with stats_lock:
+                    errors.append(f"分区 {normal_partition}: {rel_path} 写入失败")
+                continue
+
+            # 大小校验
+            actual_size = os.path.getsize(tmp_path)
+            if actual_size != exp_size:
+                log(f"  [!] 批次文件大小不匹配: {rel_path} (期望{exp_size}, 实际{actual_size})")
+                with stats_lock:
+                    errors.append(f"分区 {normal_partition}: {rel_path} 大小不匹配")
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                continue
+
+            # 校验通过 → 重命名 .tmp
+            try:
+                if os.path.isfile(target_path):
+                    os.remove(target_path)
+                os.rename(tmp_path, target_path)
+            except OSError as e:
+                log(f"  [!] 重命名失败: {rel_path} - {e}")
+                with stats_lock:
+                    errors.append(f"分区 {normal_partition}: {rel_path} 重命名失败")
+                continue
+
+            with stats_lock:
+                completed_files_list[0] += 1
+                completed_bytes_list[0] += actual_size
+            received_files += 1
+
+        # 检查是否有本批次请求了但未返回的文件
+        for bp, bsize, btp in remaining_tasks:
+            if bp in returned_paths:
+                continue
+            if os.path.isfile(btp):
+                continue  # 文件可能在之前已存在
+            log(f"  [X] 批次缺失: {bp} (服务端未返回)")
+            with stats_lock:
+                errors.append(f"分区 {normal_partition}: {bp} 批次缺失")
+
+    except (ConnectionError, TimeoutError, OSError,
+            ConnectionAbortedError, ConnectionResetError,
+            BrokenPipeError) as e:
+        _invalidate_thread_connection(host, port)
+        log(f"  [X] 批次下载失败(连接): {e}")
+        with stats_lock:
+            for rel_path, fsize, target_path in remaining_tasks:
+                errors.append(f"分区 {normal_partition}: {rel_path} 批次连接失败")
+
+    except Exception as e:
+        log(f"  [X] 批次下载失败: {e}")
+        with stats_lock:
+            for rel_path, fsize, target_path in remaining_tasks:
+                errors.append(f"分区 {normal_partition}: {rel_path} 批次异常")
 
 
 def download_files(
@@ -364,6 +692,7 @@ def download_files(
     partition_map: dict,
     log_callback=None,
     progress_callback=None,
+    file_progress_callback=None,
     max_workers: int = DEFAULT_DOWNLOAD_WORKERS,
     partition_count: int = 0,
 ):
@@ -467,7 +796,47 @@ def download_files(
             target_path = os.path.join(target_drive, rel_path.replace("/", "\\"))
             all_download_tasks.append((normal_partition, rel_path, fsize, target_path))
 
-    # 预构建所有目录（一次性完成，避免 7W+ 次 os.makedirs 系统调用）
+    # 断点续传: 清理所有残留 .tmp 文件 (上一轮传输中断留下的)
+    log("清理上一轮残留的 .tmp 文件...")
+    tmp_cleaned = 0
+    for task in all_download_tasks:
+        tmp_path = task[3] + ".tmp"
+        if os.path.isfile(tmp_path):
+            try:
+                os.remove(tmp_path)
+                tmp_cleaned += 1
+            except OSError:
+                pass
+    if tmp_cleaned > 0:
+        log(f"已清理 {tmp_cleaned} 个残留 .tmp 文件")
+
+    # 断点续传: 统计已存在且大小正确的文件 (跳过下载)
+    skipped_files = 0
+    skipped_bytes = 0
+    remaining_tasks = []
+    for task in all_download_tasks:
+        _, _, fsize, target_path = task
+        if os.path.isfile(target_path):
+            existing_size = os.path.getsize(target_path)
+            if existing_size == fsize:
+                skipped_files += 1
+                skipped_bytes += fsize
+                continue
+        remaining_tasks.append(task)
+    if skipped_files > 0:
+        log(f"断点续传: 跳过 {skipped_files} 个已存在文件 ({_fmt_size(skipped_bytes)})")
+    all_download_tasks = remaining_tasks
+
+    # 初始化进度: 已跳过的文件计入已完成
+    completed_files[0] = skipped_files
+    completed_bytes[0] = skipped_bytes
+    if skipped_files > 0:
+        progress()
+
+    if not all_download_tasks:
+        log("所有文件已存在，无需下载！")
+        progress()
+        return True, total_files, total_bytes, []
     log(f"预创建目录结构...")
     _created_dirs = set()
     for task in all_download_tasks:
@@ -477,6 +846,42 @@ def download_files(
     for d in sorted(_created_dirs):
         os.makedirs(d, exist_ok=True)
     log(f"已创建 {len(_created_dirs)} 个目录")
+
+    # 按分区 + 大小分组：小文件打包成批次，大文件单独传输
+    partition_task_map = {}  # {partition: [task, ...]}
+    for task in all_download_tasks:
+        p = task[0]
+        if p not in partition_task_map:
+            partition_task_map[p] = []
+        partition_task_map[p].append(task)
+
+    batch_submit_tasks = []   # [(partition, batch_tasks), ...]  批次任务
+    single_submit_tasks = []  # [(partition, rel_path, fsize, target_path), ...]  单文件任务
+
+    for partition, tasks in partition_task_map.items():
+        current_batch = []
+        current_batch_bytes = 0
+        for task in tasks:
+            _, rel_path, fsize, target_path = task
+            if fsize < BATCH_SIZE_THRESHOLD:
+                current_batch.append(task)
+                current_batch_bytes += fsize
+                if len(current_batch) >= BATCH_MAX_FILES or current_batch_bytes >= BATCH_MAX_TOTAL:
+                    batch_submit_tasks.append((partition, current_batch))
+                    current_batch = []
+                    current_batch_bytes = 0
+            else:
+                single_submit_tasks.append(task)
+        # 收尾：剩余未满批次的小文件
+        if current_batch:
+            batch_submit_tasks.append((partition, current_batch))
+
+    small_file_count = sum(len(b) for _, b in batch_submit_tasks)
+    large_file_count = len(single_submit_tasks)
+    if small_file_count > 0:
+        log(f"小文件优化: {small_file_count} 个 (<1MB) 打包为 {len(batch_submit_tasks)} 批次传输")
+    if large_file_count > 0:
+        log(f"大文件: {large_file_count} 个 (≥1MB) 单独传输")
 
     log(f"\n总计 {total_files} 个文件, {_fmt_size(total_bytes)}")
     log(f"开始多线程下载 (并行 {max_workers} 线程)...")
@@ -499,7 +904,24 @@ def download_files(
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
-        for task in all_download_tasks:
+
+        # 提交批次任务
+        for partition, batch in batch_submit_tasks:
+            future = executor.submit(
+                _download_batch,
+                base_url,
+                partition,
+                batch,
+                stats_lock,
+                completed_files,
+                completed_bytes,
+                errors,
+                log_callback,
+            )
+            futures.append(future)
+
+        # 提交单文件任务
+        for task in single_submit_tasks:
             normal_partition, rel_path, fsize, target_path = task
             future = executor.submit(
                 _download_single_file,
@@ -513,6 +935,7 @@ def download_files(
                 completed_bytes,
                 errors,
                 log_callback,
+                file_progress_callback,
             )
             futures.append(future)
 

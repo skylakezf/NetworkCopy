@@ -419,17 +419,21 @@ def get_partition_count(disk_number: int) -> int:
             return 0
 
         raw = bytes(buf.raw[:returned.value])
+
+        # DRIVE_LAYOUT_INFORMATION_EX 结构:
+        #   DWORD PartitionStyle  (offset 0)
+        #   DWORD PartitionCount   (offset 4)
+        #   union { MBR, GPT }     (offset 8)
+        #   PARTITION_INFORMATION_EX array (offset 48)
+        partition_style = struct.unpack_from("<I", raw, 0)[0]
         partition_count = struct.unpack_from("<I", raw, 4)[0]
 
         ntfs_count = 0
 
-        # PARTITION_INFORMATION_EX (x64, 144 字节):
-        #   off+0:  PartitionStyle(4) + padding(4)
-        #   off+8:  StartingOffset(8)
-        #   off+16: PartitionLength(8)
-        #   off+24: PartitionNumber(4)
-        #   off+28: RewritePartition(1) + padding(3)
-        #   off+32: union { MBR(16) / GPT(128) }
+        # PARTITION_INFORMATION_EX 起始偏移 48
+        # 每个元素: PartitionStyle(4) + StartingOffset(8) + PartitionLength(8) +
+        #           PartitionNumber(4) + RewritePartition(1) + padding(3) +
+        #           MBR(16) or GPT(128) = 144 字节
         PARTITION_INFO_SIZE = 144
         for i in range(partition_count):
             offset = 48 + i * PARTITION_INFO_SIZE
@@ -439,15 +443,17 @@ def get_partition_count(disk_number: int) -> int:
             pi_style = struct.unpack_from("<I", raw, offset)[0]
 
             if pi_style == 0:  # MBR
-                # Mbr.PartitionType 在 union 内偏移 4 (跳过 BootIndicator(1)+StartingCHS(3))
-                mbr_offset = offset + 32 + 4
+                # Mbr 在偏移 32: 4 bytes (BootIndicator) + 3 bytes padding +
+                # PartitionType(1) at offset 4 of Mbr sub-struct
+                # 实际上 Mbr 在 PARTITION_INFORMATION_EX 偏移 32
+                mbr_offset = offset + 36  # 32 + 4 (start of Mbr + BootIndicator)
                 if mbr_offset < len(raw):
                     ptype = raw[mbr_offset]
                     if ptype in NTFS_PARTITION_TYPES:
                         ntfs_count += 1
 
             elif pi_style == 1:  # GPT
-                # Gpt.PartitionType GUID 在 union 内偏移 0 (16 字节)
+                # Gpt 在偏移 32: PartitionType GUID (16 bytes) + PartitionId GUID (16 bytes) + ...
                 gpt_offset = offset + 32
                 if gpt_offset + 16 <= len(raw):
                     guid = raw[gpt_offset:gpt_offset + 16]
@@ -459,162 +465,252 @@ def get_partition_count(disk_number: int) -> int:
         kernel32.CloseHandle(handle)
 
 
-# =================== 分区→盘符 映射 ===================
-
-def _guid_to_str(guid_bytes) -> str:
-    """将 16 字节 GUID 转为标准字符串 {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}"""
-    if not guid_bytes or len(guid_bytes) != 16:
-        return ""
-    d1, d2, d3 = struct.unpack_from("<IHH", guid_bytes, 0)
-    d4 = guid_bytes[8:16]
-    d4_str = "".join(f"{b:02X}" for b in d4)
-    return f"{{{d1:08X}-{d2:04X}-{d3:04X}-{d4_str[:4]}-{d4_str[4:]}}}"
+def _debug(msg: str):
+    """调试输出: 写入 stderr 并立即刷新"""
+    import sys
+    try:
+        print(f"[PartMap] {msg}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
 
 
 def get_partition_drive_mapping(disk_number: int) -> dict:
     """
     返回物理磁盘上 NTFS 分区的 分区号→盘符 映射
     例如: {1: "D", 2: "E", 3: "F", 4: "G"}
-
-    策略:
-      1. IOCTL_DISK_GET_DRIVE_LAYOUT_EX 读取分区表 →
-         提取每个 NTFS 分区的: 分区号 + GUID/类型标识
-         构建 {分区号: GUID字符串} 映射
-      2. FindFirstVolume 枚举所有卷 →
-         IOCTL_STORAGE_GET_DEVICE_NUMBER 获取卷所属的分区号 →
-         按分区号匹配盘符 (不依赖偏移量, 避免 x64 对齐问题)
+    通过 IOCTL 获取分区偏移 → FindFirstVolume 枚举卷 → 匹配偏移
     """
     kernel32 = ctypes.windll.kernel32
 
-    # argtypes 声明 (64 位必须)
-    kernel32.FindFirstVolumeW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
-    kernel32.FindFirstVolumeW.restype = wintypes.HANDLE
-    kernel32.FindNextVolumeW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD]
-    kernel32.FindNextVolumeW.restype = wintypes.BOOL
-    kernel32.FindVolumeClose.argtypes = [wintypes.HANDLE]
-    kernel32.FindVolumeClose.restype = wintypes.BOOL
-    kernel32.GetVolumePathNamesForVolumeNameW.argtypes = [
-        wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD, wintypes.LPDWORD,
-    ]
-    kernel32.GetVolumePathNamesForVolumeNameW.restype = wintypes.BOOL
+    # 设置 argtypes 避免 64 位下访问违例
+    _debug("设置 Volume API argtypes...")
+    try:
+        kernel32.FindFirstVolumeW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
+        kernel32.FindFirstVolumeW.restype = wintypes.HANDLE
+        kernel32.FindNextVolumeW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD]
+        kernel32.FindNextVolumeW.restype = wintypes.BOOL
+        kernel32.FindVolumeClose.argtypes = [wintypes.HANDLE]
+        kernel32.FindVolumeClose.restype = wintypes.BOOL
+        kernel32.GetVolumePathNamesForVolumeNameW.argtypes = [
+            wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD, wintypes.LPDWORD,
+        ]
+        kernel32.GetVolumePathNamesForVolumeNameW.restype = wintypes.BOOL
+        _debug("argtypes 设置完成")
+    except Exception as e:
+        _debug(f"argtypes 设置失败: {e}")
 
-    # ===== 第一步: 读取分区表, 构建 {分区号: GUID} 映射 =====
+    # ---- 第一步: IOCTL 获取分区布局 ----
     path = f"\\\\.\\PhysicalDrive{disk_number}"
-    handle = kernel32.CreateFileW(
-        path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        None, OPEN_EXISTING, 0, None,
-    )
-    if handle == INVALID_HANDLE_VALUE:
+    _debug(f"步骤1: 打开 {path}")
+    try:
+        handle = kernel32.CreateFileW(
+            path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None, OPEN_EXISTING, 0, None,
+        )
+    except Exception as e:
+        _debug(f"CreateFileW 异常: {e}")
         return {}
+    if handle == INVALID_HANDLE_VALUE:
+        _debug(f"无法打开 {path} (INVALID_HANDLE_VALUE)")
+        return {}
+    _debug(f"步骤1 完成: handle={handle}")
 
-    # partition_map: 分区号 → GUID 或 MBR 标识 (仅 NTFS 分区)
-    partition_map = {}
+    partitions = []  # [(starting_offset, partition_number), ...]
     try:
         buf = ctypes.create_string_buffer(32768)
         returned = wintypes.DWORD(0)
+        _debug("步骤2: DeviceIoControl(IOCTL_DISK_GET_DRIVE_LAYOUT_EX)")
         ok = kernel32.DeviceIoControl(
             handle, IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
             None, 0, buf, ctypes.sizeof(buf),
             ctypes.byref(returned), None,
         )
         if not ok or returned.value < 48:
+            _debug(f"步骤2 失败: ok={ok}, returned={returned.value}")
             return {}
 
         raw = bytes(buf.raw[:returned.value])
         partition_count = struct.unpack_from("<I", raw, 4)[0]
+        PARTITION_INFO_SIZE = 144
+        _debug(f"步骤2 完成: partition_count={partition_count}, returned_size={returned.value}")
 
-        # PARTITION_INFORMATION_EX (x64, 144 字节):
-        #   off+0:  PartitionStyle(4) + padding(4)
-        #   off+8:  StartingOffset(8)
-        #   off+16: PartitionLength(8)
-        #   off+24: PartitionNumber(4)
-        #   off+28: RewritePartition(1) + padding(3)
-        #   off+32: union { MBR(16) / GPT(128) }
         for i in range(partition_count):
-            off = 48 + i * 144
-            if off + 144 > len(raw):
+            offset = 48 + i * PARTITION_INFO_SIZE
+            if offset + PARTITION_INFO_SIZE > len(raw):
+                _debug(f"  分区{i}: 偏移越界 ({offset}+{PARTITION_INFO_SIZE} > {len(raw)})")
                 break
 
-            style = struct.unpack_from("<I", raw, off)[0]
-            part_num = struct.unpack_from("<I", raw, off + 24)[0]
+            pi_style = struct.unpack_from("<I", raw, offset)[0]
+            # x64 8-byte alignment: pad at +4, StartingOffset at +8
+            start_offset = struct.unpack_from("<Q", raw, offset + 8)[0]
+            # offset+16=PartitionLength(8), offset+24=PartitionNumber(4)
+            part_number = struct.unpack_from("<I", raw, offset + 24)[0]
 
-            if style == 0:  # MBR
-                mbr_off = off + 32
-                if mbr_off + 5 <= len(raw):
-                    ptype = raw[mbr_off + 4]  # Mbr.PartitionType
-                    if ptype in NTFS_PARTITION_TYPES:
-                        partition_map[part_num] = f"MBR-{ptype:#04x}"
+            is_ntfs = False
+            if pi_style == 0:  # MBR
+                mbr_offset = offset + 32
+                if mbr_offset < len(raw):
+                    ptype = raw[mbr_offset]
+                    is_ntfs = ptype in NTFS_PARTITION_TYPES
+                    _debug(f"  分区{i}: MBR ptype={ptype:#04x} ntfs={is_ntfs} "
+                           f"offset={start_offset} part_num={part_number}")
+            elif pi_style == 1:  # GPT
+                gpt_offset = offset + 32
+                if gpt_offset + 16 <= len(raw):
+                    guid = raw[gpt_offset:gpt_offset + 16]
+                    is_ntfs = guid in NTFS_GPT_GUIDS
+                    _debug(f"  分区{i}: GPT ntfs={is_ntfs} "
+                           f"offset={start_offset} part_num={part_number}")
+            else:
+                _debug(f"  分区{i}: 未知 style={pi_style}, 跳过")
 
-            elif style == 1:  # GPT
-                gpt_off = off + 32
-                if gpt_off + 32 <= len(raw):
-                    type_guid = raw[gpt_off:gpt_off + 16]     # PartitionType GUID
-                    id_guid = raw[gpt_off + 16:gpt_off + 32]  # PartitionId GUID (唯一)
-                    if type_guid in NTFS_GPT_GUIDS:
-                        partition_map[part_num] = _guid_to_str(id_guid)
-
+            if is_ntfs:
+                partitions.append((start_offset, part_number))
+    except Exception as e:
+        _debug(f"步骤2 异常: {e}")
+        import traceback
+        traceback.print_exc(file=__import__('sys').stderr)
+        return {}
     finally:
         kernel32.CloseHandle(handle)
 
-    if not partition_map:
+    if not partitions:
+        _debug("步骤2 结果: 未发现 NTFS 分区")
         return {}
 
-    # ===== 第二步: 枚举所有卷, 用分区号匹配盘符 =====
-    # 使用 IOCTL_STORAGE_GET_DEVICE_NUMBER 替代 VOLUME_DISK_EXTENTS 偏移量匹配
-    class STORAGE_DEVICE_NUMBER(ctypes.Structure):
-        _fields_ = [
-            ("DeviceType",      wintypes.DWORD),
-            ("DeviceNumber",    wintypes.DWORD),
-            ("PartitionNumber", wintypes.DWORD),
-        ]
-    IOCTL_STORAGE_GET_DEVICE_NUMBER = 0x002D1080
+    _debug(f"步骤2 结果: 发现 {len(partitions)} 个 NTFS 分区: {partitions}")
 
-    vol_buf = ctypes.create_unicode_buffer(260)
-    find_handle = kernel32.FindFirstVolumeW(vol_buf, ctypes.sizeof(vol_buf))
+    # ---- 第二步: 枚举卷并匹配偏移 ----
+    _debug("步骤3: FindFirstVolumeW")
+    try:
+        volume_name_buf = ctypes.create_unicode_buffer(260)
+        find_handle = kernel32.FindFirstVolumeW(volume_name_buf, ctypes.sizeof(volume_name_buf))
+    except Exception as e:
+        _debug(f"FindFirstVolumeW 异常: {e}")
+        return {}
     if find_handle == INVALID_HANDLE_VALUE:
+        _debug("FindFirstVolumeW 失败 (INVALID_HANDLE_VALUE)")
         return {}
+    _debug(f"步骤3 完成: find_handle={find_handle}")
 
     result = {}
+    vol_index = 0
     try:
         while True:
-            vol_path = vol_buf.value.rstrip("\\")
+            vol_path = volume_name_buf.value.rstrip("\\")  # \\?\Volume{...}
+            vol_index += 1
+            _debug(f"  vol[{vol_index}]: path={vol_path}")
 
-            # 获取该卷的盘符
-            path_buf = ctypes.create_unicode_buffer(260)
-            path_len = wintypes.DWORD()
-            if kernel32.GetVolumePathNamesForVolumeNameW(
-                vol_path + "\\", path_buf, 260, ctypes.byref(path_len)
-            ):
-                dl = path_buf.value.strip()
-                if dl and len(dl) >= 2 and dl[1] == ":":
-                    letter = dl[0].upper()
+            # 获取卷对应的磁盘盘符 (可能多个，但 PE 下通常只有一个)
+            _debug(f"  vol[{vol_index}]: GetVolumePathNamesForVolumeNameW")
+            path_names_buf = ctypes.create_unicode_buffer(260)
+            path_names_len = wintypes.DWORD()
+            try:
+                has_path = kernel32.GetVolumePathNamesForVolumeNameW(
+                    vol_path + "\\", path_names_buf, 260, ctypes.byref(path_names_len)
+                )
+            except Exception as e:
+                _debug(f"  vol[{vol_index}]: GetVolumePathNamesForVolumeNameW 异常: {e}")
+                has_path = False
 
-                    # 获取卷所属的分区号
-                    vol_handle = kernel32.CreateFileW(
-                        vol_path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                        None, OPEN_EXISTING, 0, None,
+            drive_letters = []
+            if has_path:
+                raw_paths = path_names_buf.value
+                _debug(f"  vol[{vol_index}]: raw_paths={repr(raw_paths)}, "
+                       f"len={path_names_len.value}")
+                if raw_paths:
+                    for dl in raw_paths.split("\0"):
+                        dl = dl.strip()
+                        if len(dl) >= 2 and dl[1] == ":":
+                            drive_letters.append(dl[0].upper())
+                _debug(f"  vol[{vol_index}]: drive_letters={drive_letters}")
+            else:
+                _debug(f"  vol[{vol_index}]: 无盘符 (has_path=False)")
+
+            if not drive_letters:
+                _debug(f"  vol[{vol_index}]: 跳过, FindNextVolumeW...")
+                try:
+                    next_ok = kernel32.FindNextVolumeW(
+                        find_handle, volume_name_buf, ctypes.sizeof(volume_name_buf)
                     )
-                    if vol_handle != INVALID_HANDLE_VALUE:
-                        sdn = STORAGE_DEVICE_NUMBER()
-                        ret = wintypes.DWORD()
-                        if kernel32.DeviceIoControl(
-                            vol_handle, IOCTL_STORAGE_GET_DEVICE_NUMBER,
-                            None, 0, ctypes.byref(sdn), ctypes.sizeof(sdn),
-                            ctypes.byref(ret), None,
-                        ):
-                            # 同一磁盘 + 分区号在映射表中 → 匹配成功
-                            if (sdn.DeviceNumber == disk_number
-                                    and sdn.PartitionNumber in partition_map):
-                                result[sdn.PartitionNumber] = letter
-                        kernel32.CloseHandle(vol_handle)
+                except Exception as e:
+                    _debug(f"  vol[{vol_index}]: FindNextVolumeW 异常: {e}")
+                    break
+                if not next_ok:
+                    _debug(f"  vol[{vol_index}]: FindNextVolumeW=False, 结束枚举")
+                    break
+                continue
 
-            if not kernel32.FindNextVolumeW(
-                find_handle, vol_buf, ctypes.sizeof(vol_buf)
-            ):
+            # 获取卷的磁盘盘区
+            _debug(f"  vol[{vol_index}]: 打开卷 {vol_path}")
+            try:
+                vol_handle = kernel32.CreateFileW(
+                    vol_path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    None, OPEN_EXISTING, 0, None,
+                )
+            except Exception as e:
+                _debug(f"  vol[{vol_index}]: CreateFileW(vol) 异常: {e}")
+                vol_handle = INVALID_HANDLE_VALUE
+
+            if vol_handle != INVALID_HANDLE_VALUE:
+                _debug(f"  vol[{vol_index}]: 卷打开成功, DeviceIoControl(VOLUME_DISK_EXTENTS)")
+                extent_buf = ctypes.create_string_buffer(1024)
+                extent_returned = wintypes.DWORD(0)
+                IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000
+                try:
+                    has_extents = kernel32.DeviceIoControl(
+                        vol_handle, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                        None, 0, extent_buf, 1024,
+                        ctypes.byref(extent_returned), None,
+                    )
+                except Exception as e:
+                    _debug(f"  vol[{vol_index}]: DeviceIoControl(VOLUME_DISK_EXTENTS) 异常: {e}")
+                    has_extents = False
+                kernel32.CloseHandle(vol_handle)
+
+                if has_extents and extent_returned.value >= 8:
+                    num_extents = struct.unpack_from("<I", bytes(extent_buf.raw))[0]
+                    _debug(f"  vol[{vol_index}]: num_extents={num_extents}")
+                    for ei in range(num_extents):
+                        ext_offset = 4 + ei * 24
+                        ext_disk = struct.unpack_from("<I", bytes(extent_buf.raw), ext_offset)[0]
+                        ext_start = struct.unpack_from("<Q", bytes(extent_buf.raw), ext_offset + 4)[0]
+                        _debug(f"  vol[{vol_index}]:   extent[{ei}]: disk={ext_disk} "
+                               f"start={ext_start} (0x{ext_start:x})")
+
+                        if ext_disk == disk_number:
+                            for part_offset, part_number in partitions:
+                                if ext_start == part_offset:
+                                    _debug(f"  vol[{vol_index}]:   MATCH! 分区{part_number} → "
+                                           f"{drive_letters[0]}:")
+                                    result[part_number] = drive_letters[0]
+                                    break
+                else:
+                    _debug(f"  vol[{vol_index}]: 获取盘区失败 "
+                           f"(ok={has_extents}, returned={extent_returned.value})")
+            else:
+                _debug(f"  vol[{vol_index}]: 无法打开卷")
+
+            _debug(f"  vol[{vol_index}]: FindNextVolumeW...")
+            try:
+                next_ok = kernel32.FindNextVolumeW(
+                    find_handle, volume_name_buf, ctypes.sizeof(volume_name_buf)
+                )
+            except Exception as e:
+                _debug(f"  vol[{vol_index}]: FindNextVolumeW 异常: {e}")
                 break
+            if not next_ok:
+                _debug(f"  vol[{vol_index}]: FindNextVolumeW=False, 结束枚举")
+                break
+    except Exception as e:
+        _debug(f"枚举卷循环异常: {e}")
+        import traceback
+        traceback.print_exc(file=__import__('sys').stderr)
     finally:
+        _debug("步骤3 结束: FindVolumeClose")
         kernel32.FindVolumeClose(find_handle)
 
+    _debug(f"最终映射结果: {result}")
     return result
 
 

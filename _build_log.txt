@@ -1,0 +1,93 @@
+.\python-3.13.14-embed-amd64\python.exe : 155 INFO: PyInstaller: 6.21.0, contrib hooks: 2026.6
+所在位置 行:1 字符: 310
++ ... lyContinue; .\python-3.13.14-embed-amd64\python.exe -m PyInstaller -- ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (155 INFO: PyIns...b hooks: 2026.6:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+156 INFO: Python: 3.13.14
+187 INFO: Platform: Windows-10-10.0.19044-SP0
+187 INFO: Python environment: C:\Users\Xinyi\Desktop\���翽��\python-3.13.14-embed-amd64
+188 INFO: wrote C:\Users\Xinyi\Desktop\���翽��\���̿�������.spec
+192 INFO: Module search paths (PYTHONPATH):
+['C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-embed-amd64\\python313.zip',
+ 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-embed-amd64',
+ 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-embed-amd64\\DLLs',
+ 'C:\\Users\\Xinyi\\Desktop\\���翽��',
+ 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-embed-amd64\\Lib\\site-packages',
+ 'C:\\Users\\Xinyi\\Desktop\\���翽��']
+522 INFO: Appending 'datas' from .spec
+522 INFO: checking Analysis
+522 INFO: Building Analysis because Analysis-00.toc is non existent
+522 INFO: Looking for Python shared library...
+522 INFO: Using Python shared library: C:\Users\Xinyi\Desktop\���翽��\python-3.13.14-embed-amd64\python313.dll
+522 INFO: Running Analysis Analysis-00.toc
+522 INFO: Target bytecode optimization level: 0
+522 INFO: Initializing module dependency graph...
+523 INFO: Initializing module graph hook caches...
+536 INFO: Analyzing modules for base_library.zip ...
+2505 INFO: Processing standard module hook 'hook-encodings.py' from 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-
+embed-amd64\\Lib\\site-packages\\PyInstaller\\hooks'
+2932 INFO: Processing standard module hook 'hook-math.py' from 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-embed
+-amd64\\Lib\\site-packages\\PyInstaller\\hooks'
+4307 INFO: Processing standard module hook 'hook-pickle.py' from 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-emb
+ed-amd64\\Lib\\site-packages\\PyInstaller\\hooks'
+5443 INFO: Processing standard module hook 'hook-heapq.py' from 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-embe
+d-amd64\\Lib\\site-packages\\PyInstaller\\hooks'
+5944 INFO: Caching module dependency graph...
+6002 INFO: Analyzing C:\Users\Xinyi\Desktop\���翽��\main.py
+6025 INFO: Processing pre-find-module-path hook 'hook-tkinter.py' from 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.
+14-embed-amd64\\Lib\\site-packages\\PyInstaller\\hooks\\pre_find_module_path'
+6027 INFO: TclTkInfo: initializing cached Tcl/Tk info...
+6410 INFO: Processing standard module hook 'hook-_tkinter.py' from 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-e
+mbed-amd64\\Lib\\site-packages\\PyInstaller\\hooks'
+6574 INFO: Processing standard module hook 'hook-sysconfig.py' from 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-
+embed-amd64\\Lib\\site-packages\\PyInstaller\\hooks'
+6584 INFO: Processing standard module hook 'hook-_ctypes.py' from 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-em
+bed-amd64\\Lib\\site-packages\\PyInstaller\\hooks'
+7191 INFO: Processing standard module hook 'hook-multiprocessing.util.py' from 'C:\\Users\\Xinyi\\Desktop\\���翽��\\pyth
+on-3.13.14-embed-amd64\\Lib\\site-packages\\PyInstaller\\hooks'
+7269 INFO: Processing standard module hook 'hook-xml.py' from 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-embed-
+amd64\\Lib\\site-packages\\PyInstaller\\hooks'
+7858 INFO: Processing module hooks (post-graph stage)...
+7907 INFO: Processing standard module hook 'hook-_tkinter.py' from 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-e
+mbed-amd64\\Lib\\site-packages\\PyInstaller\\hooks'
+7925 INFO: Performing binary vs. data reclassification (928 entries)
+8010 INFO: Looking for ctypes DLLs
+8032 INFO: Analyzing run-time hooks ...
+8034 INFO: Including run-time hook 'pyi_rth_inspect.py' from 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-embed-a
+md64\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+8037 INFO: Including run-time hook 'pyi_rth_pkgutil.py' from 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-embed-a
+md64\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+8039 INFO: Including run-time hook 'pyi_rth_multiprocessing.py' from 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14
+-embed-amd64\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+8043 INFO: Including run-time hook 'pyi_rth__tkinter.py' from 'C:\\Users\\Xinyi\\Desktop\\���翽��\\python-3.13.14-embed-
+amd64\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+8081 INFO: Creating base_library.zip...
+8120 INFO: Looking for dynamic libraries
+8291 INFO: Extra DLL search directories (AddDllDirectory): []
+8291 INFO: Extra DLL search directories (PATH): []
+8690 INFO: Warnings written to C:\Users\Xinyi\Desktop\���翽��\build\���̿�������\warn-���̿�������.txt
+8715 INFO: Graph cross-reference written to C:\Users\Xinyi\Desktop\���翽��\build\���̿�������\xref-���̿�������.html
+8761 INFO: checking PYZ
+8761 INFO: Building PYZ because PYZ-00.toc is non existent
+8761 INFO: Building PYZ (ZlibArchive) C:\Users\Xinyi\Desktop\���翽��\build\���̿�������\PYZ-00.pyz
+9009 INFO: Building PYZ (ZlibArchive) C:\Users\Xinyi\Desktop\���翽��\build\���̿�������\PYZ-00.pyz completed successfully
+.
+9030 INFO: checking PKG
+9030 INFO: Building PKG because PKG-00.toc is non existent
+9030 INFO: Building PKG (CArchive) ���̿�������.pkg
+12735 INFO: Building PKG (CArchive) ���̿�������.pkg completed successfully.
+12768 INFO: Bootloader C:\Users\Xinyi\Desktop\���翽��\python-3.13.14-embed-amd64\Lib\site-packages\PyInstaller\bootloade
+r\Windows-64bit-intel\runw.exe
+12768 INFO: checking EXE
+12768 INFO: Building EXE because EXE-00.toc is non existent
+12768 INFO: Building EXE from EXE-00.toc
+12768 INFO: Copying bootloader EXE to C:\Users\Xinyi\Desktop\���翽��\dist\���̿�������.exe
+12772 INFO: Copying icon to EXE
+12776 INFO: Copying 0 resources to EXE
+12776 INFO: Embedding manifest in EXE
+12779 INFO: Appending PKG archive to EXE
+12786 INFO: Fixing EXE headers
+12907 INFO: Building EXE from EXE-00.toc completed successfully.
+12950 INFO: Build complete! The results are available in: C:\Users\Xinyi\Desktop\���翽��\dist
