@@ -692,7 +692,7 @@ def download_files(
     partition_map: dict,
     log_callback=None,
     progress_callback=None,
-    file_progress_callback=None,
+    partition_progress_callback=None,
     max_workers: int = DEFAULT_DOWNLOAD_WORKERS,
     partition_count: int = 0,
 ):
@@ -837,61 +837,26 @@ def download_files(
         log("所有文件已存在，无需下载！")
         progress()
         return True, total_files, total_bytes, []
-    log(f"预创建目录结构...")
-    _created_dirs = set()
-    for task in all_download_tasks:
-        target_dir = os.path.dirname(task[3])
-        if target_dir not in _created_dirs:
-            _created_dirs.add(target_dir)
-    for d in sorted(_created_dirs):
-        os.makedirs(d, exist_ok=True)
-    log(f"已创建 {len(_created_dirs)} 个目录")
-
-    # 按分区 + 大小分组：小文件打包成批次，大文件单独传输
-    partition_task_map = {}  # {partition: [task, ...]}
+    # 按分区分组 (仅处理剩余任务)
+    partition_task_map = {}
     for task in all_download_tasks:
         p = task[0]
         if p not in partition_task_map:
             partition_task_map[p] = []
         partition_task_map[p].append(task)
 
-    batch_submit_tasks = []   # [(partition, batch_tasks), ...]  批次任务
-    single_submit_tasks = []  # [(partition, rel_path, fsize, target_path), ...]  单文件任务
-
-    for partition, tasks in partition_task_map.items():
-        current_batch = []
-        current_batch_bytes = 0
-        for task in tasks:
-            _, rel_path, fsize, target_path = task
-            if fsize < BATCH_SIZE_THRESHOLD:
-                current_batch.append(task)
-                current_batch_bytes += fsize
-                if len(current_batch) >= BATCH_MAX_FILES or current_batch_bytes >= BATCH_MAX_TOTAL:
-                    batch_submit_tasks.append((partition, current_batch))
-                    current_batch = []
-                    current_batch_bytes = 0
-            else:
-                single_submit_tasks.append(task)
-        # 收尾：剩余未满批次的小文件
-        if current_batch:
-            batch_submit_tasks.append((partition, current_batch))
-
-    small_file_count = sum(len(b) for _, b in batch_submit_tasks)
-    large_file_count = len(single_submit_tasks)
-    if small_file_count > 0:
-        log(f"小文件优化: {small_file_count} 个 (<1MB) 打包为 {len(batch_submit_tasks)} 批次传输")
-    if large_file_count > 0:
-        log(f"大文件: {large_file_count} 个 (≥1MB) 单独传输")
-
     log(f"\n总计 {total_files} 个文件, {_fmt_size(total_bytes)}")
-    log(f"开始多线程下载 (并行 {max_workers} 线程)...")
+    if skipped_files > 0:
+        log(f"断点续传: 跳过 {skipped_files} 个已存在文件 ({_fmt_size(skipped_bytes)})")
+    log(f"需下载: {len(all_download_tasks)} 个文件")
+    log(f"开始分区串行下载 (分区内并行 {max_workers} 线程)...")
 
-    # 第二阶段: 线程池并行下载
+    # 总进度上报线程
     stats_lock = threading.Lock()
 
     def progress_reporter():
-        """后台线程: 每 2 秒上报一次进度"""
-        last_count = [0]
+        """后台线程: 每 2 秒上报一次总进度"""
+        last_count = [completed_files[0]]
         while completed_files[0] < total_files:
             time.sleep(2)
             current = completed_files[0]
@@ -902,52 +867,119 @@ def download_files(
     reporter_thread = threading.Thread(target=progress_reporter, daemon=True)
     reporter_thread.start()
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
+    # 逐分区处理 (D → E → F)，避免跨分区并发 IO 导致崩溃
+    for normal_partition in ("D", "E", "F"):
+        partition_tasks = partition_task_map.get(normal_partition, [])
+        if not partition_tasks:
+            continue
 
-        # 提交批次任务
-        for partition, batch in batch_submit_tasks:
-            future = executor.submit(
-                _download_batch,
-                base_url,
-                partition,
-                batch,
-                stats_lock,
-                completed_files,
-                completed_bytes,
-                errors,
-                log_callback,
-            )
-            futures.append(future)
+        partition_total = len(partition_tasks)
+        log(f"\n{'='*40}")
+        log(f"开始传输 {normal_partition} 盘: {partition_total} 个文件")
 
-        # 提交单文件任务
-        for task in single_submit_tasks:
-            normal_partition, rel_path, fsize, target_path = task
-            future = executor.submit(
-                _download_single_file,
-                base_url,
-                normal_partition,
-                rel_path,
-                fsize,
-                target_path,
-                stats_lock,
-                completed_files,
-                completed_bytes,
-                errors,
-                log_callback,
-                file_progress_callback,
-            )
-            futures.append(future)
+        if partition_progress_callback:
+            partition_progress_callback(normal_partition, 0, partition_total)
 
-        # 等待所有下载完成
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                log(f"  [X] 线程异常: {e}")
-                errors.append(f"线程异常: {e}")
+        # 为该分区创建目录
+        _created_dirs = set()
+        for task in partition_tasks:
+            target_dir = os.path.dirname(task[3])
+            if target_dir not in _created_dirs:
+                _created_dirs.add(target_dir)
+        for d in sorted(_created_dirs):
+            os.makedirs(d, exist_ok=True)
 
-    # 最终进度
+        # 分区内: 按大小分组 (小文件批次 / 大文件单独)
+        partition_batches = []   # [batch_tasks, ...]
+        partition_singles = []   # [(normal_partition, rel_path, fsize, target_path), ...]
+
+        current_batch = []
+        current_batch_bytes = 0
+        for task in partition_tasks:
+            _, rel_path, fsize, target_path = task
+            if fsize < BATCH_SIZE_THRESHOLD:
+                current_batch.append(task)
+                current_batch_bytes += fsize
+                if len(current_batch) >= BATCH_MAX_FILES or current_batch_bytes >= BATCH_MAX_TOTAL:
+                    partition_batches.append(current_batch)
+                    current_batch = []
+                    current_batch_bytes = 0
+            else:
+                partition_singles.append(task)
+        if current_batch:
+            partition_batches.append(current_batch)
+
+        small_count = sum(len(b) for b in partition_batches)
+        large_count = len(partition_singles)
+        if small_count > 0:
+            log(f"  小文件: {small_count} 个打包为 {len(partition_batches)} 批次")
+        if large_count > 0:
+            log(f"  大文件: {large_count} 个单独传输")
+
+        # 记录该分区开始前的基准值，用于计算分区内进度
+        baseline_files = completed_files[0]
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+
+            # 提交批次任务
+            for batch in partition_batches:
+                future = executor.submit(
+                    _download_batch,
+                    base_url,
+                    normal_partition,
+                    batch,
+                    stats_lock,
+                    completed_files,
+                    completed_bytes,
+                    errors,
+                    log_callback,
+                )
+                futures.append(future)
+
+            # 提交单文件任务
+            for task in partition_singles:
+                np, rp, fs, tp = task
+                future = executor.submit(
+                    _download_single_file,
+                    base_url,
+                    np,
+                    rp,
+                    fs,
+                    tp,
+                    stats_lock,
+                    completed_files,
+                    completed_bytes,
+                    errors,
+                    log_callback,
+                    None,  # file_progress_callback 不再使用 (简化进度显示)
+                )
+                futures.append(future)
+
+            # 等待该分区所有任务完成，同时更新分区进度
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    log(f"  [X] 线程异常: {e}")
+                    errors.append(f"线程异常: {e}")
+
+                # 更新分区进度条
+                if partition_progress_callback:
+                    partition_done = completed_files[0] - baseline_files
+                    partition_progress_callback(
+                        normal_partition,
+                        min(partition_done, partition_total),
+                        partition_total,
+                    )
+
+        # 确保分区进度条到 100%
+        if partition_progress_callback:
+            partition_progress_callback(normal_partition, partition_total, partition_total)
+
+        log(f"{normal_partition} 盘传输完成")
+
+    # 最终总进度
     progress()
     success = len(errors) == 0
     log(f"\n{'='*40}")

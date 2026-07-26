@@ -42,8 +42,6 @@ class WinGUI(Tk):
         self.tk_file_progress_bar = self.__tk_file_progress_bar(self)
         self.tk_label_mqg0zfmi = self.__tk_label_mqg0zfmi(self)
         self.tk_text_mqg105ch = self.__tk_text_mqg105ch(self)
-        # 隐藏的线程进度显示区
-        self.tk_thread_progress_text = self.__tk_thread_progress_text(self)
 
     def __win(self):
         self.title("磁盘拷贝工具 By ZhiyuChen")
@@ -169,40 +167,6 @@ class WinGUI(Tk):
         text = Text(parent)
         text.place(x=20, y=346, width=595, height=265)
         return text
-
-    def __tk_thread_progress_text(self, parent):
-        """隐藏的线程进度显示区 (每线程一行)"""
-        text = Text(parent, state="disabled", bg="#F5F5F5", fg="#333333")
-        # 默认隐藏，place_forget 在 Win.__init__ 中调用
-        text.place(x=20, y=346, width=595, height=265)
-        return text
-
-    # ==================== 线程进度显示开关 ====================
-
-    def show_thread_progress(self):
-        """显示线程进度区，隐藏日志区"""
-        self.tk_label_mqg0zfmi.place_forget()
-        self.tk_text_mqg105ch.place_forget()
-        self.tk_thread_progress_text.place(x=20, y=346, width=595, height=265)
-        self.tk_thread_progress_text.configure(state="normal")
-        self.tk_thread_progress_text.delete("1.0", "end")
-        self.tk_thread_progress_text.configure(state="disabled")
-
-    def hide_thread_progress(self):
-        """隐藏线程进度区，恢复日志区"""
-        self.tk_thread_progress_text.place_forget()
-        self.tk_label_mqg0zfmi.place(x=20, y=318, width=50, height=24)
-        self.tk_text_mqg105ch.place(x=20, y=346, width=595, height=265)
-
-    def update_thread_progress(self, lines_text: str):
-        """刷新线程进度显示 (主线程调用, 无竞态)"""
-        try:
-            self.tk_thread_progress_text.configure(state="normal")
-            self.tk_thread_progress_text.delete("1.0", "end")
-            self.tk_thread_progress_text.insert("1.0", lines_text)
-            self.tk_thread_progress_text.configure(state="disabled")
-        except Exception:
-            pass
 
     # ==================== 滚动条 ====================
 

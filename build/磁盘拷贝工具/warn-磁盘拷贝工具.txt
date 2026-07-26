@@ -20,7 +20,7 @@ excluded module named _frozen_importlib - imported by importlib (top-level), imp
 missing module named 'collections.abc' - imported by traceback (top-level), inspect (top-level), typing (top-level), logging (top-level), importlib.resources.readers (top-level), selectors (top-level), tracemalloc (top-level), http.client (top-level)
 missing module named pwd - imported by posixpath (top-level), shutil (top-level), tarfile (top-level), pathlib._local (top-level), subprocess (top-level), http.server (top-level), netrc (top-level), getpass (top-level)
 missing module named grp - imported by shutil (top-level), tarfile (top-level), pathlib._local (top-level), subprocess (top-level)
-missing module named posix - imported by posixpath (top-level), shutil (top-level), importlib._bootstrap_external (top-level), os (top-level)
+missing module named posix - imported by os (top-level), posixpath (top-level), shutil (top-level), importlib._bootstrap_external (top-level)
 missing module named resource - imported by posix (top-level)
 missing module named multiprocessing.BufferTooShort - imported by multiprocessing (top-level), multiprocessing.connection (top-level)
 missing module named multiprocessing.AuthenticationError - imported by multiprocessing (top-level), multiprocessing.connection (top-level)

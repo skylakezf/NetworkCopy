@@ -1,0 +1,11 @@
+[33mcommit 93be9555d87bccebd3b9d818c363976439597a02[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m
+Author: skylakezf <skylake-x@outlook.com>
+Date:   Mon Jul 13 02:53:04 2026 +0800
+
+    多线程进度显示重构
+
+[33mcommit 3f490d6db8af24e6cd8dcc994f27ee0677de10f1[m
+Author: skylakezf <skylake-x@outlook.com>
+Date:   Fri Jul 3 16:21:26 2026 +0800
+
+    V1.0
