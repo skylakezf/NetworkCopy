@@ -12,13 +12,23 @@ Phase 4: CSV 校验
 import os
 import csv
 import re
+import ssl
 import threading
+import json
+import urllib.request
+import urllib.parse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 与 file_transfer.py 保持一致的跳过规则
-SKIP_DIRS = {"AppData", "System Volume Information","WeChat Files"}
-SKIP_PREFIXES = ("$",)  # $RECYCLE.BIN 等
+# 客户端 SSL 上下文: 不校验自签名证书 (与 file_transfer.py 一致)
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
+
+# 与 file_transfer.py 保持一致
+SKIP_DIRS = {"AppData", "System Volume Information", "WeChat Files"}
+SKIP_PREFIXES = ("$",)
+TRANSFER_PORT = 9999
 
 # 校验线程数 (文件多时 I/O 是瓶颈，多线程可大幅加速)
 DEFAULT_VERIFY_WORKERS = 12
@@ -91,6 +101,26 @@ def find_csv_file(folder_path: str) -> str:
     raise FileNotFoundError(f"在 {folder_path} 中未找到 FullFilelist_DEF.csv")
 
 
+def _patch_csv_gtmc_paths(csv_path: str, gtmc_new_name: str) -> None:
+    """
+    直接修改 CSV 文件内容: 将 GTMC_User_Profiles 替换为 GTMC_User_ProfilesYYMMDD
+    修改后 CSV 中的路径与实际文件系统一致，后续校验无需额外处理
+    """
+    old_name = "GTMC_User_Profiles"
+    new_name = gtmc_new_name
+
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        content = f.read()
+
+    if old_name not in content:
+        return  # 无需替换
+
+    content = content.replace(old_name, new_name)
+
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        f.write(content)
+
+
 def _should_skip_path(full_path: str) -> bool:
     """
     判断路径是否属于需要跳过的目录 (AppData / $前缀 / System Volume Information)
@@ -119,7 +149,7 @@ def _verify_single_row(
     log_callback=None,
 ) -> tuple:
     """
-    校验单行 (在线程池中执行)
+    校验单行 (在线程池中执行) —— 纯校验，不做重试下载
     校验逻辑: 通过 A 列 Drive + partition_map 定位 PE 路径，比对 D 列大小
     CSV 格式: A=Drive, B=FullPath, C=FileName, D=SizeBytes
     返回: (idx, updated_row, result, log_msg)
@@ -140,7 +170,6 @@ def _verify_single_row(
         if drive_letter and drive_letter in partition_map:
             pe_drive = partition_map[drive_letter].rstrip("\\")
         elif len(full_path) >= 2 and full_path[1] == ":":
-            # 回退: 从 B 列路径解析盘符
             src_drive = full_path[0].upper()
             pe_drive = partition_map.get(src_drive, "").rstrip("\\")
         else:
@@ -191,6 +220,203 @@ def _verify_single_row(
         return (idx, row, "N", f"  [N] 校验异常: {full_path[:80]} - {e}")
 
 
+def _retry_missing_files(
+    server_ip: str,
+    port: int,
+    partition_map: dict,
+    csv_path: str,
+    col_a: int,
+    col_b: int,
+    col_d: int,
+    col_e: int,
+    log_callback=None,
+    auth_code: str = "",
+) -> int:
+    """
+    校验完成后，对缺失文件进行批量重试下载
+    返回成功下载的文件数
+    """
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    # 收集所有 N 行中文件确实不存在的条目
+    missing_entries = []  # [(row_idx, row, drive, rel_path, actual_path, expected_size), ...]
+    try:
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            for idx, row in enumerate(reader):
+                # 只处理标记为 N 的行
+                if len(row) <= col_e or row[col_e].strip() != "N":
+                    continue
+                full_path = row[col_b].strip() if len(row) > col_b else ""
+                drive_letter = row[col_a].strip().upper() if len(row) > col_a else ""
+                if not drive_letter:
+                    continue
+
+                pe_drive = partition_map.get(drive_letter, "").rstrip("\\")
+                if not pe_drive:
+                    continue
+
+                if len(full_path) >= 2 and full_path[1] == ":":
+                    rel_path = full_path[3:]
+                else:
+                    rel_path = full_path
+
+                actual_path = os.path.join(pe_drive, rel_path)
+
+                # 只重试文件不存在的 (大小不匹配的不重试)
+                if os.path.isfile(actual_path):
+                    continue
+
+                try:
+                    expected_size = int(row[col_d].strip()) if len(row) > col_d else -1
+                except (ValueError, TypeError):
+                    expected_size = -1
+
+                missing_entries.append((idx, row, drive_letter, rel_path, actual_path, expected_size))
+    except Exception as e:
+        log(f"  [X] 读取 CSV 失败，无法重试: {e}")
+        return 0
+
+    if not missing_entries:
+        log("没有可重试的缺失文件")
+        return 0
+
+    log(f"\n========== 重试下载 {len(missing_entries)} 个缺失文件 ==========")
+
+    # 按分区分组
+    by_partition = {}  # {partition: [entries]}
+    for entry in missing_entries:
+        p = entry[2]
+        if p not in by_partition:
+            by_partition[p] = []
+        by_partition[p].append(entry)
+
+    downloaded = 0
+    for partition, entries in by_partition.items():
+        log(f"  分区 {partition}: {len(entries)} 个缺失文件")
+
+        # 使用批量 POST 端点 (HTTPS + 验证码)
+        base_url = f"https://{server_ip}:{port}"
+        pwd = urllib.parse.quote(auth_code)
+        paths = [e[3] for e in entries]
+
+        try:
+            body = json.dumps({
+                "partition": partition,
+                "paths": paths,
+            }, ensure_ascii=False).encode("utf-8-sig")
+
+            req = urllib.request.Request(
+                f"{base_url}/batch_get?pwd={pwd}",
+                data=body,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                method="POST",
+            )
+            resp = urllib.request.urlopen(req, timeout=120, context=_SSL_CTX)
+
+            if resp.status != 200:
+                log(f"  [X] 批量重试 HTTP {resp.status}")
+                # 回退：逐个下载
+                for entry in entries:
+                    _, _, drv, rp, tp, _ = entry
+                    if _download_one_file(server_ip, port, drv, rp, tp, auth_code):
+                        downloaded += 1
+                continue
+
+            import struct as _struct
+            raw = resp.read()
+
+            if len(raw) < 4:
+                log(f"  [X] 批量重试响应过短")
+                for entry in entries:
+                    _, _, drv, rp, tp, _ = entry
+                    if _download_one_file(server_ip, port, drv, rp, tp, auth_code):
+                        downloaded += 1
+                continue
+
+            pos = 0
+            file_count = _struct.unpack_from(">I", raw, pos)[0]
+            pos += 4
+
+            for i in range(file_count):
+                if pos + 4 > len(raw):
+                    break
+                path_len = _struct.unpack_from(">I", raw, pos)[0]
+                pos += 4
+
+                if pos + path_len > len(raw):
+                    break
+                rel_path = raw[pos:pos + path_len].decode("utf-8")
+                pos += path_len
+
+                if pos + 8 > len(raw):
+                    break
+                data_len = _struct.unpack_from(">Q", raw, pos)[0]
+                pos += 8
+
+                if pos + data_len > len(raw):
+                    break
+                file_data = raw[pos:pos + data_len]
+                pos += data_len
+
+                # 找到对应的 target_path
+                for entry in entries:
+                    if entry[3] == rel_path:
+                        target_path = entry[4]
+                        target_dir = os.path.dirname(target_path)
+                        os.makedirs(target_dir, exist_ok=True)
+                        try:
+                            with open(target_path, "wb") as fw:
+                                fw.write(file_data)
+                            downloaded += 1
+                        except OSError:
+                            log(f"  [X] 重试写入失败: {rel_path}")
+                        break
+
+            log(f"  分区 {partition}: 批量重试完成，成功 {downloaded} 文件")
+
+        except Exception as e:
+            log(f"  [X] 分区 {partition} 批量重试异常: {e}")
+            # 回退：逐个下载
+            for entry in entries:
+                _, _, drv, rp, tp, _ = entry
+                if _download_one_file(server_ip, port, drv, rp, tp, auth_code):
+                    downloaded += 1
+
+    log(f"重试下载完成: 成功恢复 {downloaded}/{len(missing_entries)} 个文件")
+    return downloaded
+
+
+def _download_one_file(
+    server_ip: str,
+    port: int,
+    partition: str,
+    rel_path: str,
+    target_path: str,
+    auth_code: str = "",
+) -> bool:
+    """从源设备下载单个文件（回退用，HTTPS + 验证码）"""
+    try:
+        encoded_path = urllib.parse.quote(rel_path.replace("\\", "/"), safe="")
+        pwd = urllib.parse.quote(auth_code)
+        url = f"https://{server_ip}:{port}/get?partition={partition}&path={encoded_path}&pwd={pwd}"
+        req = urllib.request.urlopen(url, timeout=30, context=_SSL_CTX)
+        target_dir = os.path.dirname(target_path)
+        os.makedirs(target_dir, exist_ok=True)
+        with open(target_path, "wb") as f:
+            while True:
+                chunk = req.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+        return True
+    except Exception:
+        return False
+
+
 def verify_csv(
     csv_path: str,
     partition_map: dict,
@@ -200,7 +426,7 @@ def verify_csv(
     progress_callback=None,
 ) -> tuple:
     """
-    校验 CSV 文件 (多线程)
+    校验 CSV 文件 (多线程) —— 纯校验，不做重试下载
     csv_path: FullFilelist_DEF.csv 的完整路径
     partition_map: {"D": "I:", "E": "J:", "F": "K:"}  正常盘符→PE盘符(目标设备)
     max_workers: 校验线程数 (默认 12)
@@ -279,7 +505,8 @@ def verify_csv(
         for idx, row in enumerate(rows):
             future = executor.submit(
                 _verify_single_row,
-                row, idx, col_a, col_b, col_d, col_e, partition_map, log_callback,
+                row, idx, col_a, col_b, col_d, col_e, partition_map,
+                log_callback,
             )
             futures[future] = idx
 
@@ -358,6 +585,9 @@ def run_verification(
     max_workers: int = DEFAULT_VERIFY_WORKERS,
     stop_check=None,
     progress_callback=None,
+    server_ip: str = "",
+    gtmc_new_name: str = "",
+    auth_code: str = "",
 ) -> tuple:
     """
     执行完整校验流程
@@ -366,25 +596,93 @@ def run_verification(
     max_workers: 校验线程数 (默认 12)
     stop_check: callable, 返回 True 时中止校验
     progress_callback: callable(done, total), 每完成一个文件调用一次
+    server_ip: 源设备 IP，启用缺失文件重试下载 (可选)
+    流程: 校验 → 收集缺失文件 → 批量重试下载 → 二次校验
     返回: (成功?, 通过数, 失败数, 跳过数, 总文件数)
     """
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+
     try:
         folder = find_latest_appl_folder(f_drive_pe)
-        if log_callback:
-            log_callback(f"找到最新 Appl 文件夹: {folder}")
+        log(f"找到最新 Appl 文件夹: {folder}")
 
         csv_path = find_csv_file(folder)
-        if log_callback:
-            log_callback(f"找到 CSV 文件: {csv_path}")
+        log(f"找到 CSV 文件: {csv_path}")
 
+        # 若 GTMC_User_Profiles 已被重命名，直接修改 CSV 文件中的路径
+        if gtmc_new_name:
+            log(f"CSV 路径替换: GTMC_User_Profiles → {gtmc_new_name}")
+            _patch_csv_gtmc_paths(csv_path, gtmc_new_name)
+
+        # ---- 第一轮: 纯校验 ----
         passed, failed, skipped, total = verify_csv(
             csv_path, partition_map, log_callback,
             max_workers=max_workers, stop_check=stop_check,
             progress_callback=progress_callback,
         )
+
+        # ---- 第二轮: 如果有缺失文件且源设备可达，重试下载 ----
+        if failed > 0 and server_ip:
+            if stop_check and stop_check():
+                log("重试下载已中止")
+                return False, passed, failed, skipped, total
+
+            # 解析 CSV 列 (与 verify_csv 内相同逻辑)
+            header = []
+            with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+
+            if header:
+                try:
+                    col_a = header.index("Drive")
+                except ValueError:
+                    col_a = 0
+
+                try:
+                    col_b = header.index("FullPath")
+                except ValueError:
+                    col_b = 1
+
+                try:
+                    col_d = header.index("SizeBytes")
+                except ValueError:
+                    col_d = 3
+
+                try:
+                    col_e = header.index("VerifyResult") if "VerifyResult" in header else 4
+                except ValueError:
+                    col_e = 4
+
+                # 批量重试下载
+                recovered = _retry_missing_files(
+                    server_ip, TRANSFER_PORT,
+                    partition_map, csv_path,
+                    col_a, col_b, col_d, col_e,
+                    log_callback=log,
+                    auth_code=auth_code,
+                )
+
+                if recovered > 0:
+                    log(f"\n========== 二次校验 (已重试 {recovered} 个文件) ==========")
+
+                    if stop_check and stop_check():
+                        log("二次校验已中止")
+                        return False, passed, failed, skipped, total
+
+                    # 只对恢复的文件做二次校验 (全量校验也可以，但避免重复扫描)
+                    passed2, failed2, skipped2, total2 = verify_csv(
+                        csv_path, partition_map, log_callback,
+                        max_workers=max_workers,
+                        stop_check=stop_check,
+                        progress_callback=progress_callback,
+                    )
+                    passed, failed, skipped, total = passed2, failed2, skipped2, total2
+
         return True, passed, failed, skipped, total
 
     except Exception as e:
-        if log_callback:
-            log_callback(f"校验失败: {e}")
+        log(f"校验失败: {e}")
         return False, 0, 0, 0, 0

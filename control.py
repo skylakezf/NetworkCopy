@@ -7,11 +7,14 @@ import time
 import subprocess
 import os
 from typing import Literal
+from tkinter import simpledialog, messagebox
+import tkinter as tk
 from nic_scanner import scan_nics, get_nic_display_list, get_local_ip
-from disk_scanner import get_disk_list, get_drive_letter_list, get_disk_number, get_partition_count, get_partition_drive_mapping
+from disk_scanner import get_disk_list, get_drive_letter_list, get_disk_number, get_partition_count, get_partition_details
 from file_transfer import FileServer, download_files, scan_source_device, TRANSFER_PORT
 from verifier import run_verification
 from ip_config import SOURCE_IP  # 169.254.100.1 (目标设备自身 IP)
+import tls_utils
 DHCP_ASSIGNED_IP = "169.254.100.2"  # DHCP 分配给源设备的 IP
 
 
@@ -41,6 +44,13 @@ class Controller:
         self._verify_thread = None
         self._stop_verify = False  # 新传输开始时通知旧校验停止
 
+        # ---- 网络/鉴权状态 (避免未选网卡直接点按钮时 AttributeError) ----
+        self._use_dhcp = False
+        self._source_ip = ""
+        self._dhcp_server = None
+        self._auth_code = ""        # 源: 生成并显示; 目标: 用户输入
+        self._last_source_ip = ""   # 目标: 最近一次成功连接的源设备 IP (供校验重试)
+
     # ==================== 初始化 ====================
 
     def init(self, ui):
@@ -54,6 +64,13 @@ class Controller:
         self.ui.tk_button_mqfzl35t.config(state="disabled")
         self.ui.tk_select_box_discover.config(values=("等待 DHCP 响应...",))
         self.ui.tk_select_box_discover.set("等待 DHCP 响应...")
+        # DHCP 按钮默认隐藏, 仅目标设备显示
+        self.ui.hide_dhcp()
+        # 手动 IP 与目标验证码输入框默认隐藏, 选择目标设备后显示
+        self.ui.hide_manual_ip()
+        self.ui.hide_auth_input()
+        # 验证码显示区默认隐藏, 生成/输入后显示
+        self.ui.hide_auth_code()
 
     def _setup_events(self):
         """绑定 UI 控件事件"""
@@ -81,6 +98,8 @@ class Controller:
         )
         # 开始按钮
         self.ui.tk_button_mqfzl35t.config(command=self._on_start_button)
+        # 开启 DHCP 按钮 (目标设备)
+        self.ui.tk_button_dhcp.config(command=self._on_dhcp_button)
 
     # ==================== 网卡扫描 ====================
 
@@ -122,6 +141,9 @@ class Controller:
         if dev_type in ("源设备", "目标设备"):
             self._configure_ip(adapter_desc, dev_type)
 
+        # 网卡选定后重新评估开始按钮状态
+        self._check_button_state()
+
     def _on_device_type_selected(self, event=None):
         dev_type = self.ui.tk_select_box_mqg0hm2h.get()
         self._device_type = dev_type
@@ -130,9 +152,23 @@ class Controller:
         if dev_type == "源设备":
             self.ui.tk_button_mqfzl35t.config(text="开始传输")
             self.ui.hide_discover()
+            self.ui.hide_dhcp()
+            # 源设备不需要手动 IP / 验证码输入
+            self.ui.hide_manual_ip()
+            self.ui.hide_auth_input()
         else:
             self.ui.tk_button_mqfzl35t.config(text="开始接收")
             self.ui.show_discover()
+            self.ui.show_dhcp()
+            # 目标设备: 需要输入源设备显示的验证码
+            self.ui.hide_manual_ip()
+            self.ui.show_auth_input()
+        # 切换设备类型后旧验证码作废
+        self._auth_code = ""
+        self.ui.hide_auth_code()
+
+        # 设备类型选定后重新评估开始按钮状态
+        self._check_button_state()
 
         # 网卡已选 → 配置网络
         nic_display = self.ui.tk_select_box_mqfzkd6x.get()
@@ -166,20 +202,16 @@ class Controller:
                         f"检测到 {ntfs_count} 个 NTFS 分区 (PhysicalDrive{disk_num})"
                     ))
 
-                    # 获取分区号→盘符映射，自动填充 D/E/F
-                    part_map = get_partition_drive_mapping(disk_num)
-                    if part_map:
-                        # 按分区号排序，取盘符列表
-                        sorted_letters = [letter for _, letter in sorted(part_map.items())]
-                        self.ui.after(0, lambda: self._log(
-                            f"分区→盘符映射: {dict(sorted(part_map.items()))}"
+                    # 获取物理顺序分区详情，自动填充 D/E/F
+                    details = get_partition_details(disk_num)
+                    if details:
+                        ordered = [dl for _, _, dl in details]
+                        self.ui.after(0, lambda o=list(ordered): self._log(
+                            f"分区物理顺序→盘符: {o}"
                         ))
-                        # 自动填充: 跳过第一个 (通常是 C 系统分区)
-                        self.ui.after(0, lambda: self._auto_fill_drive_mapping(
-                            sorted_letters, ntfs_count
-                        ))
-
-                    self.ui.after(0, self._check_button_state)
+                        # 自动填充: 按磁盘物理分区顺序映射到 D/E/F
+                        self.ui.after(0, lambda o=list(ordered), n=ntfs_count:
+                                      self._auto_fill_drive_mapping(o, n))
                 else:
                     self._ntfs_partition_count = 0
             except Exception as e:
@@ -188,6 +220,9 @@ class Controller:
                 tb = traceback.format_exc()
                 self.ui.after(0, lambda: self._log(f"分区检测失败: {e}"))
                 self.ui.after(0, lambda t=tb: self._log(f"调试: {t}"))
+            finally:
+                # 无论检测成功与否, 都重新评估开始按钮状态
+                self.ui.after(0, self._check_button_state)
 
         threading.Thread(target=_detect_partitions, daemon=True).start()
 
@@ -203,33 +238,29 @@ class Controller:
             return
 
         self._update_partition_map()
-
-        # 根据 NTFS 分区数验证映射
-        ntfs_count: int = self._ntfs_partition_count
-        mapped: list[str] = [p for p in ("D", "E", "F") if p in self._partition_map and self._partition_map[p]]
-
-        if ntfs_count == 2:
-            # 2 分区: 只需要 D、E
-            required_keys: tuple[Literal['D'], Literal['E'], Literal['F']] = ("D", "E")
-            required_count = 2
-        else:
-            # 3/4 分区: 需要 D、E、F
-            required_keys: tuple[Literal['D'], Literal['E'], Literal['F']] = ("D", "E", "F")
-            required_count = 3
-
-        missing = [k for k in required_keys if k not in self._partition_map or not self._partition_map[k]]
-        if len(mapped) < required_count:
-            self._log(f"请先完成 {'/'.join(required_keys)} 盘符映射 (当前: {len(mapped)} 个)")
+        dev_type = self.ui.tk_select_box_mqg0hm2h.get()
+        if dev_type not in ("源设备", "目标设备"):
+            self._log("请先选择设备类型")
             return
 
-        dev_type = self.ui.tk_select_box_mqg0hm2h.get()
+        manual_ip = self._get_manual_ip()
 
         if dev_type == "源设备":
-            self._start_source_server()
-        elif dev_type == "目标设备":
-            self._start_target_download()
+            # 源设备只负责搭建 HTTP 服务器, 不强制分区映射
+            if not self._partition_map:
+                self._log("提示: 尚未配置分区映射, 服务器将不提供任何盘符数据"
+                          "(可在启动后继续设置映射)")
+            self._start_source_server(manual_ip=manual_ip)
         else:
-            self._log("请先选择设备类型")
+            # 目标设备需要完成分区映射才能下载
+            ntfs_count: int = self._ntfs_partition_count
+            required_keys = ("D", "E") if ntfs_count == 2 else ("D", "E", "F")
+            mapped = [k for k in required_keys if self._partition_map.get(k)]
+            if len(mapped) < len(required_keys):
+                self._log(f"请先完成 {'/'.join(required_keys)} 盘符映射"
+                          f"(当前: {len(mapped)} 个)")
+                return
+            self._start_target_download(manual_ip=manual_ip)
 
     # ==================== 磁盘/分区 ====================
 
@@ -266,24 +297,41 @@ class Controller:
         except Exception as e:
             self._log(f"分区扫描失败: {e}")
 
-    def _auto_fill_drive_mapping(self, sorted_letters: list, ntfs_count: int):
-        """根据分区→盘符映射自动填充 D/E/F 下拉框 (跳过第一个 = 系统分区)"""
-        if not sorted_letters:
+    def _auto_fill_drive_mapping(self, ordered_letters: list, ntfs_count: int):
+        """按磁盘物理分区顺序 (StartingOffset) 自动填充 D/E/F 下拉框。
+
+        规则 (兼容 GPT/MBR, 盘符可任意乱序):
+          1. ordered_letters 已按分区在磁盘上的物理顺序排列;
+          2. 去掉系统分区 (盘符 C);
+          3. 若剩余仍多于 3 个, 从头部跳过多余分区 (视为系统/保留分区);
+          4. 剩余分区按物理顺序依次填充 D → E → F。
+
+        示例:
+          4 分区识别为 C,E,F,G → 去掉 C → D=E, E=F, F=G
+          3 分区机械盘识别为 E,D,F (物理顺序) → D=E, E=D, F=F
+        """
+        if not ordered_letters:
             return
 
-        # 跳过第一个盘符 (通常是 C 系统分区), 余下的分配给 D/E/F
-        data_letters = sorted_letters[1:]  # ["D", "E", "F"]
+        # 去掉系统分区 C
+        data_letters = [dl for dl in ordered_letters if dl.upper() != "C"]
+        # 仍超过 3 个: 头部多余的视为系统/保留分区, 跳过
+        while len(data_letters) > 3:
+            skipped = data_letters.pop(0)
+            self._log(f"自动映射: 跳过头部分区 {skipped} (视为系统/保留分区)")
+
         combos = (
             (self.ui.tk_select_box_mqfzsdz4, "D"),
             (self.ui.tk_select_box_mqfzuo2y, "E"),
             (self.ui.tk_select_box_mqfzwehm, "F"),
         )
-
         for i, (cb, label) in enumerate(combos):
             if i < len(data_letters):
-                cb.set(data_letters[i])
-                self._log(f"自动映射: 源分区 {label} → PE盘符 {data_letters[i]}:")
-
+                try:
+                    cb.set(data_letters[i])
+                    self._log(f"自动映射(物理顺序): 源 {label} → 目标 {data_letters[i]}")
+                except tk.TclError:
+                    pass
         self._update_partition_map()
 
     def _update_partition_map(self):
@@ -303,16 +351,16 @@ class Controller:
         self._log(f"分区映射: {self._partition_map}")
 
     def _check_button_state(self):
-        """根据映射完整性启用/禁用开始按钮"""
-        mapped_count = len([v for v in self._partition_map.values() if v])
+        """根据网卡与设备类型启用/禁用开始按钮。
+
+        说明: 源设备只负责搭建 HTTP 服务器, 限制从简 —— 只要选好网卡与设备类型即可启用;
+        真正的完整性校验 (分区映射 / DHCP / 手动 IP) 在点击时由 _on_start_button 进行。
+        """
         dev_type = self.ui.tk_select_box_mqg0hm2h.get()
         nic_selected = self.ui.tk_select_box_mqfzkd6x.get() not in (
             "扫描中...", "未检测到网卡", "", "网卡1", "网卡2"
         )
-
-        # 2 分区需要 2 个映射, 3/4 分区需要 3 个
-        required = 2 if self._ntfs_partition_count == 2 else 3
-        if mapped_count >= required and dev_type in ("源设备", "目标设备") and nic_selected:
+        if nic_selected and dev_type in ("源设备", "目标设备"):
             self.ui.tk_button_mqfzl35t.config(state="normal")
         else:
             self.ui.tk_button_mqfzl35t.config(state="disabled")
@@ -334,9 +382,11 @@ class Controller:
             self.ui.after(0, lambda: self._log("源设备: 正在获取 IP..."))
             threading.Thread(target=self._setup_source_network, args=(adapter_desc,), daemon=True).start()
         else:
-            # 目标设备: 设自身 IP + 启动 DHCP
-            self.ui.after(0, lambda: self._log("目标设备: 正在启动 DHCP 服务器..."))
-            threading.Thread(target=self._setup_target_dhcp, args=(adapter_desc,), daemon=True).start()
+            # 目标设备: 不自动启动 DHCP, 等待用户点击「开启DHCP」
+            self.ui.after(0, lambda: self._log(
+                "目标设备: 请先选择网卡并点击「开启DHCP」启动 DHCP 服务器，"
+                "待源设备分配到 IP 后点击「开始接收」"
+            ))
 
     def _setup_source_network(self, adapter_desc):
         """源设备: ipconfig /renew 从目标 DHCP 获取 IP"""
@@ -354,6 +404,88 @@ class Controller:
                 self.ui.after(0, lambda: self._log("源设备: 等待 IP (将使用 APIPA)"))
         except Exception as e:
             self.ui.after(0, lambda: self._log(f"源设备网络: {e}"))
+
+    # ==================== 手动 IP 辅助 ====================
+
+    def _get_manual_ip(self):
+        """读取手动 IP 输入框: 4 段均有效返回 'x.x.x.x', 否则返回 None。
+
+        注: 该 IP 代表「源设备 IP」, 目标设备据此直连源设备 (无需 DHCP)。
+        该输入框默认隐藏, 仅在需要时由 UI 显示。
+        """
+        try:
+            octets = [
+                self.ui.ip_octet1_var.get().strip(),
+                self.ui.ip_octet2_var.get().strip(),
+                self.ui.ip_octet3_var.get().strip(),
+                self.ui.ip_octet4_var.get().strip(),
+            ]
+        except Exception:
+            return None
+        if all(o.isdigit() and o != "" and 0 <= int(o) <= 255 for o in octets):
+            return ".".join(octets)
+        return None
+
+    def _apply_manual_ip(self, adapter_desc, ip):
+        """源设备: 将本机网卡 IP 设为手动输入的 IP (供目标直连)"""
+        from ip_config import set_ip_via_api
+        try:
+            success, msg = set_ip_via_api(adapter_desc, ip)
+            self.ui.after(0, lambda m=msg: self._log(m))
+            if not success:
+                subprocess.run(
+                    ["netsh", "interface", "ip", "set", "address",
+                     f'"{adapter_desc}"', "static", ip, "255.255.255.0"],
+                    capture_output=True, timeout=10,
+                    encoding="utf-8", errors="replace",
+                )
+                self.ui.after(0, lambda: self._log(f"源设备手动 IP: {ip}"))
+        except Exception as e:
+            self.ui.after(0, lambda: self._log(f"设置源设备手动 IP 失败: {e}"))
+
+    def _apply_target_manual_ip(self, adapter_desc, source_ip):
+        """目标设备: 将本机网卡 IP 设为与源 IP 同网段 (源末位+1), 以便直连"""
+        from ip_config import set_ip_via_api
+        parts = source_ip.split(".")
+        try:
+            last = int(parts[3])
+            last = last + 1 if last < 254 else 1
+            target_ip = ".".join(parts[:3] + [str(last)])
+        except Exception:
+            target_ip = SOURCE_IP
+        try:
+            success, msg = set_ip_via_api(adapter_desc, target_ip)
+            self.ui.after(0, lambda m=msg: self._log(m))
+            if not success:
+                subprocess.run(
+                    ["netsh", "interface", "ip", "set", "address",
+                     f'"{adapter_desc}"', "static", target_ip, "255.255.255.0"],
+                    capture_output=True, timeout=10,
+                    encoding="utf-8", errors="replace",
+                )
+                self.ui.after(0, lambda: self._log(f"目标手动 IP: {target_ip}"))
+        except Exception as e:
+            self.ui.after(0, lambda: self._log(f"设置目标手动 IP 失败: {e}"))
+
+    def _on_dhcp_button(self):
+        """目标设备: 点击「开启DHCP」→ 后台启动 DHCP 服务器"""
+        if self._transferring:
+            self._log("传输正在进行中, 暂时无法操作")
+            return
+        if self._dhcp_server and getattr(self._dhcp_server, "is_running", lambda: False)():
+            self._log("DHCP 服务器已在运行")
+            return
+        nic_display = self.ui.tk_select_box_mqfzkd6x.get()
+        if nic_display in ("扫描中...", "未检测到可用网卡", "", "网卡1", "网卡2"):
+            self._log("请先选择网卡，再点击「开启DHCP」")
+            return
+        adapter_desc = self._get_adapter_desc(nic_display)
+        if not adapter_desc:
+            self._log("无法识别所选网卡，请重新选择")
+            return
+        self.ui.tk_button_dhcp.config(state="disabled")
+        self.ui.tk_button_dhcp.configure(text="DHCP启动中...")
+        threading.Thread(target=self._setup_target_dhcp, args=(adapter_desc,), daemon=True).start()
 
     def _setup_target_dhcp(self, adapter_desc):
         """目标设备: 设自身 IP 169.254.100.1 → 启动 DHCP → 等源设备获取 IP"""
@@ -382,6 +514,7 @@ class Controller:
 
         if not success:
             self.ui.after(0, lambda: self._log("无法设置目标 IP, 回退 APIPA"))
+            self.ui.after(0, lambda: self.ui.tk_button_dhcp.configure(text="开启DHCP", state="normal"))
             return
 
         # 获取本地 MAC 地址列表，排除本地网卡的 DHCP 自响应
@@ -389,13 +522,18 @@ class Controller:
         local_macs = get_local_mac_addresses()
         self._log(f"本地 MAC 排除列表: {local_macs}")
 
-        self._dhcp_server = MiniDHCPServer(exclude_macs=local_macs)
+        try:
+            self._dhcp_server = MiniDHCPServer(exclude_macs=local_macs)
 
-        def _on_client(ip, mac, hostname):
-            self._update_discover_list(ip, mac, hostname)
+            def _on_client(ip, mac, hostname):
+                self._update_discover_list(ip, mac, hostname)
 
-        self._dhcp_server.set_on_client(_on_client)
-        self._dhcp_server.start()
+            self._dhcp_server.set_on_client(_on_client)
+            self._dhcp_server.start()
+        except Exception as e:
+            self.ui.after(0, lambda: self._log(f"DHCP 启动失败: {e}"))
+            self.ui.after(0, lambda: self.ui.tk_button_dhcp.configure(text="开启DHCP", state="normal"))
+            return
         self._use_dhcp = True
         self._source_ip = DHCP_ASSIGNED_IP  # 目标 DHCP 分配的源 IP
         self._discover_count = 0
@@ -404,6 +542,7 @@ class Controller:
             f"DHCP 已启动, 源设备将获取 {DHCP_ASSIGNED_IP} (60s 超时)..."
         ))
         self.ui.after(60000, self._auto_select_target)
+        self.ui.after(0, lambda: self.ui.tk_button_dhcp.configure(text="DHCP运行中", state="normal"))
 
     def _update_discover_list(self, ip, mac, hostname=""):
         """更新发现设备下拉框"""
@@ -449,26 +588,61 @@ class Controller:
 
     # ==================== 源设备：启动服务器 ====================
 
-    def _start_source_server(self):
-        """源设备启动 HTTP 文件服务器"""
+    def _start_source_server(self, manual_ip=None):
+        """源设备启动 HTTP 文件服务器 (manual_ip 非空时为手动 IP 模式)"""
         self._log("\n" + "=" * 50)
         self._log("源设备模式: 启动文件服务器")
         self._log("=" * 50)
         self._log(f"分区映射: {self._partition_map}")
 
+        # 手动 IP 模式: 先把本机网卡设为该 IP, 再启动服务器
+        if manual_ip:
+            adapter_desc = self._get_adapter_desc(self.ui.tk_select_box_mqfzkd6x.get())
+            if adapter_desc:
+                self._apply_manual_ip(adapter_desc, manual_ip)
+            self._log(f"手动 IP 模式: 源设备将绑定 {manual_ip}")
+
         # 重命名 GTMC_User_Profiles (如存在)
         self._rename_gtmc_user_profiles()
 
+        # 生成验证码 + 自签名证书 (HTTPS 必需)
+        self._auth_code = tls_utils.generate_auth_code()
+        cert_ip = get_local_ip() or DHCP_ASSIGNED_IP
+        try:
+            cert_paths = tls_utils.get_or_create_cert(cert_ip)
+        except Exception as e:
+            self._log(f"错误: 生成 TLS 证书失败, 无法启动服务器: {e}")
+            self._set_status("证书生成失败")
+            return
+
         self._file_server = FileServer(
             partition_map=self._partition_map,
-            log_callback=self._log
+            log_callback=self._log,
+            auth_code=self._auth_code,
+            cert_paths=cert_paths,
         )
         self._file_server.start()
         self._log(f"文件服务器已启动, 监听 0.0.0.0:{TRANSFER_PORT}")
+        self._log("\n" + "*" * 50)
+        self._log(f"  连接验证码: {self._auth_code}")
+        self._log("  请在目标设备上输入此验证码")
+        self._log("*" * 50 + "\n")
+        self._set_status(f"验证码: {self._auth_code}  等待目标设备连接...")
         self._log("等待目标设备连接下载...")
+
+        # UI 专用区域常驻醒目显示验证码
+        self.ui.show_auth_code(self._auth_code)
 
         self._transferring = True
         self.ui.tk_button_mqfzl35t.config(text="传输中...", state="disabled")
+
+        # 弹窗醒目显示验证码 (服务器已在后台线程运行, 阻塞 UI 无碍)
+        messagebox.showinfo(
+            "连接验证码",
+            f"验证码: {self._auth_code}\n\n请在目标设备点击「开始接收」后输入此验证码。\n"
+            "(验证码将持续显示在主界面「连接验证码」区域)",
+            parent=self.ui,
+        )
 
     def _rename_gtmc_user_profiles(self):
         """检查源设备 D 盘，若存在 GTMC_User_Profiles 则重命名为 GTMC_User_ProfilesYYMMDD"""
@@ -500,12 +674,45 @@ class Controller:
 
     # ==================== 目标设备：下载文件 ====================
 
-    def _start_target_download(self):
-        """目标设备连接源设备下载文件"""
+    def _start_target_download(self, manual_ip=None):
+        """目标设备连接源设备下载文件。
+
+        manual_ip: 若提供 (手动 IP 模式), 直接连接该源设备 IP, 无需 DHCP;
+                   目标自身 IP 自动设为与源同网段 (源末位+1)。
+        """
+        if not manual_ip:
+            # DHCP 模式: 必须先开启 DHCP 并等待源设备分配到 IP
+            if not self._use_dhcp or not (self._dhcp_server and self._dhcp_server.is_running()):
+                self._log("请先点击「开启DHCP」启动 DHCP 服务器并等待源设备分配 IP")
+                return
+
         self._log("\n" + "=" * 50)
         self._log("目标设备模式: 连接源设备...")
         self._log("=" * 50)
         self._log(f"分区映射: {self._partition_map}")
+
+        if manual_ip:
+            adapter_desc = self._get_adapter_desc(self.ui.tk_select_box_mqfzkd6x.get())
+            if adapter_desc:
+                self._apply_target_manual_ip(adapter_desc, manual_ip)
+            self._log(f"手动 IP 模式: 将直连源设备 {manual_ip}:{TRANSFER_PORT}")
+
+        # 输入源设备显示的验证码 (HTTPS 鉴权必需)
+        # 优先读取主界面上的验证码输入框; 为空时再弹出对话框作为兜底
+        code = (self.ui.get_auth_input() or "").strip()
+        if not code:
+            code = simpledialog.askstring(
+                "验证码",
+                "请输入源设备屏幕上显示的 4 位验证码:",
+                parent=self.ui,
+            )
+        if not code or not code.strip():
+            self._log("未输入验证码, 已取消接收")
+            return
+        self._auth_code = code.strip().upper()
+        # 回填主界面输入框并显示, 便于与源设备核对
+        self.ui.set_auth_input(self._auth_code)
+        self.ui.show_auth_code(self._auth_code)
 
         # 如果旧校验还在跑，通知它停止
         if self._verify_thread and self._verify_thread.is_alive():
@@ -519,9 +726,13 @@ class Controller:
         self.ui.tk_button_mqfzl35t.config(text="连接中...", state="disabled")
 
         def _connect_and_download():
-            source_ip = ""
-
-            if self._use_dhcp:
+            if manual_ip:
+                # 手动 IP 模式: 直连填写的源设备 IP
+                source_ip = manual_ip
+                self.ui.after(0, lambda: self._log(
+                    f"手动 IP 模式: 直连源设备 {manual_ip}:{TRANSFER_PORT}"
+                ))
+            elif self._use_dhcp:
                 # DHCP 模式: 源 IP 由目标 DHCP 分配 (169.254.100.2)
                 self.ui.after(0, lambda: self._log(
                     f"DHCP 模式: 直连源设备 {DHCP_ASSIGNED_IP}:{TRANSFER_PORT}"
@@ -531,7 +742,9 @@ class Controller:
                 # APIPA 扫描
                 self.ui.after(0, lambda: self._log("APIPA 模式: 扫描源设备..."))
                 self.ui.after(0, lambda: self._set_status("正在扫描源设备..."))
-                source_ip = scan_source_device(log_callback=self._log)
+                source_ip = scan_source_device(
+                    log_callback=self._log, auth_code=self._auth_code
+                )
 
             if not source_ip:
                 self.ui.after(0, lambda: self._log(
@@ -543,6 +756,7 @@ class Controller:
                 self.ui.after(0, lambda: self._on_transfer_failed())
                 return
 
+            self._last_source_ip = source_ip  # 供校验阶段缺失文件重试下载
             self.ui.after(0, lambda: self._log(f"连接源设备: {source_ip}:{TRANSFER_PORT}"))
             self.ui.after(0, lambda: self.ui.tk_button_mqfzl35t.config(text="接收中..."))
 
@@ -559,6 +773,7 @@ class Controller:
                 log_callback=self._log,
                 progress_callback=_progress,
                 partition_count=self._ntfs_partition_count,
+                auth_code=self._auth_code,
             )
             self.ui.after(0, lambda: self._on_download_complete(success, files, bytes_done, errors))
 
@@ -574,6 +789,7 @@ class Controller:
         self._reset_progress("传输失败")
         self.ui.tk_select_box_discover.config(values=("等待 DHCP 响应...",))
         self.ui.tk_button_mqfzl35t.config(text="开始接收", state="normal")
+        self.ui.tk_button_dhcp.configure(text="开启DHCP", state="normal")
 
     def _on_download_complete(self, success, files, bytes_done, errors):
         """下载完成回调 — 立即启动后台校验线程，同时恢复按钮"""
@@ -605,6 +821,11 @@ class Controller:
             return
 
         partition_map = dict(self._partition_map)  # 快照当前映射
+        server_ip = self._last_source_ip
+        auth_code = self._auth_code
+        gtmc_new_name = self._detect_gtmc_new_name()
+        if gtmc_new_name:
+            self._log(f"检测到 GTMC 目录已重命名为: {gtmc_new_name} (校验时自动映射)")
 
         def _verify():
             try:
@@ -621,6 +842,9 @@ class Controller:
                     log_callback=self._log,
                     stop_check=lambda: self._stop_verify,
                     progress_callback=_verify_progress,
+                    server_ip=server_ip,
+                    gtmc_new_name=gtmc_new_name,
+                    auth_code=auth_code,
                 )
                 if self._stop_verify:
                     self.ui.after(0, lambda: self._log("校验已取消 (新一轮传输开始)"))
@@ -643,6 +867,32 @@ class Controller:
 
         self._verify_thread = threading.Thread(target=_verify, daemon=True)
         self._verify_thread.start()
+
+    def _detect_gtmc_new_name(self) -> str:
+        """
+        目标端检测 D 盘中被源端重命名后的 GTMC_User_Profiles 目录
+        (源端下载前已重命名为 GTMC_User_ProfilesYYMMDD, 而 CSV 记录的是旧名,
+         校验时需要将 CSV 路径映射到新目录名)
+        返回新目录名; 未找到返回空字符串
+        """
+        d_drive = self._partition_map.get("D", "")
+        if not d_drive or not os.path.isdir(d_drive):
+            return ""
+        candidates = []
+        try:
+            for name in os.listdir(d_drive):
+                if name.startswith("GTMC_User_Profiles") and name != "GTMC_User_Profiles":
+                    p = os.path.join(d_drive, name)
+                    if os.path.isdir(p):
+                        try:
+                            candidates.append((os.path.getmtime(p), name))
+                        except OSError:
+                            candidates.append((0, name))
+        except OSError:
+            return ""
+        if not candidates:
+            return ""
+        return max(candidates)[1]  # 取最近修改的一个
 
     # ==================== 工具方法 ====================
 

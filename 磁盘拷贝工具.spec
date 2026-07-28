@@ -1,12 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_data_files
+
+datas = []
+datas += collect_data_files('cryptography')
 
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('task', 'task')],
-    hiddenimports=['tkinter', 'tkinter.ttk', 'urllib.parse', 'json', 'csv', 'hashlib', 'concurrent.futures', 'http.server', 'struct', 're', 'threading', 'socket', 'subprocess', 'ctypes', 'ctypes.wintypes', 'urllib.request', 'urllib.error'],
+    datas=datas,
+    hiddenimports=['tkinter', 'tkinter.ttk', 'urllib.parse', 'json', 'csv', 'hashlib', 'concurrent.futures', 'http.server', 'struct', 're', 'threading', 'socket', 'subprocess', 'ctypes', 'ctypes.wintypes', 'urllib.request', 'urllib.error', 'cryptography', 'cryptography.hazmat.primitives.asymmetric.rsa', 'cryptography.hazmat.primitives.serialization', 'cryptography.hazmat.backends.openssl.backend', 'secrets', 'tls_utils'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

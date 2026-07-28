@@ -2,7 +2,6 @@
 磁盘拷贝工具 GUI
 基于 Tkinter/ttk 布局
 """
-import random
 import tkinter as _tk
 from tkinter import *
 from tkinter.ttk import *
@@ -12,6 +11,10 @@ class WinGUI(Tk):
     def __init__(self):
         super().__init__()
         self.__win()
+        # 注册 IP 每段 (0~255) 输入校验命令, 供 4 个文本框复用
+        self._octet_vcmd = (self.register(self._octet_validate), "%P")
+        # 注册验证码输入校验命令 (仅英文数字, 最多 4 位)
+        self._auth_vcmd = (self.register(self._auth_validate), "%P")
         self.tk_label_mqfzd8tn = self.__tk_label_mqfzd8tn(self)
         self.tk_label_mqfzgrmh = self.__tk_label_mqfzgrmh(self)
         self.tk_select_box_mqfzkd6x = self.__tk_select_box_mqfzkd6x(self)
@@ -25,6 +28,7 @@ class WinGUI(Tk):
         self.tk_select_box_mqg0hm2h = self.__tk_select_box_mqg0hm2h(self)
         self.tk_label_discover = self.__tk_label_discover(self)
         self.tk_select_box_discover = self.__tk_select_box_discover(self)
+        self.tk_button_dhcp = self.__tk_button_dhcp(self)
         self.tk_label_ip_manual = self.__tk_label_ip_manual(self)
         self.ip_octet1_var = _tk.StringVar()
         self.tk_ip_octet1 = self.__tk_ip_octet(self, self.ip_octet1_var, 100)
@@ -37,6 +41,11 @@ class WinGUI(Tk):
         self.tk_label_dot3 = self.__tk_dot_label(self, 256)
         self.ip_octet4_var = _tk.StringVar()
         self.tk_ip_octet4 = self.__tk_ip_octet(self, self.ip_octet4_var, 268)
+        self.tk_label_auth_title = self.__tk_label_auth_title(self)
+        self.tk_label_auth_code = self.__tk_label_auth_code(self)
+        # 目标设备: 验证码输入框 (源设备不需要输入, 只需显示)
+        self.tk_label_auth_input_title = self.__tk_label_auth_input_title(self)
+        self.tk_entry_auth_input = self.__tk_entry_auth_input(self)
         self.tk_label_status = self.__tk_label_status(self)
         self.tk_progress_bar = self.__tk_progress_bar(self)
         self.tk_file_progress_bar = self.__tk_file_progress_bar(self)
@@ -120,8 +129,13 @@ class WinGUI(Tk):
     def __tk_select_box_discover(self, parent):
         cb = Combobox(parent, state="readonly")
         cb['values'] = ("等待 DHCP 响应...",)
-        cb.place(x=100, y=165, width=380, height=28)
+        cb.place(x=100, y=165, width=265, height=28)
         return cb
+
+    def __tk_button_dhcp(self, parent):
+        btn = Button(parent, text="开启DHCP", takefocus=False)
+        btn.place(x=372, y=165, width=108, height=28)
+        return btn
 
     def __tk_button_mqfzl35t(self, parent):
         btn = Button(parent, text="开始传输/接收", takefocus=False)
@@ -129,19 +143,72 @@ class WinGUI(Tk):
         return btn
 
     def __tk_label_ip_manual(self, parent):
-        label = Label(parent, text="手动输入IP:", anchor="w")
+        label = Label(parent, text="源设备IP(手动):", anchor="w")
         label.place(x=20, y=195, width=80, height=24)
         return label
 
     def __tk_ip_octet(self, parent, var, x):
-        entry = Entry(parent, textvariable=var, width=4, justify="center")
+        entry = Entry(
+            parent, textvariable=var, width=4, justify="center",
+            validate="key", validatecommand=self._octet_vcmd,
+        )
         entry.place(x=x, y=195, width=42, height=28)
         return entry
+
+    def _octet_validate(self, new_value: str) -> bool:
+        """限制手动 IP 每个文本框只能输入 0~255 的纯数字。
+
+        允许空字符串 (便于删除/编辑); 拒绝非数字、超过 3 位、或数值 > 255。
+        """
+        if new_value == "":
+            return True
+        if not new_value.isdigit():
+            return False
+        if len(new_value) > 3:
+            return False
+        if int(new_value) > 255:
+            return False
+        return True
+
+    def _auth_validate(self, new_value: str) -> bool:
+        """限制验证码输入框: 最多 4 位, 仅允许英文/数字 (大小写不敏感)。"""
+        if len(new_value) > 4:
+            return False
+        return all(c.isalnum() for c in new_value)
 
     def __tk_dot_label(self, parent, x):
         label = Label(parent, text=".", font=("Microsoft YaHei UI", 11, "bold"))
         label.place(x=x, y=195, width=10, height=24)
         return label
+
+    def __tk_label_auth_title(self, parent):
+        label = Label(parent, text="连接验证码", anchor="e")
+        label.place(x=340, y=195, width=80, height=28)
+        return label
+
+    def __tk_label_auth_code(self, parent):
+        # 用原生 tk.Label 以便自定义大字体/前景/背景 (ttk.Label 受主题限制)
+        label = _tk.Label(
+            parent, text="----",
+            font=("Consolas", 16, "bold"),
+            fg="#D32F2F", bg="#FFF3E0",
+            relief="groove", bd=1,
+        )
+        label.place(x=428, y=190, width=187, height=36)
+        return label
+
+    def __tk_label_auth_input_title(self, parent):
+        label = _tk.Label(parent, text="连接验证码:", anchor="w",
+                          font=("Microsoft YaHei UI", 12, "bold"))
+        label.place(x=20, y=195, width=95, height=24)
+        return label
+
+    def __tk_entry_auth_input(self, parent):
+        entry = Entry(parent, font=("Microsoft YaHei UI", 16, "bold"),
+                      justify="center", validate="key",
+                      validatecommand=self._auth_vcmd)
+        entry.place(x=118, y=193, width=160, height=30)
+        return entry
 
     def __tk_label_status(self, parent):
         label = Label(parent, text="就绪", anchor="w", foreground="#555555")
@@ -235,7 +302,61 @@ class Win(WinGUI):
 
     def show_discover(self):
         self.tk_label_discover.place(x=20, y=165, width=80, height=24)
-        self.tk_select_box_discover.place(x=100, y=165, width=380, height=28)
+        self.tk_select_box_discover.place(x=100, y=165, width=265, height=28)
+
+    def hide_dhcp(self):
+        self.tk_button_dhcp.place_forget()
+
+    def show_dhcp(self):
+        self.tk_button_dhcp.place(x=372, y=165, width=108, height=28)
+
+    def show_auth_code(self, code: str):
+        """在专用区域醒目显示连接验证码"""
+        self.tk_label_auth_code.config(text=code)
+        self.tk_label_auth_title.place(x=340, y=195, width=80, height=28)
+        self.tk_label_auth_code.place(x=428, y=190, width=187, height=36)
+
+    def hide_auth_code(self):
+        self.tk_label_auth_code.config(text="----")
+        self.tk_label_auth_title.place_forget()
+        self.tk_label_auth_code.place_forget()
+
+    # ---- 手动 IP (源设备不需要, 默认隐藏) ----
+    def hide_manual_ip(self):
+        self.tk_label_ip_manual.place_forget()
+        self.tk_ip_octet1.place_forget()
+        self.tk_label_dot1.place_forget()
+        self.tk_ip_octet2.place_forget()
+        self.tk_label_dot2.place_forget()
+        self.tk_ip_octet3.place_forget()
+        self.tk_label_dot3.place_forget()
+        self.tk_ip_octet4.place_forget()
+
+    def show_manual_ip(self):
+        self.tk_label_ip_manual.place(x=20, y=195, width=80, height=24)
+        self.tk_ip_octet1.place(x=100, y=193, width=40, height=28)
+        self.tk_label_dot1.place(x=144, y=195, width=10, height=24)
+        self.tk_ip_octet2.place(x=156, y=193, width=40, height=28)
+        self.tk_label_dot2.place(x=200, y=195, width=10, height=24)
+        self.tk_ip_octet3.place(x=212, y=193, width=40, height=28)
+        self.tk_label_dot3.place(x=256, y=195, width=10, height=24)
+        self.tk_ip_octet4.place(x=268, y=193, width=40, height=28)
+
+    # ---- 目标设备验证码输入框 ----
+    def show_auth_input(self):
+        self.tk_label_auth_input_title.place(x=20, y=195, width=95, height=24)
+        self.tk_entry_auth_input.place(x=118, y=193, width=160, height=30)
+
+    def hide_auth_input(self):
+        self.tk_label_auth_input_title.place_forget()
+        self.tk_entry_auth_input.place_forget()
+
+    def get_auth_input(self) -> str:
+        return self.tk_entry_auth_input.get()
+
+    def set_auth_input(self, code: str):
+        self.tk_entry_auth_input.delete(0, "end")
+        self.tk_entry_auth_input.insert(0, code)
 
 
 if __name__ == "__main__":

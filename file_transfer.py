@@ -7,14 +7,22 @@ PE 下自动使用 APIPA (169.254.x.x)，目标设备扫描发现源设备
 import os
 import json
 import socket
+import ssl
 import threading
 import time
+import secrets
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 服务端口
+import tls_utils
+
+# 服务端口 (高位非特权端口: 无需 SYSTEM/管理员即可绑定, 避免 WinError 10013)
 TRANSFER_PORT = 9999
+
+# 客户端 SSL 上下文 (自签名证书不校验, 由验证码保证鉴权)
+CLIENT_SSL_CTX = tls_utils.make_client_ssl_context()
 
 # 需要跳过的文件夹
 SKIP_DIRS = {"AppData", "System Volume Information", "WeChat Files"}
@@ -39,6 +47,28 @@ class FileServerHandler(BaseHTTPRequestHandler):
     partition_map = {}   # {"D": "I:", "E": "J:", "F": "K:"}  正常盘符→PE盘符
     log_callback = None  # 日志回调函数
     suppress_access_log = False  # 批量传输时禁用逐条 HTTP 日志
+    auth_code = ""       # 随机验证码: 所有请求必须携带 ?pwd= 且匹配
+
+    @classmethod
+    def _is_authorized(cls, params: dict) -> bool:
+        """校验请求中的 pwd 参数是否匹配验证码 (常量时间比较)"""
+        if not cls.auth_code:
+            return False
+        pwd = params.get("pwd", "")
+        return secrets.compare_digest(pwd, cls.auth_code)
+
+    @staticmethod
+    def _parse_query(path: str):
+        """从请求路径解析 (path, params_dict)"""
+        p = path.split("?")[0]
+        params = {}
+        if "?" in path:
+            qs = path.split("?", 1)[1]
+            for pair in qs.split("&"):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    params[k] = urllib.parse.unquote(v)
+        return p, params
 
     def log_message(self, format, *args):
         """重定向 HTTP 日志 (批量传输时抑制逐条日志，避免 after(0) 洪水)"""
@@ -48,11 +78,15 @@ class FileServerHandler(BaseHTTPRequestHandler):
             FileServerHandler.log_callback(f"[HTTP] {args[0]}")
 
     def _send_json(self, data, status=200):
+        # 必须携带 Content-Length: HTTP/1.1 keep-alive 下客户端依赖它判断 body 结束,
+        # 否则 resp.read() 会阻塞直到超时 (P0 Bug 修复)
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8-sig"))
+        self.wfile.write(body)
 
     def _send_file(self, filepath, file_info=""):
         if not os.path.isfile(filepath):
@@ -98,16 +132,12 @@ class FileServerHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             # 解析路径和参数
-            path = self.path.split("?")[0]
-            params = {}
-            if "?" in self.path:
-                qs = self.path.split("?", 1)[1]
-                for pair in qs.split("&"):
-                    if "=" in pair:
-                        k, v = pair.split("=", 1)
-                        # URL 解码参数值 (中文文件名等)
-                        from urllib.parse import unquote
-                        params[k] = unquote(v)
+            path, params = self._parse_query(self.path)
+
+            # ---- 鉴权: 必须携带正确的 pwd ----
+            if not FileServerHandler._is_authorized(params):
+                self._send_json({"error": "未授权: 验证码错误"}, 403)
+                return
 
             if path == "/list":
                 self._handle_list(params)
@@ -158,13 +188,17 @@ class FileServerHandler(BaseHTTPRequestHandler):
                             continue
                     full = os.path.join(root, fname)
                     try:
-                        fsize = os.path.getsize(full)
+                        st = os.stat(full)
+                        fsize = st.st_size
+                        f_mtime = st.st_mtime  # 保留原始修改时间，传输后还原
                     except OSError:
                         fsize = 0
+                        f_mtime = 0
                     rel = os.path.relpath(full, base)
                     files.append({
                         "path": rel.replace("\\", "/"),
                         "size": fsize,
+                        "mtime": f_mtime,
                     })
                     total_size += fsize
 
@@ -196,7 +230,11 @@ class FileServerHandler(BaseHTTPRequestHandler):
     # ---- 小文件批量下载 ----
     def do_POST(self):
         try:
-            path = self.path.split("?")[0]
+            path, params = self._parse_query(self.path)
+            # ---- 鉴权: 必须携带正确的 pwd ----
+            if not FileServerHandler._is_authorized(params):
+                self._send_json({"error": "未授权: 验证码错误"}, 403)
+                return
             if path == "/batch_get":
                 self._handle_batch_get()
             else:
@@ -259,9 +297,10 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
 
 class ThreadingFileServer(ThreadingMixIn, HTTPServer):
-    """多线程 HTTP 服务器，支持并发处理多个下载请求"""
+    """多线程 HTTPS 服务器，支持并发处理多个下载请求"""
     daemon_threads = True
     allow_reuse_address = True
+    ssl_ctx = None  # 服务器 SSL 上下文 (由 FileServer.start 设置)
 
     def server_bind(self):
         """绑定前设置 socket 选项"""
@@ -273,37 +312,90 @@ class ThreadingFileServer(ThreadingMixIn, HTTPServer):
         super().server_bind()
 
     def get_request(self):
-        """接受连接后设置客户端 socket 选项"""
+        """接受连接后设置客户端 socket 选项, 并强制 TLS: 仅当首字节为 TLS ClientHello
+        (0x16 0x03) 才升级为加密连接; 其余一律视为非法明文请求直接关闭。
+        按安全策略 (指令 C) 禁止明文 HTTP, 无证书 (ssl_ctx 为 None) 时同样拒绝服务。
+        """
         conn, addr = super().get_request()
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
         conn.settimeout(30)  # 30s 超时，防止僵死连接
+        if self.ssl_ctx is None:
+            # 无证书则无法提供 TLS; 按指令 C 禁止明文, 直接拒绝
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise RuntimeError("未配置 TLS 证书, 已禁用明文 HTTP (指令 C)")
+        try:
+            peek = conn.recv(2, socket.MSG_PEEK)
+        except Exception:
+            peek = b""
+        if not (peek[:1] == b"\x16" and peek[1:2] == b"\x03"):
+            # 非 TLS 请求 (明文 HTTP) → 禁止, 关闭连接
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise RuntimeError("明文 HTTP 已被禁用 (指令 C)")
+        try:
+            conn = self.ssl_ctx.wrap_socket(conn, server_side=True)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
         return conn, addr
 
 
-class FileServer:
-    """文件服务器包装类"""
+# (HTTP→HTTPS 重定向服务已移除; 本服务器为纯 TLS, 明文 HTTP 已被禁用, 见指令 C)
 
-    def __init__(self, partition_map: dict, log_callback=None):
+
+class FileServer:
+    """文件服务器包装类 (纯 TLS, 明文 HTTP 已禁用)"""
+
+    def __init__(self, partition_map: dict, log_callback=None,
+                 auth_code: str = "", cert_paths: tuple = None, redirect_ip: str = ""):
         """
         partition_map: {"D": "I:", "E": "J:", "F": "K:"} 正常盘符→PE盘符
+        auth_code:     随机验证码, 客户端请求必须携带
+        cert_paths:    (cert_path, key_path) 自签名证书
+        redirect_ip:   保留参数 (原明文重定向目标, 现已禁用明文, 不再使用)
         """
         self.partition_map = partition_map
         self.log_callback = log_callback
+        self.auth_code = auth_code
+        self.cert_paths = cert_paths
+        self.redirect_ip = redirect_ip
         self._server = None
         self._thread = None
+        self._redirect_server = None
+        self._redirect_thread = None
 
     def start(self):
         """启动服务器（阻塞线程）"""
         FileServerHandler.partition_map = self.partition_map
         FileServerHandler.log_callback = self.log_callback
         FileServerHandler.suppress_access_log = True  # 批量传输时禁止逐条 HTTP 访问日志
+        FileServerHandler.auth_code = self.auth_code
 
         self._server = ThreadingFileServer(("0.0.0.0", TRANSFER_PORT), FileServerHandler)
+        if self.cert_paths:
+            try:
+                self._server.ssl_ctx = tls_utils.make_server_ssl_context(*self.cert_paths)
+                if self.log_callback:
+                    self.log_callback("HTTPS (TLS) 已启用")
+            except Exception as e:
+                if self.log_callback:
+                    self.log_callback(f"SSL 上下文创建失败: {e}")
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
         if self.log_callback:
-            self.log_callback(f"文件服务器已启动，监听端口 {TRANSFER_PORT}")
+            self.log_callback(f"文件服务器已启动 (纯 TLS), 监听端口 {TRANSFER_PORT}")
+
+        # 说明: 纯 TLS 服务器, 明文 HTTP 已禁用 (指令 C)。鉴权由 pwd 验证码保证。
+        # 端口为高位非特权端口 9999, 无需 SYSTEM/管理员即可绑定, 避免 WinError 10013。
 
     def _serve(self):
         try:
@@ -312,10 +404,22 @@ class FileServer:
             if self.log_callback:
                 self.log_callback(f"服务器异常: {e}")
 
+    def _redirect_serve(self):
+        try:
+            self._redirect_server.serve_forever()
+        except Exception:
+            pass
+
     def stop(self):
         if self._server:
             self._server.shutdown()
             self._server.server_close()
+        if self._redirect_server:
+            try:
+                self._redirect_server.shutdown()
+                self._redirect_server.server_close()
+            except Exception:
+                pass
         if self.log_callback:
             self.log_callback("文件服务器已停止")
 
@@ -336,8 +440,19 @@ import http.client as _http_client
 _tl_connections = threading.local()
 
 
+def _urlopen_https(url: str, timeout: int = 5, context=CLIENT_SSL_CTX, **kwargs):
+    """仅使用 HTTPS (TLS)。按安全策略 (指令 C) 禁止回退到明文 HTTP:
+    TLS 握手失败即抛出异常, 由调用方记录并中止, 绝不降级为明文传输。
+    链路加密由 TLS 提供, 鉴权仍由 pwd 验证码保证。
+    """
+    return urllib.request.urlopen(url, timeout=timeout, context=context, **kwargs)
+
+
 def _get_thread_connection(host: str, port: int):
-    """获取或惰性重建当前线程的持久 HTTP 连接"""
+    """获取或惰性建立当前线程的持久 TLS 连接 (纯 HTTPS)。
+    按安全策略 (指令 C) 禁止明文回退: 若 TLS 握手失败直接抛出异常,
+    由下载函数捕获并记录错误, 绝不降级为明文 HTTP。
+    """
     key = f"{host}:{port}"
     conns = getattr(_tl_connections, "conns", None)
     if conns is None:
@@ -346,7 +461,9 @@ def _get_thread_connection(host: str, port: int):
 
     conn = conns.get(key)
     if conn is None:
-        conn = _http_client.HTTPConnection(host, port, timeout=120, blocksize=1024 * 1024)
+        conn = _http_client.HTTPSConnection(
+            host, port, timeout=120, context=CLIENT_SSL_CTX, blocksize=1024 * 1024
+        )
         conn.connect()
         conns[key] = conn
     return conn
@@ -370,35 +487,44 @@ def _download_single_file(
     rel_path: str,
     fsize: int,
     target_path: str,
-    stats_lock: threading.Lock,
-    completed_files_list: list,
-    completed_bytes_list: list,
-    errors: list,
+    mtime: float = 0,
+    auth_code: str = "",
+    stats_lock: threading.Lock = None,
+    completed_files_list: list = None,
+    completed_bytes_list: list = None,
+    errors: list = None,
     log_callback=None,
     file_progress_callback=None,
+    overwrite: bool = False,
 ):
-    """下载单个文件（在线程池中执行，写 .tmp 后重命名防断点文件损坏）"""
+    """下载单个文件（在线程池中执行，写 .tmp 后重命名防断点文件损坏）
+    overwrite=True 时覆盖已存在文件 (用户选择覆盖); 否则断点续传跳过已存在文件。
+    """
     import urllib.parse as _urlparse
 
     def log(msg):
         if log_callback:
             log_callback(msg)
 
-    # 断点续传: 如果目标文件已存在且大小正确，直接跳过
+    # 已存在文件处理: 覆盖模式重下; 否则断点续传跳过 (大小正确时)
     if os.path.isfile(target_path):
         existing_size = os.path.getsize(target_path)
-        if existing_size == fsize:
+        if existing_size == fsize and not overwrite:
+            if mtime:
+                try:
+                    os.utime(target_path, (mtime, mtime))
+                except OSError:
+                    pass
             log(f"  [✓] 跳过(已存在): {rel_path}")
             with stats_lock:
                 completed_files_list[0] += 1
                 completed_bytes_list[0] += fsize
             return
-        else:
+        elif not overwrite:
             log(f"  [_] 大小不匹配, 重新下载: {rel_path} (已有{existing_size}, 期望{fsize})")
-            try:
-                os.remove(target_path)
-            except OSError:
-                pass
+        else:
+            log(f"  [_] 覆盖模式, 重新下载: {rel_path}")
+        # 覆盖/大小不匹配: 由下方 tmp+rename 过程覆盖, 无需预删除
 
     # 清理上一轮残留的 .tmp 文件
     tmp_path = target_path + ".tmp"
@@ -415,7 +541,7 @@ def _download_single_file(
     try:
         conn = _get_thread_connection(host, port)
         encoded_path = _urlparse.quote(rel_path, safe="")
-        url_path = f"/get?partition={normal_partition}&path={encoded_path}"
+        url_path = f"/get?partition={normal_partition}&path={encoded_path}&pwd={urllib.parse.quote(auth_code)}"
         conn.request("GET", url_path, headers={"Connection": "keep-alive"})
         resp = conn.getresponse()
 
@@ -467,6 +593,13 @@ def _download_single_file(
                 errors.append(f"分区 {normal_partition}: {rel_path} 重命名失败")
             return
 
+        # 还原原始修改时间 (HTTP 传输默认会变为传输时间)
+        if mtime:
+            try:
+                os.utime(target_path, (mtime, mtime))
+            except OSError:
+                pass
+
         if fsize >= BATCH_SIZE_THRESHOLD:
             log(f"  [OK] {rel_path}")
 
@@ -502,14 +635,18 @@ def _handle_tmp_failure(log, tmp_path: str, rel_path: str):
 def _download_batch(
     base_url: str,
     normal_partition: str,
-    batch_tasks: list,  # [(normal_partition, rel_path, fsize, target_path), ...]
-    stats_lock: threading.Lock,
-    completed_files_list: list,
-    completed_bytes_list: list,
-    errors: list,
+    batch_tasks: list,  # [(normal_partition, rel_path, fsize, target_path, mtime), ...]
+    auth_code: str = "",
+    stats_lock: threading.Lock = None,
+    completed_files_list: list = None,
+    completed_bytes_list: list = None,
+    errors: list = None,
     log_callback=None,
+    overwrite: bool = False,
 ):
-    """批量下载小文件：一次 POST 请求获取多个文件，写 .tmp 后重命名防断点损坏"""
+    """批量下载小文件：一次 POST 请求获取多个文件，写 .tmp 后重命名防断点损坏
+    overwrite=True 时覆盖已存在文件; 否则断点续传跳过已存在且大小正确的文件。
+    """
     import struct as _struct
     import urllib.parse as _urlparse
 
@@ -521,25 +658,29 @@ def _download_batch(
     host = parsed.hostname
     port = parsed.port or TRANSFER_PORT
 
-    # 断点续传: 跳过已存在且大小正确的文件
+    # 断点续传: 跳过已存在且大小正确的文件 (覆盖模式则全部重新下载)
     remaining_tasks = []  # [(rel_path, fsize, target_path), ...]
     for item in batch_tasks:
-        _, rel_path, fsize, target_path = item
+        _, rel_path, fsize, target_path, mtime = item
         if os.path.isfile(target_path):
             existing_size = os.path.getsize(target_path)
-            if existing_size == fsize:
+            if existing_size == fsize and not overwrite:
+                if mtime:
+                    try:
+                        os.utime(target_path, (mtime, mtime))
+                    except OSError:
+                        pass
                 log(f"  [✓] 跳过(已存在): {rel_path}")
                 with stats_lock:
                     completed_files_list[0] += 1
                     completed_bytes_list[0] += fsize
                 continue
-            else:
+            elif not overwrite:
                 log(f"  [_] 大小不匹配, 重新下载: {rel_path}")
-                try:
-                    os.remove(target_path)
-                except OSError:
-                    pass
-        remaining_tasks.append((rel_path, fsize, target_path))
+            else:
+                log(f"  [_] 覆盖模式, 重新下载: {rel_path}")
+            # 覆盖/大小不匹配: 交由下方 tmp+rename 覆盖
+        remaining_tasks.append((rel_path, fsize, target_path, mtime))
 
     if not remaining_tasks:
         return  # 本批次全部已存在
@@ -555,7 +696,7 @@ def _download_batch(
             "paths": paths,
         }, ensure_ascii=False).encode("utf-8-sig")
 
-        conn.request("POST", "/batch_get", body=body, headers={
+        conn.request("POST", f"/batch_get?pwd={urllib.parse.quote(auth_code)}", body=body, headers={
             "Content-Type": "application/json; charset=utf-8",
             "Connection": "keep-alive",
         })
@@ -565,7 +706,7 @@ def _download_batch(
             body_text = resp.read().decode("utf-8-sig", errors="replace")
             log(f"  [X] 批次下载失败 HTTP {resp.status}: {body_text}")
             with stats_lock:
-                for rel_path, fsize, target_path in remaining_tasks:
+                for rel_path, fsize, target_path, _mt in remaining_tasks:
                     errors.append(
                         f"分区 {normal_partition}: {rel_path} 批次HTTP {resp.status}"
                     )
@@ -576,7 +717,7 @@ def _download_batch(
         if len(raw) < 4:
             log(f"  [X] 批次响应过短: {len(raw)} 字节")
             with stats_lock:
-                for rel_path, fsize, target_path in remaining_tasks:
+                for rel_path, fsize, target_path, _mt in remaining_tasks:
                     errors.append(f"分区 {normal_partition}: {rel_path} 批次响应异常")
             return
 
@@ -612,10 +753,12 @@ def _download_batch(
             # 查找对应任务
             target_path = ""
             exp_size = 0
-            for bp, bsize, tp in remaining_tasks:
+            exp_mtime = 0
+            for bp, bsize, tp, bt in remaining_tasks:
                 if bp == rel_path:
                     target_path = tp
                     exp_size = bsize
+                    exp_mtime = bt
                     break
 
             if not target_path:
@@ -656,13 +799,20 @@ def _download_batch(
                     errors.append(f"分区 {normal_partition}: {rel_path} 重命名失败")
                 continue
 
+            # 还原原始修改时间
+            if exp_mtime:
+                try:
+                    os.utime(target_path, (exp_mtime, exp_mtime))
+                except OSError:
+                    pass
+
             with stats_lock:
                 completed_files_list[0] += 1
                 completed_bytes_list[0] += actual_size
             received_files += 1
 
         # 检查是否有本批次请求了但未返回的文件
-        for bp, bsize, btp in remaining_tasks:
+        for bp, bsize, btp, _bt in remaining_tasks:
             if bp in returned_paths:
                 continue
             if os.path.isfile(btp):
@@ -677,13 +827,13 @@ def _download_batch(
         _invalidate_thread_connection(host, port)
         log(f"  [X] 批次下载失败(连接): {e}")
         with stats_lock:
-            for rel_path, fsize, target_path in remaining_tasks:
+            for rel_path, fsize, target_path, _mt in remaining_tasks:
                 errors.append(f"分区 {normal_partition}: {rel_path} 批次连接失败")
 
     except Exception as e:
         log(f"  [X] 批次下载失败: {e}")
         with stats_lock:
-            for rel_path, fsize, target_path in remaining_tasks:
+            for rel_path, fsize, target_path, _mt in remaining_tasks:
                 errors.append(f"分区 {normal_partition}: {rel_path} 批次异常")
 
 
@@ -695,18 +845,23 @@ def download_files(
     partition_progress_callback=None,
     max_workers: int = DEFAULT_DOWNLOAD_WORKERS,
     partition_count: int = 0,
+    auth_code: str = "",
+    overwrite: bool = False,
+    stop_check=None,
 ):
     """
-    从源设备多线程并行下载 D/E/F 分区数据
+    从源设备多线程并行下载 D/E/F 分区数据 (HTTPS + 验证码鉴权)
     partition_map: {"D": "I:", "E": "J:", "F": "K:"}  正常盘符→目标PE盘符
     server_ip: 源设备 IP
+    auth_code: 源设备显示的验证码 (pwd)
     max_workers: 并行下载线程数 (默认 6)
     partition_count: NTFS 分区数 (2/3/4) — 2 分区时 D 盘仅下载 User 文件夹
     """
     import urllib.request
     import urllib.error
 
-    base_url = f"http://{server_ip}:{TRANSFER_PORT}"
+    base_url = f"https://{server_ip}:{TRANSFER_PORT}"
+    pwd = urllib.parse.quote(auth_code)
     local_partition_map = partition_map
 
     # 使用可变列表包装，避免闭包中赋值问题
@@ -725,10 +880,10 @@ def download_files(
             progress_callback(completed_files[0], total_files, completed_bytes[0], total_bytes)
 
     # 先 ping 确认服务器在线
-    log(f"正在连接源设备 {server_ip}:{TRANSFER_PORT}...")
+    log(f"正在连接源设备 {server_ip}:{TRANSFER_PORT} (HTTPS)...")
     for attempt in range(5):
         try:
-            req = urllib.request.urlopen(f"{base_url}/ping", timeout=5)
+            req = _urlopen_https(f"{base_url}/ping?pwd={pwd}", timeout=5)
             data = json.loads(req.read().decode("utf-8-sig"))
             if data.get("status") == "ok":
                 log(f"已连接到源设备，可用分区: {data.get('partitions', [])}")
@@ -756,8 +911,8 @@ def download_files(
         log(f"\n{'='*40}")
         log(f"正在获取 {normal_partition} 盘文件列表...")
         try:
-            req = urllib.request.urlopen(
-                f"{base_url}/list?partition={normal_partition}", timeout=30
+            req = _urlopen_https(
+                f"{base_url}/list?partition={normal_partition}&pwd={pwd}", timeout=30,
             )
             list_data = json.loads(req.read().decode("utf-8-sig"))
         except Exception as e:
@@ -793,8 +948,9 @@ def download_files(
         for f_info in files:
             rel_path = f_info["path"]
             fsize = f_info["size"]
+            mtime = f_info.get("mtime", 0)
             target_path = os.path.join(target_drive, rel_path.replace("/", "\\"))
-            all_download_tasks.append((normal_partition, rel_path, fsize, target_path))
+            all_download_tasks.append((normal_partition, rel_path, fsize, target_path, mtime))
 
     # 断点续传: 清理所有残留 .tmp 文件 (上一轮传输中断留下的)
     log("清理上一轮残留的 .tmp 文件...")
@@ -810,21 +966,33 @@ def download_files(
     if tmp_cleaned > 0:
         log(f"已清理 {tmp_cleaned} 个残留 .tmp 文件")
 
-    # 断点续传: 统计已存在且大小正确的文件 (跳过下载)
+    # 断点续传/覆盖: 统计已存在且大小正确的文件
     skipped_files = 0
     skipped_bytes = 0
     remaining_tasks = []
-    for task in all_download_tasks:
-        _, _, fsize, target_path = task
-        if os.path.isfile(target_path):
-            existing_size = os.path.getsize(target_path)
-            if existing_size == fsize:
-                skipped_files += 1
-                skipped_bytes += fsize
-                continue
-        remaining_tasks.append(task)
-    if skipped_files > 0:
-        log(f"断点续传: 跳过 {skipped_files} 个已存在文件 ({_fmt_size(skipped_bytes)})")
+    if overwrite:
+        # 覆盖模式: 不排除任何已存在文件, 全部重新下载
+        remaining_tasks = list(all_download_tasks)
+        log("覆盖模式: 将重新下载所有文件 (含已存在的)")
+    else:
+        # 断点续传: 跳过已存在且大小正确的文件
+        for task in all_download_tasks:
+            _, _, fsize, target_path, _mtime = task
+            if os.path.isfile(target_path):
+                existing_size = os.path.getsize(target_path)
+                if existing_size == fsize:
+                    # 修正已存在文件的原始修改时间 (上一轮可能丢失)
+                    if _mtime:
+                        try:
+                            os.utime(target_path, (_mtime, _mtime))
+                        except OSError:
+                            pass
+                    skipped_files += 1
+                    skipped_bytes += fsize
+                    continue
+            remaining_tasks.append(task)
+        if skipped_files > 0:
+            log(f"断点续传: 跳过 {skipped_files} 个已存在文件 ({_fmt_size(skipped_bytes)})")
     all_download_tasks = remaining_tasks
 
     # 初始化进度: 已跳过的文件计入已完成
@@ -867,11 +1035,35 @@ def download_files(
     reporter_thread = threading.Thread(target=progress_reporter, daemon=True)
     reporter_thread.start()
 
+    # 暂停/取消信号: stop_check() 返回 ("cancel",) 终止传输; 返回 ("pause",) 阻塞等待恢复
+    _pause_event = threading.Event()
+    _pause_event.set()
+
+    def _check_stop():
+        """返回 True 表示已取消; 暂停时阻塞直到恢复"""
+        if stop_check is None:
+            return False
+        sig = stop_check()
+        if sig == "cancel":
+            return True
+        if sig == "pause":
+            _pause_event.clear()
+            _pause_event.wait()  # 等待 control 层调用 set() 恢复
+            return False
+        return False
+
     # 逐分区处理 (D → E → F)，避免跨分区并发 IO 导致崩溃
+    cancelled = False
     for normal_partition in ("D", "E", "F"):
         partition_tasks = partition_task_map.get(normal_partition, [])
         if not partition_tasks:
             continue
+
+        # 进入新分区前检查暂停/取消
+        if _check_stop():
+            cancelled = True
+            log(f"{normal_partition} 盘: 传输已取消 (用户中止)")
+            break
 
         partition_total = len(partition_tasks)
         log(f"\n{'='*40}")
@@ -896,7 +1088,7 @@ def download_files(
         current_batch = []
         current_batch_bytes = 0
         for task in partition_tasks:
-            _, rel_path, fsize, target_path = task
+            _, rel_path, fsize, target_path, _mtime = task
             if fsize < BATCH_SIZE_THRESHOLD:
                 current_batch.append(task)
                 current_batch_bytes += fsize
@@ -929,17 +1121,19 @@ def download_files(
                     base_url,
                     normal_partition,
                     batch,
+                    auth_code,
                     stats_lock,
                     completed_files,
                     completed_bytes,
                     errors,
                     log_callback,
+                    overwrite,
                 )
                 futures.append(future)
 
             # 提交单文件任务
             for task in partition_singles:
-                np, rp, fs, tp = task
+                np, rp, fs, tp, mt = task
                 future = executor.submit(
                     _download_single_file,
                     base_url,
@@ -947,12 +1141,15 @@ def download_files(
                     rp,
                     fs,
                     tp,
+                    mt,
+                    auth_code,
                     stats_lock,
                     completed_files,
                     completed_bytes,
                     errors,
                     log_callback,
                     None,  # file_progress_callback 不再使用 (简化进度显示)
+                    overwrite,
                 )
                 futures.append(future)
 
@@ -963,6 +1160,14 @@ def download_files(
                 except Exception as e:
                     log(f"  [X] 线程异常: {e}")
                     errors.append(f"线程异常: {e}")
+
+                # 每完成一个文件检查暂停/取消 (取消则取消剩余任务并跳出)
+                if _check_stop():
+                    cancelled = True
+                    for f in futures:
+                        f.cancel()
+                    log(f"{normal_partition} 盘: 传输已取消 (用户中止)")
+                    break
 
                 # 更新分区进度条
                 if partition_progress_callback:
@@ -981,7 +1186,9 @@ def download_files(
 
     # 最终总进度
     progress()
-    success = len(errors) == 0
+    success = len(errors) == 0 and not cancelled
+    if cancelled:
+        log("传输已被用户取消 (已下载的文件保留在磁盘, 可重新传输以续传)")
     log(f"\n{'='*40}")
     log(f"传输完成: {completed_files[0]}/{total_files} 文件, "
         + f"{_fmt_size(completed_bytes[0])}/{_fmt_size(total_bytes)}")
@@ -1032,13 +1239,14 @@ def _try_connect(ip: str, port: int, timeout: float = 0.8) -> bool:
         return False
 
 
-def _verify_source(ip: str, timeout: float = 2.0) -> bool:
-    """验证目标 IP 是否是源设备 (发送 /ping 请求)"""
+def _verify_source(ip: str, timeout: float = 2.0, auth_code: str = "") -> bool:
+    """验证目标 IP 是否是源设备 (发送 /ping 请求, HTTPS)"""
     import urllib.request
     import urllib.error
     try:
-        req = urllib.request.urlopen(
-            f"http://{ip}:{TRANSFER_PORT}/ping", timeout=timeout
+        pwd = urllib.parse.quote(auth_code)
+        req = _urlopen_https(
+            f"https://{ip}:{TRANSFER_PORT}/ping?pwd={pwd}", timeout=timeout,
         )
         data = json.loads(req.read().decode("utf-8-sig"))
         return data.get("status") == "ok"
@@ -1046,9 +1254,9 @@ def _verify_source(ip: str, timeout: float = 2.0) -> bool:
         return False
 
 
-def scan_source_device(log_callback=None) -> str:
+def scan_source_device(log_callback=None, auth_code: str = "") -> str:
     """
-    扫描局域网找到源设备 (端口 9999 开放)
+    扫描局域网找到源设备 (端口开放, TLS 或明文均可)
     策略: 优先扫描本机所在 /24，逐级扩大，绝不扫整个 /16
     返回源设备 IP，找不到返回空字符串
     """
@@ -1099,7 +1307,7 @@ def scan_source_device(log_callback=None) -> str:
 
         # 第二阶段: 验证
         for ip in candidates:
-            if _verify_source(ip):
+            if _verify_source(ip, auth_code=auth_code):
                 return ip
 
     if log_callback:
