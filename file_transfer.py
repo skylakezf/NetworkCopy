@@ -4,6 +4,7 @@ Phase 3: 源设备启动 HTTP 文件服务器，目标设备通过 HTTP 下载
 保持完整目录结构，日志实时回传
 PE 下自动使用 APIPA (169.254.x.x)，目标设备扫描发现源设备
 """
+import ctypes as _ctypes
 import os
 import json
 import socket
@@ -17,6 +18,29 @@ from socketserver import ThreadingMixIn
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import tls_utils
+
+# Windows API 常量: 阻止系统休眠/锁屏
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+_ES_DISPLAY_REQUIRED = 0x00000002
+
+
+def _prevent_sleep():
+    """阻止系统自动休眠和关闭显示器 (Windows API SetThreadExecutionState)"""
+    try:
+        _ctypes.windll.kernel32.SetThreadExecutionState(
+            _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_DISPLAY_REQUIRED
+        )
+    except Exception:
+        pass  # 非 Windows 或权限不足时静默忽略
+
+
+def _allow_sleep():
+    """恢复系统正常休眠策略"""
+    try:
+        _ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+    except Exception:
+        pass
 
 # 服务端口 (高位非特权端口: 无需 SYSTEM/管理员即可绑定, 避免 WinError 10013)
 TRANSFER_PORT = 9999
@@ -108,10 +132,15 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
         with open(filepath, "rb") as f:
             while True:
-                chunk = f.read(1024 * 1024)  # 1MB chunks
+                chunk = f.read(4 * 1024 * 1024)  # 4MB chunks，减少循环和 SSL 记录开销
                 if not chunk:
                     break
                 self.wfile.write(chunk)
+        # 确保缓冲数据立即推送 (wbufsize=1MB 时，最后不到 1MB 的数据可能未自动 flush)
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
 
     def _resolve_path(self, normal_partition: str, relative_path: str = ""):
         """
@@ -136,6 +165,9 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
             # ---- 鉴权: 必须携带正确的 pwd ----
             if not FileServerHandler._is_authorized(params):
+                if FileServerHandler.log_callback:
+                    FileServerHandler.log_callback(
+                        f"[诊断] 拒绝未授权请求: path={path} (缺少或错误的 ?pwd= 验证码)")
                 self._send_json({"error": "未授权: 验证码错误"}, 403)
                 return
 
@@ -233,6 +265,9 @@ class FileServerHandler(BaseHTTPRequestHandler):
             path, params = self._parse_query(self.path)
             # ---- 鉴权: 必须携带正确的 pwd ----
             if not FileServerHandler._is_authorized(params):
+                if FileServerHandler.log_callback:
+                    FileServerHandler.log_callback(
+                        f"[诊断] 拒绝未授权请求: path={path} (缺少或错误的 ?pwd= 验证码)")
                 self._send_json({"error": "未授权: 验证码错误"}, 403)
                 return
             if path == "/batch_get":
@@ -297,10 +332,35 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
 
 class ThreadingFileServer(ThreadingMixIn, HTTPServer):
-    """多线程 HTTPS 服务器，支持并发处理多个下载请求"""
+    """多线程 HTTPS 服务器，支持并发处理多个下载请求。
+
+    关键设计: _requests_semaphore 限制并发处理线程数 (默认 16)。
+    ThreadingMixIn 原生无上限 — 每次请求 spawn 新线程, 客户端 8 worker × 上万文件
+    会导致服务端创建/销毁数万个线程, 最终资源耗尽 (WinError 10054→10060)。
+    """
     daemon_threads = True
     allow_reuse_address = True
     ssl_ctx = None  # 服务器 SSL 上下文 (由 FileServer.start 设置)
+
+    # 输出缓冲区: 1MB，合并多次小写为一个 socket.sendall，减少 SSL/TLS 记录开销
+    # 默认 wbufsize=0 意味着每个 write 都直接走 sendall，产生大量 TLS 片 → 严重拖慢吞吐量
+    wbufsize = 1024 * 1024
+
+    # 最大并发处理线程数 (防止 ThreadingMixIn 无限创建线程耗尽 OS 资源)
+    MAX_CONCURRENT_HANDLERS = 16
+    _requests_semaphore = None  # 类级别信号量, 首次 process_request 时惰性初始化
+
+    def process_request(self, request, client_address):
+        """限制并发线程数: 超过上限则阻塞等待, 避免无限创建线程"""
+        if ThreadingFileServer._requests_semaphore is None:
+            ThreadingFileServer._requests_semaphore = threading.BoundedSemaphore(
+                ThreadingFileServer.MAX_CONCURRENT_HANDLERS
+            )
+        ThreadingFileServer._requests_semaphore.acquire()
+        try:
+            super().process_request(request, client_address)
+        finally:
+            ThreadingFileServer._requests_semaphore.release()
 
     def server_bind(self):
         """绑定前设置 socket 选项"""
@@ -315,37 +375,73 @@ class ThreadingFileServer(ThreadingMixIn, HTTPServer):
         """接受连接后设置客户端 socket 选项, 并强制 TLS: 仅当首字节为 TLS ClientHello
         (0x16 0x03) 才升级为加密连接; 其余一律视为非法明文请求直接关闭。
         按安全策略 (指令 C) 禁止明文 HTTP, 无证书 (ssl_ctx 为 None) 时同样拒绝服务。
+
+        关键: 所有拒绝路径都抛 OSError 子类 (ConnectionAbortedError)。
+        原因: 基类 BaseServer.handle_request 只捕获 `except OSError` 来跳过异常连接,
+        若抛 RuntimeError 会导致异常逃逸出 serve_forever, 使整个服务器线程崩溃 ——
+        这正是"浏览器一发明文请求服务器就死、后续 https 也连不上"的根因。
+        改为抛 OSError 后, 非法/握手失败的连接只会被丢弃, 服务器继续存活。
         """
         conn, addr = super().get_request()
+        if FileServerHandler.log_callback:
+            FileServerHandler.log_callback(f"[诊断] 收到新连接来自 {addr}")
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
         conn.settimeout(30)  # 30s 超时，防止僵死连接
         if self.ssl_ctx is None:
             # 无证书则无法提供 TLS; 按指令 C 禁止明文, 直接拒绝
+            if FileServerHandler.log_callback:
+                FileServerHandler.log_callback(f"[诊断] 拒绝连接 {addr}: 未配置 TLS 证书 (明文 HTTP 已禁用)")
             try:
                 conn.close()
             except Exception:
                 pass
-            raise RuntimeError("未配置 TLS 证书, 已禁用明文 HTTP (指令 C)")
+            raise ConnectionAbortedError("未配置 TLS 证书, 已禁用明文 HTTP (指令 C)")
+        # 稳健读取 TLS 握手头: 至少需要 2 字节 (0x16 0x03)。
+        # 跨机网络下 recv(2, MSG_PEEK) 可能先只到达 1 字节, 必须用循环补齐,
+        # 否则会误判为"明文 HTTP"而直接关闭连接, 导致传输失败。
         try:
-            peek = conn.recv(2, socket.MSG_PEEK)
-        except Exception:
             peek = b""
+            while len(peek) < 2:
+                chunk = conn.recv(2 - len(peek), socket.MSG_PEEK)
+                if not chunk:
+                    raise ConnectionAbortedError("客户端未发送数据 (连接已关闭)")
+                peek += chunk
+        except Exception as e:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if FileServerHandler.log_callback:
+                FileServerHandler.log_callback(
+                    f"[诊断] 拒绝连接 {addr}: 读取握手头失败/超时: {e} (连接已关闭)")
+            # 抛 OSError 子类, 让服务器在拒绝该连接后继续存活 (而非崩溃)
+            raise ConnectionAbortedError("明文 HTTP 已被禁用 (指令 C)")
         if not (peek[:1] == b"\x16" and peek[1:2] == b"\x03"):
             # 非 TLS 请求 (明文 HTTP) → 禁止, 关闭连接
             try:
                 conn.close()
             except Exception:
                 pass
-            raise RuntimeError("明文 HTTP 已被禁用 (指令 C)")
+            if FileServerHandler.log_callback:
+                FileServerHandler.log_callback(f"[诊断] 拒绝连接 {addr}: 非 TLS 握手 (明文 HTTP 已被禁用)")
+            # 抛 OSError 子类, 让服务器在拒绝该连接后继续存活 (而非崩溃)
+            raise ConnectionAbortedError("明文 HTTP 已被禁用 (指令 C)")
         try:
             conn = self.ssl_ctx.wrap_socket(conn, server_side=True)
-        except Exception:
+        except Exception as e:
             try:
                 conn.close()
             except Exception:
                 pass
-            raise
+            if FileServerHandler.log_callback:
+                FileServerHandler.log_callback(f"[诊断] 拒绝连接 {addr}: TLS 握手失败: {e}")
+            # TLS 握手失败 (非 TLS 客户端/证书问题) → 抛 OSError, 服务器继续存活
+            raise ConnectionAbortedError("TLS 握手失败, 已断开连接")
+        if FileServerHandler.log_callback:
+            FileServerHandler.log_callback(f"[诊断] 连接 {addr}: TLS 握手成功, 进入加密通道")
+        # 握手成功后取消 30s 握手超时, 改为阻塞, 避免大文件传输中因空闲间隙被误断
+        conn.settimeout(None)
         return conn, addr
 
 
@@ -386,11 +482,19 @@ class FileServer:
                 self._server.ssl_ctx = tls_utils.make_server_ssl_context(*self.cert_paths)
                 if self.log_callback:
                     self.log_callback("HTTPS (TLS) 已启用")
+                    self.log_callback(f"[诊断] TLS 证书文件: {self.cert_paths[0]}")
+                    self.log_callback(f"[诊断] TLS 证书 SAN: {tls_utils.cert_san_info(self.cert_paths[0])}")
+                    self.log_callback(f"[诊断] 鉴权验证码已设置: {'是' if self.auth_code else '否(将拒绝所有请求)'}")
+                    self.log_callback(f"[诊断] 已映射盘符: {list(self.partition_map.keys())}")
             except Exception as e:
                 if self.log_callback:
                     self.log_callback(f"SSL 上下文创建失败: {e}")
+        else:
+            if self.log_callback:
+                self.log_callback("[诊断] 未提供证书路径, ssl_ctx 为 None, 将拒绝所有连接")
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
+        _prevent_sleep()  # 源端开始传输后阻止系统休眠/锁屏
         if self.log_callback:
             self.log_callback(f"文件服务器已启动 (纯 TLS), 监听端口 {TRANSFER_PORT}")
 
@@ -420,6 +524,7 @@ class FileServer:
                 self._redirect_server.server_close()
             except Exception:
                 pass
+        _allow_sleep()  # 传输结束, 恢复系统正常休眠策略
         if self.log_callback:
             self.log_callback("文件服务器已停止")
 
@@ -427,7 +532,8 @@ class FileServer:
 # ===================== 文件下载客户端 (目标设备) =====================
 
 # 多线程下载并发数（有线网络通常 4-8 线程最佳）
-DEFAULT_DOWNLOAD_WORKERS = 8
+# 降低至 4, 减少对服务端的并发连接压力, 避免 ThreadingMixIn 线程爆炸
+DEFAULT_DOWNLOAD_WORKERS = 4
 
 # 小文件批量传输配置
 BATCH_SIZE_THRESHOLD = 1 * 1024 * 1024   # < 1MB 归入批次
@@ -440,12 +546,37 @@ import http.client as _http_client
 _tl_connections = threading.local()
 
 
-def _urlopen_https(url: str, timeout: int = 5, context=CLIENT_SSL_CTX, **kwargs):
+def _urlopen_https(url: str, timeout: int = 5, context=CLIENT_SSL_CTX, log_callback=None, **kwargs):
     """仅使用 HTTPS (TLS)。按安全策略 (指令 C) 禁止回退到明文 HTTP:
     TLS 握手失败即抛出异常, 由调用方记录并中止, 绝不降级为明文传输。
     链路加密由 TLS 提供, 鉴权仍由 pwd 验证码保证。
+
+    证书校验已被关闭 (CERT_NONE), 故证书/主机名错误不会在此抛出,
+    连接失败通常是网络层问题 (主机不可达/超时/被拒绝)。诊断信息会明确区分。
     """
-    return urllib.request.urlopen(url, timeout=timeout, context=context, **kwargs)
+    try:
+        return urllib.request.urlopen(url, timeout=timeout, context=context, **kwargs)
+    except Exception as e:
+        # 把底层原因展开, 便于定位"连不上"的真实原因
+        reason = getattr(e, "reason", None)
+        errno = getattr(reason, "errno", None)
+        import ssl as _ssl
+        kind = "未知"
+        if isinstance(e, _ssl.SSLError):
+            kind = "TLS握手/证书错误"
+        elif isinstance(e, TimeoutError) or (errno in (11001, 10060, 60, 110)):
+            kind = "连接超时"
+        elif errno in (10061, 111, 61):
+            kind = "连接被拒绝(目标端口无服务)"
+        elif errno in (11001, 10051, 101, 51):
+            kind = "主机不可达/网络不可达"
+        elif reason is not None:
+            kind = f"底层错误({reason})"
+        detail = f"[{kind}] {type(e).__name__}: {e}"
+        if log_callback:
+            log_callback(f"[诊断] HTTPS 请求失败 {url} -> {detail}")
+        # 重新抛出, 让调用方 (download_files/verifier) 继续处理
+        raise
 
 
 def _get_thread_connection(host: str, port: int):
@@ -465,6 +596,13 @@ def _get_thread_connection(host: str, port: int):
             host, port, timeout=120, context=CLIENT_SSL_CTX, blocksize=1024 * 1024
         )
         conn.connect()
+        # 客户端性能优化: TCP_NODELAY 禁用 Nagle(防止 ACK 延迟拖慢发送端),
+        # SO_RCVBUF 增大接收窗口 (匹配服务端 SO_SNDBUF=2MB)
+        try:
+            conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            conn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
+        except Exception:
+            pass
         conns[key] = conn
     return conn
 
@@ -479,6 +617,18 @@ def _invalidate_thread_connection(host: str, port: int):
         except Exception:
             pass
         del conns[key]
+
+
+def _close_all_thread_connections():
+    """关闭当前线程持有的所有持久连接 (分区间调用, 避免复用僵死连接)"""
+    conns = getattr(_tl_connections, "conns", None)
+    if conns:
+        for key in list(conns.keys()):
+            try:
+                conns[key].close()
+            except Exception:
+                pass
+        conns.clear()
 
 
 def _download_single_file(
@@ -560,7 +710,7 @@ def _download_single_file(
         with open(tmp_path, "wb") as f:
             file_done = 0
             while True:
-                chunk = resp.read(1024 * 1024)
+                chunk = resp.read(4 * 1024 * 1024)  # 4MB chunks，匹配服务端发送块大小
                 if not chunk:
                     break
                 f.write(chunk)
@@ -614,12 +764,59 @@ def _download_single_file(
         log(f"  [X] 下载失败(连接): {rel_path} - {e}")
         with stats_lock:
             errors.append(f"分区 {normal_partition}: {rel_path} 下载失败 - {e}")
+        raise  # 重新抛出连接错误, 供上层重试逻辑处理
 
     except Exception as e:
         _handle_tmp_failure(log, tmp_path, rel_path)
         log(f"  [X] 下载失败: {rel_path} - {e}")
         with stats_lock:
             errors.append(f"分区 {normal_partition}: {rel_path} 下载失败 - {e}")
+
+
+def _download_single_file_with_retry(
+    base_url: str,
+    normal_partition: str,
+    rel_path: str,
+    fsize: int,
+    target_path: str,
+    mtime: float = 0,
+    auth_code: str = "",
+    stats_lock: threading.Lock = None,
+    completed_files_list: list = None,
+    completed_bytes_list: list = None,
+    errors: list = None,
+    log_callback=None,
+    file_progress_callback=None,
+    overwrite: bool = False,
+    max_retries: int = 3,
+):
+    """带重试的单文件下载: 连接错误时指数退避重试 (最多 3 次)。
+    服务端线程爆炸时连接被拒绝 → 等一会再试通常恢复。
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return _download_single_file(
+                base_url, normal_partition, rel_path, fsize, target_path,
+                mtime, auth_code, stats_lock, completed_files_list,
+                completed_bytes_list, errors, log_callback,
+                file_progress_callback, overwrite,
+            )
+        except (ConnectionError, TimeoutError, OSError,
+                ConnectionAbortedError, ConnectionResetError,
+                BrokenPipeError) as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                delay = 0.5 * (2 ** attempt)  # 0.5s, 1s, 2s
+                if log_callback:
+                    log_callback(f"  [_] 重试 {attempt+1}/{max_retries}: {rel_path} ({delay:.1f}s 后退)")
+                time.sleep(delay)
+        except Exception:
+            # 非连接错误不重试
+            break
+
+    if last_error and log_callback:
+        log_callback(f"  [X] 下载失败(已重试{max_retries}次): {rel_path} - {last_error}")
 
 
 def _handle_tmp_failure(log, tmp_path: str, rel_path: str):
@@ -829,12 +1026,57 @@ def _download_batch(
         with stats_lock:
             for rel_path, fsize, target_path, _mt in remaining_tasks:
                 errors.append(f"分区 {normal_partition}: {rel_path} 批次连接失败")
+        raise  # 重新抛出连接错误, 供上层重试逻辑处理
 
     except Exception as e:
         log(f"  [X] 批次下载失败: {e}")
         with stats_lock:
             for rel_path, fsize, target_path, _mt in remaining_tasks:
                 errors.append(f"分区 {normal_partition}: {rel_path} 批次异常")
+
+
+def _download_batch_with_retry(
+    base_url: str,
+    normal_partition: str,
+    batch_tasks: list,
+    auth_code: str = "",
+    stats_lock: threading.Lock = None,
+    completed_files_list: list = None,
+    completed_bytes_list: list = None,
+    errors: list = None,
+    log_callback=None,
+    overwrite: bool = False,
+    max_retries: int = 3,
+):
+    """带重试的批量下载: 连接错误时指数退避重试 (最多 3 次)"""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return _download_batch(
+                base_url, normal_partition, batch_tasks,
+                auth_code, stats_lock, completed_files_list,
+                completed_bytes_list, errors, log_callback, overwrite,
+            )
+        except (ConnectionError, TimeoutError, OSError,
+                ConnectionAbortedError, ConnectionResetError,
+                BrokenPipeError) as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                delay = 0.5 * (2 ** attempt)
+                if log_callback:
+                    log_callback(
+                        f"  [_] 批次重试 {attempt+1}/{max_retries} "
+                        f"({len(batch_tasks)} 个文件) ({delay:.1f}s 后退)"
+                    )
+                time.sleep(delay)
+        except Exception:
+            break
+
+    if last_error and log_callback:
+        log_callback(
+            f"  [X] 批次下载失败(已重试{max_retries}次): "
+            f"{len(batch_tasks)} 个文件 - {last_error}"
+        )
 
 
 def download_files(
@@ -864,6 +1106,32 @@ def download_files(
     pwd = urllib.parse.quote(auth_code)
     local_partition_map = partition_map
 
+    _prevent_sleep()  # 接收端开始传输后阻止系统休眠/锁屏
+    try:
+        success, done_files, done_bytes, errors = _download_files_inner(
+            base_url, pwd, local_partition_map, log_callback,
+            progress_callback, partition_progress_callback,
+            max_workers, partition_count, auth_code, overwrite,
+            stop_check,
+        )
+    finally:
+        _allow_sleep()  # 传输结束, 恢复系统正常休眠策略
+    return success, done_files, done_bytes, errors
+
+
+def _download_files_inner(
+    base_url: str,
+    pwd: str,
+    local_partition_map: dict,
+    log_callback=None,
+    progress_callback=None,
+    partition_progress_callback=None,
+    max_workers: int = DEFAULT_DOWNLOAD_WORKERS,
+    partition_count: int = 0,
+    auth_code: str = "",
+    overwrite: bool = False,
+    stop_check=None,
+):
     # 使用可变列表包装，避免闭包中赋值问题
     completed_files = [0]
     completed_bytes = [0]
@@ -880,26 +1148,41 @@ def download_files(
             progress_callback(completed_files[0], total_files, completed_bytes[0], total_bytes)
 
     # 先 ping 确认服务器在线
-    log(f"正在连接源设备 {server_ip}:{TRANSFER_PORT} (HTTPS)...")
+    log(f"正在连接源设备 {base_url} (HTTPS)...")
+    log(f"[诊断] 目标地址 base_url={base_url}, 验证码已携带={'是' if pwd else '否'}")
+    log(f"[诊断] 客户端 TLS 上下文: check_hostname={getattr(CLIENT_SSL_CTX,'check_hostname',None)}, "
+        f"verify_mode={getattr(CLIENT_SSL_CTX,'verify_mode',None)} (CERT_NONE=0 表示已忽略证书错误)")
+    connected = False
     for attempt in range(5):
         try:
-            req = _urlopen_https(f"{base_url}/ping?pwd={pwd}", timeout=5)
+            req = _urlopen_https(
+                f"{base_url}/ping?pwd={pwd}", timeout=5, log_callback=log
+            )
             data = json.loads(req.read().decode("utf-8-sig"))
             if data.get("status") == "ok":
                 log(f"已连接到源设备，可用分区: {data.get('partitions', [])}")
+                connected = True
                 break
+            else:
+                log(f"[诊断] 服务器已连通但返回非 ok: {data}")
         except Exception as e:
+            log(f"[诊断] 第 {attempt+1}/5 次连接失败: {type(e).__name__}: {e}")
             if attempt == 4:
-                log(f"无法连接到源设备: {e}")
+                log(f"无法连接到源设备 ({base_url}): {e}")
+                log("排查建议: 1) 源端是否已点'源设备'启动服务器; 2) 两端网线/网卡已连接; "
+                    "3) 接收端实际 IP 与源端是否同网段; 4) 防火墙是否放行 9999; "
+                    "5) 验证码是否输入正确 (证书错误已被忽略, 此问题不是证书)")
                 return False, 0, 0, errors
             time.sleep(2)
+    if not connected:
+        return False, 0, 0, errors
 
     # 第一阶段: 收集所有分区的文件列表
     all_download_tasks = []  # [(normal_partition, rel_path, fsize, target_path), ...]
 
     for normal_partition in ("D", "E", "F"):
-        target_drive = local_partition_map.get(normal_partition, "").rstrip("\\")
-        if not target_drive:
+        target_drive = local_partition_map.get(normal_partition, "").rstrip("\\") + "\\"
+        if not target_drive.strip("\\"):
             log(f"分区 {normal_partition} 未配置映射，跳过")
             continue
 
@@ -1023,14 +1306,22 @@ def download_files(
     stats_lock = threading.Lock()
 
     def progress_reporter():
-        """后台线程: 每 2 秒上报一次总进度"""
-        last_count = [completed_files[0]]
+        """后台线程: 每 1 秒上报一次总进度。
+
+        同时按"文件数"和"字节数"判断推进: 传输大文件时文件数长时间不变,
+        但字节数在持续增长, 必须也按字节刷新, 否则进度条会"卡住"假死。
+        """
+        last_files = [completed_files[0]]
+        last_bytes = [completed_bytes[0]]
         while completed_files[0] < total_files:
-            time.sleep(2)
-            current = completed_files[0]
-            if current != last_count[0]:
+            time.sleep(1)
+            with stats_lock:
+                cur_files = completed_files[0]
+                cur_bytes = completed_bytes[0]
+            if cur_files != last_files[0] or cur_bytes != last_bytes[0]:
                 progress()
-                last_count[0] = current
+                last_files[0] = cur_files
+                last_bytes[0] = cur_bytes
 
     reporter_thread = threading.Thread(target=progress_reporter, daemon=True)
     reporter_thread.start()
@@ -1069,26 +1360,50 @@ def download_files(
         log(f"\n{'='*40}")
         log(f"开始传输 {normal_partition} 盘: {partition_total} 个文件")
 
-        if partition_progress_callback:
-            partition_progress_callback(normal_partition, 0, partition_total)
-
-        # 为该分区创建目录
+        # 为该分区创建/验证目录（跳过无法写入或路径冲突的目录）
         _created_dirs = set()
+        _skipped_dirs = set()
         for task in partition_tasks:
             target_dir = os.path.dirname(task[3])
-            if target_dir not in _created_dirs:
+            if target_dir not in _created_dirs and target_dir not in _skipped_dirs:
                 _created_dirs.add(target_dir)
+
         for d in sorted(_created_dirs):
-            os.makedirs(d, exist_ok=True)
+            # 预检1: 路径已存在为文件 (而非目录) → 无法创建同名目录
+            if os.path.isfile(d):
+                log(f"  [跳过] 路径被文件占用，无法创建目录: {d}")
+                _skipped_dirs.add(d)
+                continue
+            # 预检2: 路径已存在为目录 → 检查是否可写
+            if os.path.isdir(d):
+                if os.access(d, os.W_OK):
+                    continue  # 目录已存在且可写，无需创建
+                else:
+                    log(f"  [跳过] 目录已存在但无写入权限: {d}")
+                    _skipped_dirs.add(d)
+                    continue
+            # 预检3: 路径不存在 → 尝试创建目录
+            try:
+                os.makedirs(d, exist_ok=True)
+            except (PermissionError, FileExistsError, OSError) as e:
+                log(f"  [跳过] 无法创建目录: {d} ({e})")
+                _skipped_dirs.add(d)
+
+        for d in _skipped_dirs:
+            _created_dirs.discard(d)
 
         # 分区内: 按大小分组 (小文件批次 / 大文件单独)
         partition_batches = []   # [batch_tasks, ...]
         partition_singles = []   # [(normal_partition, rel_path, fsize, target_path), ...]
 
+        skipped_count = 0
         current_batch = []
         current_batch_bytes = 0
         for task in partition_tasks:
             _, rel_path, fsize, target_path, _mtime = task
+            if os.path.dirname(target_path) in _skipped_dirs:
+                skipped_count += 1
+                continue
             if fsize < BATCH_SIZE_THRESHOLD:
                 current_batch.append(task)
                 current_batch_bytes += fsize
@@ -1100,6 +1415,13 @@ def download_files(
                 partition_singles.append(task)
         if current_batch:
             partition_batches.append(current_batch)
+
+        if skipped_count > 0:
+            log(f"  因目录无写入权限，跳过 {skipped_count} 个文件")
+            partition_total -= skipped_count
+
+        if partition_progress_callback:
+            partition_progress_callback(normal_partition, 0, partition_total)
 
         small_count = sum(len(b) for b in partition_batches)
         large_count = len(partition_singles)
@@ -1114,10 +1436,10 @@ def download_files(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
 
-            # 提交批次任务
+            # 提交批次任务 (带重试: 连接错误重试最多3次)
             for batch in partition_batches:
                 future = executor.submit(
-                    _download_batch,
+                    _download_batch_with_retry,
                     base_url,
                     normal_partition,
                     batch,
@@ -1131,11 +1453,11 @@ def download_files(
                 )
                 futures.append(future)
 
-            # 提交单文件任务
+            # 提交单文件任务 (带重试: 连接错误重试最多3次)
             for task in partition_singles:
                 np, rp, fs, tp, mt = task
                 future = executor.submit(
-                    _download_single_file,
+                    _download_single_file_with_retry,
                     base_url,
                     np,
                     rp,
@@ -1183,6 +1505,9 @@ def download_files(
             partition_progress_callback(normal_partition, partition_total, partition_total)
 
         log(f"{normal_partition} 盘传输完成")
+
+        # 分区完成后关闭本线程持有的持久连接, 防止僵死连接跨分区复用
+        _close_all_thread_connections()
 
     # 最终总进度
     progress()

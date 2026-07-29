@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_data_files
 
-datas = []
+datas = [('certs', 'certs')]
 datas += collect_data_files('cryptography')
 
 

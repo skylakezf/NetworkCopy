@@ -31,3 +31,4 @@
 - 所有传输端点 (/ping /list /get /batch_get) 必须携带 ?pwd=<验证码>，否则 403
 - 客户端不校验自签名证书 (CERT_NONE)，安全性由随机验证码保证；如需防 MITM 需改为校验证书
 - 已知重大问题（2026-07-28 审查，尚未修复）：control.py 未向 FileServer/download_files/scan_source_device 传 auth_code 与 cert_paths，主流程实际跑不通；_send_json 缺 Content-Length 导致 HTTP/1.1 keep-alive 下 JSON 端点挂起；_download_batch except 分支对 4 元组按 3 值解包；verifier 重试下载走明文 http 且无 pwd；run_verification 未传 server_ip/gtmc_new_name。详见 2026-07-28.md
+- 已修复（2026-07-29）：Windows 路径拼接 bug — .rstrip("\\") 后再 os.path.join 得到的是相对盘符路径（如 "J:foo" 而非 "J:\\foo"），导致文件写入当前工作目录。修复了 file_transfer.py:990 和 verifier.py:216/219/303 四处，rstrip 后补回 "\\"。

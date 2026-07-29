@@ -11,7 +11,8 @@ import time
 
 SERVER_IP = "169.254.100.1"
 DHCP_SUBNET = "169.254.100"
-DHCP_MASK = "255.255.255.0"
+# 统一 /16 掩码, 与 169.254.x.x (APIPA) 地址段一致, 避免两端掩码非对称导致源端无法回包
+DHCP_MASK = "255.255.0.0"
 DHCP_SERVER_PORT = 67
 DHCP_CLIENT_PORT = 68
 
@@ -42,12 +43,15 @@ class MiniDHCPServer:
     """最小的 DHCP 服务器 - 只给外部客户端分配 IP，排除本地网卡"""
 
     def __init__(self, server_ip=SERVER_IP, subnet=DHCP_SUBNET, mask=DHCP_MASK,
-                 exclude_macs=None):
+                 exclude_macs=None, out_ip=""):
         self.server_ip = server_ip
         self.server_int = _ip2int(server_ip)
         self.subnet = subnet
         self.mask = mask
         self.mask_int = _ip2int(mask)
+        # 广播应答的出口网卡 IP: 多网卡时把 255.255.255.255 广播绑定到该网卡发出,
+        # 否则 Windows 可能把 OFFER 路由到别的网卡, 导致源端收不到而反复重试 (表现为"等很久")
+        self.out_ip = out_ip
 
         # 需要排除的本地 MAC 地址集合（避免本地网卡 DHCP 自响应）
         self._exclude_macs = set()
@@ -60,6 +64,7 @@ class MiniDHCPServer:
         self._leases = {}      # mac -> {"ip": int, "hostname": str}
         self._running = False
         self._sock = None
+        self._send_sock = None
         self._thread = None
         self._client_assigned = threading.Event()
         self._on_client = None  # callback(ip_str, mac_str, hostname)
@@ -242,14 +247,14 @@ class MiniDHCPServer:
                     if yiaddr is None:
                         continue  # 本地 MAC，跳过不响应
                     pkt = self._build_dhcp_packet(BOOTREPLY, xid, yiaddr, chaddr, DHCPOFFER)
-                    self._sock.sendto(pkt, ('255.255.255.255', DHCP_CLIENT_PORT))
+                    (self._send_sock or self._sock).sendto(pkt, ('255.255.255.255', DHCP_CLIENT_PORT))
 
                 elif msg_type == DHCPREQUEST:
                     yiaddr = self._handle_request(xid, chaddr, options)
                     if yiaddr is None:
                         continue  # 本地 MAC，跳过不响应
                     pkt = self._build_dhcp_packet(BOOTREPLY, xid, yiaddr, chaddr, DHCPACK)
-                    self._sock.sendto(pkt, ('255.255.255.255', DHCP_CLIENT_PORT))
+                    (self._send_sock or self._sock).sendto(pkt, ('255.255.255.255', DHCP_CLIENT_PORT))
 
             except Exception as e:
                 print(f"[DHCP] Error: {e}")
@@ -267,21 +272,39 @@ class MiniDHCPServer:
             pass
 
         self._sock.bind(('0.0.0.0', DHCP_SERVER_PORT))
+
+        # 独立发送套接字: 绑定到出口网卡 IP, 保证广播应答 (OFFER/ACK) 从正确网卡发出。
+        # 多网卡主机上, 若直接用 0.0.0.0 套接字发 255.255.255.255, Windows 可能选错出口网卡,
+        # 导致源端收不到 OFFER 而反复 DISCOVER 重试 (表现为"获取 IP 要等很久")。
+        self._send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        if self.out_ip:
+            try:
+                self._send_sock.bind((self.out_ip, 0))
+                print(f"[DHCP] 广播应答出口网卡绑定: {self.out_ip}")
+            except Exception as e:
+                print(f"[DHCP] 绑定出口网卡 {self.out_ip} 失败, 回退默认路由: {e}")
+
         self._running = True
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
         print(f"[DHCP] Server started on 0.0.0.0:{DHCP_SERVER_PORT}")
+
+    def is_running(self):
+        """返回 DHCP 服务器是否正在运行"""
+        return self._running
 
     def stop(self):
         """停止 DHCP 服务器"""
         self._running = False
         if self._thread:
             self._thread.join(timeout=2)
-        if self._sock:
-            try:
-                self._sock.close()
-            except Exception:
-                pass
+        for s in (self._sock, self._send_sock):
+            if s:
+                try:
+                    s.close()
+                except Exception:
+                    pass
         print("[DHCP] Server stopped")
 
     def set_on_client(self, callback):

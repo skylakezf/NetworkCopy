@@ -7,15 +7,37 @@ import time
 import subprocess
 import os
 from typing import Literal
-from tkinter import simpledialog, messagebox
+from tkinter import simpledialog
 import tkinter as tk
 from nic_scanner import scan_nics, get_nic_display_list, get_local_ip
 from disk_scanner import get_disk_list, get_drive_letter_list, get_disk_number, get_partition_count, get_partition_details
-from file_transfer import FileServer, download_files, scan_source_device, TRANSFER_PORT
+from file_transfer import FileServer, download_files, scan_source_device, TRANSFER_PORT, _allow_sleep
 from verifier import run_verification
-from ip_config import SOURCE_IP  # 169.254.100.1 (目标设备自身 IP)
+from ip_config import SOURCE_IP, SUBNET_MASK  # 169.254.100.1 (目标设备自身 IP)
 import tls_utils
 DHCP_ASSIGNED_IP = "169.254.100.2"  # DHCP 分配给源设备的 IP
+
+
+def is_running_in_winpe() -> bool:
+    """检测当前是否运行在 Windows PE (WinPE) 环境。
+
+    判定依据 (任一满足即视为 PE):
+      1. 注册表 HKLM\\SYSTEM\\CurrentControlSet\\Control\\MiniNT 存在 (PE 标志键);
+      2. 存在 X:\\Windows\\System32 (典型 PE 启动盘)。
+    正常 Windows 系统两项均不成立。
+    """
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\MiniNT"
+        )
+        key.Close()
+        return True
+    except OSError:
+        pass
+    if os.path.exists(os.path.join("X:\\Windows", "System32")):
+        return True
+    return False
 
 
 class Controller:
@@ -55,9 +77,26 @@ class Controller:
 
     def init(self, ui):
         self.ui = ui
+        self._install_thread_excepthook()
         self._setup_events()
         self._setup_ui_defaults()
         self._populate_nics()
+
+    def _install_thread_excepthook(self):
+        """捕获所有后台线程的未处理异常并输出到日志。
+        打包成 exe (pythonw, 无控制台) 时, 线程里抛出的异常默认被静默丢弃,
+        表现为"点了按钮没反应"。挂上 excepthook 后, 任何线程崩溃都会显示在日志里。"""
+        import traceback as _tb
+
+        def _hook(args):
+            try:
+                msg = "".join(_tb.format_exception(
+                    args.exc_type, args.exc_value, args.exc_traceback))
+                self.ui.after(0, lambda: self._log(f"[诊断] 后台线程异常:\n{msg}"))
+            except Exception:
+                pass
+
+        threading.excepthook = _hook
 
     def _setup_ui_defaults(self):
         """设置 UI 初始状态"""
@@ -69,8 +108,12 @@ class Controller:
         # 手动 IP 与目标验证码输入框默认隐藏, 选择目标设备后显示
         self.ui.hide_manual_ip()
         self.ui.hide_auth_input()
+        # 接收端 CSV 选择框默认隐藏, 选择目标设备后显示
+        self.ui.hide_csv_selector()
         # 验证码显示区默认隐藏, 生成/输入后显示
         self.ui.hide_auth_code()
+        # 运行环境单选: 默认按检测结果预选 (WinPE / 正常系统), 用户可手动改
+        self.ui.winpe_var.set("winpe" if is_running_in_winpe() else "normal")
 
     def _setup_events(self):
         """绑定 UI 控件事件"""
@@ -161,8 +204,11 @@ class Controller:
             self.ui.show_discover()
             self.ui.show_dhcp()
             # 目标设备: 需要输入源设备显示的验证码
-            self.ui.hide_manual_ip()
+            # 同时保留「手动输入源设备IP」直连功能 (对方网卡已有 IP / 无需 DHCP 时)
+            self.ui.show_manual_ip()
             self.ui.show_auth_input()
+            # 接收端: 显示 FullFilelist_DEF.csv 手动选择框
+            self.ui.show_csv_selector()
         # 切换设备类型后旧验证码作废
         self._auth_code = ""
         self.ui.hide_auth_code()
@@ -233,34 +279,44 @@ class Controller:
 
     def _on_start_button(self):
         """开始传输/接收 按钮"""
-        if self._transferring:
-            self._log("传输正在进行中...")
-            return
-
-        self._update_partition_map()
-        dev_type = self.ui.tk_select_box_mqg0hm2h.get()
-        if dev_type not in ("源设备", "目标设备"):
-            self._log("请先选择设备类型")
-            return
-
-        manual_ip = self._get_manual_ip()
-
-        if dev_type == "源设备":
-            # 源设备只负责搭建 HTTP 服务器, 不强制分区映射
-            if not self._partition_map:
-                self._log("提示: 尚未配置分区映射, 服务器将不提供任何盘符数据"
-                          "(可在启动后继续设置映射)")
-            self._start_source_server(manual_ip=manual_ip)
-        else:
-            # 目标设备需要完成分区映射才能下载
-            ntfs_count: int = self._ntfs_partition_count
-            required_keys = ("D", "E") if ntfs_count == 2 else ("D", "E", "F")
-            mapped = [k for k in required_keys if self._partition_map.get(k)]
-            if len(mapped) < len(required_keys):
-                self._log(f"请先完成 {'/'.join(required_keys)} 盘符映射"
-                          f"(当前: {len(mapped)} 个)")
+        try:
+            if self._transferring:
+                self._log("传输正在进行中...")
                 return
-            self._start_target_download(manual_ip=manual_ip)
+
+            self._update_partition_map()
+            dev_type = self.ui.tk_select_box_mqg0hm2h.get()
+            if dev_type not in ("源设备", "目标设备"):
+                self._log("请先选择设备类型")
+                return
+
+            manual_ip = self._get_manual_ip()
+            self._log(
+                f"[诊断] 点击开始: 类型={dev_type}, "
+                f"模式={'手动IP(' + manual_ip + ')' if manual_ip else 'DHCP/扫描'}"
+            )
+
+            if dev_type == "源设备":
+                # 源设备必须指定要对外提供(拷贝)的盘符, 否则服务器虽启动但无任何数据可传,
+                # 表现为"服务已开启却无法传输文件"。因此这里改为强制校验。
+                if not self._partition_map:
+                    self._log("错误: 源设备尚未配置任何盘符映射 (D/E/F), "
+                              "服务器将无任何数据可拷贝。请先在下拉框选择要提供的盘符。")
+                    return
+                self._start_source_server(manual_ip=manual_ip)
+            else:
+                # 目标设备需要完成分区映射才能下载
+                ntfs_count: int = self._ntfs_partition_count
+                required_keys = ("D", "E") if ntfs_count == 2 else ("D", "E", "F")
+                mapped = [k for k in required_keys if self._partition_map.get(k)]
+                if len(mapped) < len(required_keys):
+                    self._log(f"请先完成 {'/'.join(required_keys)} 盘符映射"
+                              f"(当前: {len(mapped)} 个)")
+                    return
+                self._start_target_download(manual_ip=manual_ip)
+        except Exception:
+            import traceback
+            self._log("[诊断] 开始按钮处理异常:\n" + traceback.format_exc())
 
     # ==================== 磁盘/分区 ====================
 
@@ -389,14 +445,27 @@ class Controller:
             ))
 
     def _setup_source_network(self, adapter_desc):
-        """源设备: ipconfig /renew 从目标 DHCP 获取 IP"""
+        """源设备: 从目标 DHCP 获取 IP —— 异步触发 renew + 轮询目标网卡, 避免长时间阻塞。
+
+        原实现直接 `ipconfig /renew` 同步等待: 该命令会逐个续租【所有】网卡, 其它没有
+        DHCP 服务的网卡会反复重试到超时, 导致命令长时间(数十秒)不返回, 用户感觉"等非常久"。
+        现改为: 后台异步触发 renew, 然后只轮询【目标网卡】拿到 169.254.100.x 立即返回
+        (通常 2~3 秒), 不再等待其它网卡。
+        """
         try:
             subprocess.run(["ipconfig", "/release"], capture_output=True, timeout=10,
                            encoding="utf-8", errors="replace")
-            subprocess.run(["ipconfig", "/renew"], capture_output=True, timeout=20,
-                           encoding="utf-8", errors="replace")
-            time.sleep(2)
-            ip = get_local_ip(adapter_desc)
+            # 异步触发续租 (不阻塞), 输出丢弃
+            subprocess.Popen(["ipconfig", "/renew"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # 轮询目标网卡, 拿到 DHCP 分配的 169.254.100.x 即返回
+            deadline = time.time() + 20
+            ip = ""
+            while time.time() < deadline:
+                ip = get_local_ip(adapter_desc)
+                if ip and ip.startswith("169.254.100."):
+                    break
+                time.sleep(0.4)
             if ip and ip != "0.0.0.0":
                 self._source_ip = ip
                 self.ui.after(0, lambda: self._log(f"源设备 IP: {ip}"))
@@ -427,25 +496,36 @@ class Controller:
         return None
 
     def _apply_manual_ip(self, adapter_desc, ip):
-        """源设备: 将本机网卡 IP 设为手动输入的 IP (供目标直连)"""
-        from ip_config import set_ip_via_api
+        """源设备: 将本机网卡 IP 设为手动输入的 IP (供目标直连)。
+        掩码使用 SUBNET_MASK (/16), 与 169.254.x.x (APIPA) 一致, 避免掩码非对称。"""
+        from ip_config import set_ip_via_api, set_ip_via_netsh
         try:
-            success, msg = set_ip_via_api(adapter_desc, ip)
+            success, msg = set_ip_via_api(adapter_desc, ip, mask_str=SUBNET_MASK)
             self.ui.after(0, lambda m=msg: self._log(m))
             if not success:
-                subprocess.run(
-                    ["netsh", "interface", "ip", "set", "address",
-                     f'"{adapter_desc}"', "static", ip, "255.255.255.0"],
-                    capture_output=True, timeout=10,
-                    encoding="utf-8", errors="replace",
-                )
-                self.ui.after(0, lambda: self._log(f"源设备手动 IP: {ip}"))
+                success2, msg2 = set_ip_via_netsh(adapter_desc, ip)
+                self.ui.after(0, lambda m=msg2: self._log(m))
+                if success2:
+                    self.ui.after(0, lambda: self._log(
+                        f"源设备手动 IP 已生效: {ip} (掩码 {SUBNET_MASK})"))
+                else:
+                    self.ui.after(0, lambda: self._log(
+                        f"警告: 源设备手动 IP 设置失败 ({ip}), 网卡可能停留在 APIPA。\n"
+                        f"  由于两端掩码已统一为 {SUBNET_MASK}, 仍可直连通信。"))
+            else:
+                self.ui.after(0, lambda: self._log(
+                    f"源设备手动 IP 已生效: {ip} (掩码 {SUBNET_MASK})"))
         except Exception as e:
             self.ui.after(0, lambda: self._log(f"设置源设备手动 IP 失败: {e}"))
 
     def _apply_target_manual_ip(self, adapter_desc, source_ip):
-        """目标设备: 将本机网卡 IP 设为与源 IP 同网段 (源末位+1), 以便直连"""
-        from ip_config import set_ip_via_api
+        """目标设备: 将本机网卡 IP 设为与源 IP 同网段 (源末位+1), 以便直连。
+
+        掩码统一使用 SUBNET_MASK (/16), 与 169.254.x.x (APIPA) 地址段一致,
+        避免两端掩码非对称导致源端无法回包 (连接超时)。
+        若 IP 设置失败, 网卡可能停留在 APIPA (/16); 由于两端均为 /16, 仍可直连通信。
+        """
+        from ip_config import set_ip_via_api, set_ip_via_netsh
         parts = source_ip.split(".")
         try:
             last = int(parts[3])
@@ -453,26 +533,29 @@ class Controller:
             target_ip = ".".join(parts[:3] + [str(last)])
         except Exception:
             target_ip = SOURCE_IP
-        try:
-            success, msg = set_ip_via_api(adapter_desc, target_ip)
-            self.ui.after(0, lambda m=msg: self._log(m))
-            if not success:
-                subprocess.run(
-                    ["netsh", "interface", "ip", "set", "address",
-                     f'"{adapter_desc}"', "static", target_ip, "255.255.255.0"],
-                    capture_output=True, timeout=10,
-                    encoding="utf-8", errors="replace",
-                )
-                self.ui.after(0, lambda: self._log(f"目标手动 IP: {target_ip}"))
-        except Exception as e:
-            self.ui.after(0, lambda: self._log(f"设置目标手动 IP 失败: {e}"))
+        success, msg = set_ip_via_api(adapter_desc, target_ip)
+        self.ui.after(0, lambda m=msg: self._log(m))
+        if not success:
+            # API 失败 → 回退 netsh (set_ip_via_netsh 内部已用 GBK 解码且默认 /16 掩码)
+            success2, msg2 = set_ip_via_netsh(adapter_desc, target_ip)
+            self.ui.after(0, lambda m=msg2: self._log(m))
+            if success2:
+                self.ui.after(0, lambda: self._log(
+                    f"目标手动 IP 已生效: {target_ip} (掩码 {SUBNET_MASK})"))
+            else:
+                self.ui.after(0, lambda: self._log(
+                    f"警告: 目标手动 IP 设置失败 ({target_ip}), 网卡可能停留在 APIPA。\n"
+                    f"  由于两端掩码已统一为 {SUBNET_MASK}, 即使本机为 APIPA 地址也可与源端 {source_ip} 直连通信。"))
+        else:
+            self.ui.after(0, lambda: self._log(
+                f"目标手动 IP 已生效: {target_ip} (掩码 {SUBNET_MASK})"))
 
     def _on_dhcp_button(self):
         """目标设备: 点击「开启DHCP」→ 后台启动 DHCP 服务器"""
         if self._transferring:
             self._log("传输正在进行中, 暂时无法操作")
             return
-        if self._dhcp_server and getattr(self._dhcp_server, "is_running", lambda: False)():
+        if self._dhcp_server and self._dhcp_server.is_running():
             self._log("DHCP 服务器已在运行")
             return
         nic_display = self.ui.tk_select_box_mqfzkd6x.get()
@@ -488,34 +571,31 @@ class Controller:
         threading.Thread(target=self._setup_target_dhcp, args=(adapter_desc,), daemon=True).start()
 
     def _setup_target_dhcp(self, adapter_desc):
-        """目标设备: 设自身 IP 169.254.100.1 → 启动 DHCP → 等源设备获取 IP"""
-        from ip_config import set_ip_via_api
+        """目标设备: 不设置自身 IP, 依赖 APIPA (169.254.x.x) 自动地址, 直接启动 DHCP 服务器。
+
+        说明: 目标作为 DHCP 服务器, 为源设备分配 169.254.100.2。两端掩码统一为
+        SUBNET_MASK (/16), 目标只要有一个 169.254.x.x 的 APIPA 地址 (Windows 在
+        网线连通且无其他 DHCP 响应时自动分配), 就与源端 169.254.100.2 处于同一
+        /16 网段, 可直连通信。无需手动为自身设 IP —— 之前调用 set_ip_via_api 在
+        部分网卡上返回 ERROR_INVALID_PARAMETER(87) "API 参数无效", 导致 DHCP 服务
+        器始终无法启动, 故改为纯 APIPA + DHCP 服务器方案。
+        """
         from dhcp_server import MiniDHCPServer
 
         self.ui.after(0, lambda: self.ui.tk_select_box_discover.config(
             values=("等待源设备连接...",)
         ))
 
-        success, msg = set_ip_via_api(adapter_desc, SOURCE_IP)
-        self.ui.after(0, lambda m=msg: self._log(m))
-
-        if not success:
-            try:
-                subprocess.run(["ipconfig", "/release"], capture_output=True, timeout=10,
-                               encoding="utf-8", errors="replace")
-                subprocess.run(["netsh", "interface", "ip", "set", "address",
-                                f'"{adapter_desc}"', "static", SOURCE_IP, "255.255.255.0"],
-                               capture_output=True, timeout=10,
-                               encoding="utf-8", errors="replace")
-                self.ui.after(0, lambda: self._log(f"目标 IP: {SOURCE_IP}"))
-                success = True
-            except Exception:
-                pass
-
-        if not success:
-            self.ui.after(0, lambda: self._log("无法设置目标 IP, 回退 APIPA"))
-            self.ui.after(0, lambda: self.ui.tk_button_dhcp.configure(text="开启DHCP", state="normal"))
-            return
+        # 诊断: 打印本机当前地址, 确认是否已获得 APIPA (169.254.x.x)
+        _cur_ip = get_local_ip(adapter_desc)
+        if _cur_ip:
+            self.ui.after(0, lambda: self._log(
+                f"DHCP 模式: 接收端不设置自身 IP, 当前本机地址 {_cur_ip} (掩码 {SUBNET_MASK})。"
+                f"只要该地址属于 169.254.x.x/16, 即可与源端 {DHCP_ASSIGNED_IP} 直连。"))
+        else:
+            self.ui.after(0, lambda: self._log(
+                f"DHCP 模式: 接收端不设置自身 IP, 等待 APIPA 自动分配 (请确认网线已连接); "
+                f"DHCP 服务器将照常启动。"))
 
         # 获取本地 MAC 地址列表，排除本地网卡的 DHCP 自响应
         from nic_scanner import get_local_mac_addresses
@@ -523,7 +603,7 @@ class Controller:
         self._log(f"本地 MAC 排除列表: {local_macs}")
 
         try:
-            self._dhcp_server = MiniDHCPServer(exclude_macs=local_macs)
+            self._dhcp_server = MiniDHCPServer(exclude_macs=local_macs, out_ip=_cur_ip or "")
 
             def _on_client(ip, mac, hostname):
                 self._update_discover_list(ip, mac, hostname)
@@ -588,12 +668,52 @@ class Controller:
 
     # ==================== 源设备：启动服务器 ====================
 
+    def _add_firewall_exception(self, port: int):
+        """源设备: 放行入站 TCP port —— 使用【标准 Windows 防火墙提示】, 而非管理员/UAC 提权。
+
+        说明: 标准 Windows 防火墙机制是 —— 当程序开始监听某端口且没有放行规则时,
+        系统会自动弹出"Windows 安全中心警报"对话框, 用户勾选网络类型并点【允许访问】即可,
+        全程不需要管理员权限。因此这里不再用 UAC 提权去写规则, 而是:
+          1) 先做一次非提权的 netsh 尝试 (若进程本身已是管理员则直接成功, 不弹任何窗);
+          2) 失败(非管理员)则直接依赖服务器监听端口后由 Windows 弹出的标准防火墙提示框,
+             并在日志里引导用户点击"允许访问"。
+        WinPE 默认无防火墙, 直接跳过。
+        """
+        import subprocess
+
+        rule_name = f"DiskCopyTool_In_TCP{port}"
+        netsh_cmd = (
+            f'netsh advfirewall firewall delete rule name={rule_name} & '
+            f'netsh advfirewall firewall add rule name={rule_name} dir=in '
+            f'action=allow protocol=TCP localport={port} profile=any'
+        )
+        try:
+            res = subprocess.run(
+                ["cmd", "/c", netsh_cmd],
+                capture_output=True, timeout=10, encoding="gbk", errors="replace",
+            )
+            if res.returncode == 0:
+                self._log(f"已放行防火墙入站规则: TCP {port} (接收端跨机可访问)")
+                return
+        except FileNotFoundError:
+            self._log("提示: 当前环境无 netsh advfirewall (如 WinPE), 防火墙默认关闭, 可忽略。")
+            return
+        except Exception:
+            pass
+
+        # 非管理员 / netsh 不可用: 不弹 UAC, 改用标准防火墙提示框
+        self._log(
+            f"防火墙: 未能自动放行 (当前非管理员权限, 不再请求 UAC 提权)。\n"
+            f"  源端开始监听 TCP {port} 后, Windows 会弹出【标准防火墙提示】"
+            f"(Windows 安全中心警报)。\n"
+            f"  请在弹窗中勾选网络类型并点击【允许访问】, 接收端即可跨机连接。\n"
+            f"  (若长时间未弹窗, 也可右键以管理员身份运行本工具自动放行。)")
+
     def _start_source_server(self, manual_ip=None):
         """源设备启动 HTTP 文件服务器 (manual_ip 非空时为手动 IP 模式)"""
         self._log("\n" + "=" * 50)
         self._log("源设备模式: 启动文件服务器")
         self._log("=" * 50)
-        self._log(f"分区映射: {self._partition_map}")
 
         # 手动 IP 模式: 先把本机网卡设为该 IP, 再启动服务器
         if manual_ip:
@@ -605,11 +725,12 @@ class Controller:
         # 重命名 GTMC_User_Profiles (如存在)
         self._rename_gtmc_user_profiles()
 
-        # 生成验证码 + 自签名证书 (HTTPS 必需)
+        # 生成验证码 + 固定自签名证书 (HTTPS 必需; 证书与 IP 无关, 统一使用一份)
         self._auth_code = tls_utils.generate_auth_code()
-        cert_ip = get_local_ip() or DHCP_ASSIGNED_IP
         try:
-            cert_paths = tls_utils.get_or_create_cert(cert_ip)
+            cert_paths = tls_utils.get_or_create_fixed_cert()
+            self._log(f"使用固定 TLS 证书: {cert_paths[0]}")
+            self._log(f"证书 SAN: {tls_utils.cert_san_info(cert_paths[0])}")
         except Exception as e:
             self._log(f"错误: 生成 TLS 证书失败, 无法启动服务器: {e}")
             self._set_status("证书生成失败")
@@ -622,7 +743,13 @@ class Controller:
             cert_paths=cert_paths,
         )
         self._file_server.start()
+        self._add_firewall_exception(TRANSFER_PORT)
         self._log(f"文件服务器已启动, 监听 0.0.0.0:{TRANSFER_PORT}")
+        self._log(f"将对外提供以下盘符数据: {self._partition_map}")
+        self._log(
+            f"本地测试地址: https://127.0.0.1:{TRANSFER_PORT} "
+            f"(浏览器会提示自签名证书, 点击'高级'→'继续访问'即可; API 需带 ?pwd={self._auth_code})"
+        )
         self._log("\n" + "*" * 50)
         self._log(f"  连接验证码: {self._auth_code}")
         self._log("  请在目标设备上输入此验证码")
@@ -636,16 +763,16 @@ class Controller:
         self._transferring = True
         self.ui.tk_button_mqfzl35t.config(text="传输中...", state="disabled")
 
-        # 弹窗醒目显示验证码 (服务器已在后台线程运行, 阻塞 UI 无碍)
-        messagebox.showinfo(
-            "连接验证码",
-            f"验证码: {self._auth_code}\n\n请在目标设备点击「开始接收」后输入此验证码。\n"
-            "(验证码将持续显示在主界面「连接验证码」区域)",
-            parent=self.ui,
-        )
-
     def _rename_gtmc_user_profiles(self):
-        """检查源设备 D 盘，若存在 GTMC_User_Profiles 则重命名为 GTMC_User_ProfilesYYMMDD"""
+        """检查源设备 D 盘，若存在 GTMC_User_Profiles 则重命名为 GTMC_User_ProfilesYYMMDD。
+
+        仅在「运行环境 = WinPE 下」时执行重命名；正常 Windows 系统不改动用户文件夹，
+        以免误改真实系统的用户配置目录。
+        """
+        if self.ui.winpe_var.get() != "winpe":
+            self._log("当前非 WinPE 环境, 跳过 GTMC_User_Profiles 重命名")
+            return
+
         d_drive = self._partition_map.get("D", "")
         if not d_drive:
             return
@@ -677,25 +804,33 @@ class Controller:
     def _start_target_download(self, manual_ip=None):
         """目标设备连接源设备下载文件。
 
-        manual_ip: 若提供 (手动 IP 模式), 直接连接该源设备 IP, 无需 DHCP;
-                   目标自身 IP 自动设为与源同网段 (源末位+1)。
+        manual_ip: 若提供 (手动 IP 模式), 直接连接该源设备 IP, 无需 DHCP。
+                   接收端【无需设置自身 IP】: 只要本机与源设备网络可达即可直连
+                   (两端掩码已统一为 SUBNET_MASK, 即使本机停留在 APIPA 也能直连,
+                   因为 169.254.x.x 同属 /16)。曾经"将本机设为源末位+1"的尝试会
+                   扰动网卡, 导致随后 Python 的 TLS 握手失败, 现已移除。
         """
         if not manual_ip:
             # DHCP 模式: 必须先开启 DHCP 并等待源设备分配到 IP
             if not self._use_dhcp or not (self._dhcp_server and self._dhcp_server.is_running()):
                 self._log("请先点击「开启DHCP」启动 DHCP 服务器并等待源设备分配 IP")
                 return
+            # DHCP 已完成使命 (源设备已拿到 IP)，停止 DHCP 服务器，释放端口避免干扰后续传输
+            self._log("源设备已通过 DHCP 获取 IP，正在关闭 DHCP 服务器...")
+            self._dhcp_server.stop()
+            self._log("DHCP 服务器已关闭")
 
         self._log("\n" + "=" * 50)
         self._log("目标设备模式: 连接源设备...")
         self._log("=" * 50)
-        self._log(f"分区映射: {self._partition_map}")
 
         if manual_ip:
-            adapter_desc = self._get_adapter_desc(self.ui.tk_select_box_mqfzkd6x.get())
-            if adapter_desc:
-                self._apply_target_manual_ip(adapter_desc, manual_ip)
+            # 手动 IP 模式: 接收端【不再设置自身 IP】。只要网络可达即直连,
+            # 避免网卡被扰动导致随后的 TLS 握手失败 (浏览器能连、工具连不上即此因)。
             self._log(f"手动 IP 模式: 将直连源设备 {manual_ip}:{TRANSFER_PORT}")
+            self._log(
+                f"说明: 接收端不设置自身 IP (掩码已统一为 {SUBNET_MASK}), "
+                f"网络可达即直连, 无需与本机设同网段地址。")
 
         # 输入源设备显示的验证码 (HTTPS 鉴权必需)
         # 优先读取主界面上的验证码输入框; 为空时再弹出对话框作为兜底
@@ -756,6 +891,48 @@ class Controller:
                 self.ui.after(0, lambda: self._on_transfer_failed())
                 return
 
+            # ---- 网络自检诊断: 打印本机 IP / 目标 IP / TCP 端口可达性 ----
+            try:
+                import socket as _sock
+                self._log(f"[诊断] 拟连接源设备: {source_ip}:{TRANSFER_PORT}")
+                # 本机所有网卡 IP
+                try:
+                    _hostname = _sock.gethostname()
+                    _ips = _sock.getaddrinfo(_hostname, None)
+                    _local_ips = sorted({i[4][0] for i in _ips if ":" not in i[4][0]})
+                    self._log(f"[诊断] 本机 IP 列表: {_local_ips}")
+                except Exception as e:
+                    self._log(f"[诊断] 获取本机 IP 失败: {e}")
+                # TLS 可达性探测: 直接做 TLS 握手 (同时验证 TCP+TLS, 无需验证码)
+                # 说明: 旧版用裸 create_connection 探端口后立刻 close, Windows 上会产生 RST,
+                # 触发源端服务器误报"读取握手头失败/超时 (按明文处理)"。改用真实 TLS 握手探测,
+                # 既能干净验证握手是否成功, 也不会让源端误以为遭受明文攻击而拒绝连接。
+                try:
+                    import ssl as _ssl
+                    _ctx = _ssl._create_unverified_context()
+                    _s = _ssl.wrap_socket(
+                        _sock.create_connection((source_ip, TRANSFER_PORT), timeout=5),
+                        server_side=False, context=_ctx,
+                    )
+                    _s.close()
+                    self._log(f"[诊断] TLS 端口 {source_ip}:{TRANSFER_PORT} 可达 (TCP+TLS 握手成功)")
+                except Exception as e:
+                    _reason = getattr(e, "reason", e)
+                    _winerr = getattr(_reason, "errno", getattr(e, "winerror", None))
+                    if isinstance(e, TimeoutError) or _winerr in (10060, 110):
+                        _hint = ("超时/无响应 → 典型防火墙拦截 (TCP 被丢弃)。\n"
+                                 "      请在源端: 以管理员运行本工具, 或手动允许入站 TCP 9999。")
+                    elif _winerr in (10061, 111, 61):
+                        _hint = "连接被拒绝 → 源端服务器未启动或端口错误"
+                    elif _winerr in (10065, 10051, 101, 51):
+                        _hint = "主机不可达 → 检查网线/同网段/源端 IP 是否正确"
+                    else:
+                        _hint = f"TLS 握手失败 → {e} (若源端为旧版 exe 未完成 TLS 握手, 请重新打包)"
+                    self._log(f"[诊断] TLS 端口 {source_ip}:{TRANSFER_PORT} 不可达: {type(e).__name__}: {e}")
+                    self._log(f"  → {_hint}")
+            except Exception as e:
+                self._log(f"[诊断] 网络自检异常: {e}")
+
             self._last_source_ip = source_ip  # 供校验阶段缺失文件重试下载
             self.ui.after(0, lambda: self._log(f"连接源设备: {source_ip}:{TRANSFER_PORT}"))
             self.ui.after(0, lambda: self.ui.tk_button_mqfzl35t.config(text="接收中..."))
@@ -764,7 +941,11 @@ class Controller:
                 self.ui.after(0, lambda: self._set_status(
                     f"正在传输... {files_done}/{total_files} 文件"
                 ))
-                if total_files > 0:
+                # 总进度条: 优先按字节占比 (大文件传输时文件数不变但字节在涨,
+                # 仅按文件数会导致进度条长时间不动); 无总字节信息时退回按文件数
+                if total_bytes > 0:
+                    self.ui.after(0, lambda: self._set_progress(bytes_done, total_bytes))
+                elif total_files > 0:
                     self.ui.after(0, lambda: self._set_progress(files_done, total_files))
 
             success, files, bytes_done, errors = download_files(
@@ -772,6 +953,7 @@ class Controller:
                 partition_map=self._partition_map,
                 log_callback=self._log,
                 progress_callback=_progress,
+                partition_progress_callback=self._partition_progress,
                 partition_count=self._ntfs_partition_count,
                 auth_code=self._auth_code,
             )
@@ -827,6 +1009,13 @@ class Controller:
         if gtmc_new_name:
             self._log(f"检测到 GTMC 目录已重命名为: {gtmc_new_name} (校验时自动映射)")
 
+        # 接收端手动指定的 FullFilelist_DEF.csv (为空则自动识别最新 Appl 文件夹)
+        csv_path = self.ui.get_csv_path()
+        if csv_path:
+            self._log(f"将使用手动指定的 CSV: {csv_path}")
+        else:
+            self._log("未手动指定 CSV, 将自动识别最新 Appl 文件夹下的 FullFilelist_DEF.csv")
+
         def _verify():
             try:
                 def _verify_progress(done, total):
@@ -845,6 +1034,8 @@ class Controller:
                     server_ip=server_ip,
                     gtmc_new_name=gtmc_new_name,
                     auth_code=auth_code,
+                    winpe=(self.ui.winpe_var.get() == "winpe"),
+                    csv_path=csv_path,
                 )
                 if self._stop_verify:
                     self.ui.after(0, lambda: self._log("校验已取消 (新一轮传输开始)"))
@@ -956,3 +1147,65 @@ class Controller:
         self._set_status(status_text)
         self._set_progress_mode(indeterminate=False)
         self._set_progress(0)
+        try:
+            self.ui.tk_file_progress_bar.config(value=0)
+        except Exception:
+            pass
+
+    def _partition_progress(self, partition: str, done: int, total: int):
+        """第二个进度条: 当前分区拷贝进度 (D/E/F 盘各自 0-100%)
+
+        file_transfer.download_files 在逐分区串行下载时持续回调此函数。
+        """
+        try:
+            pct = min(done / total * 100, 100) if total > 0 else 0
+            self.ui.after(0, lambda: self.ui.tk_file_progress_bar.config(value=pct))
+            self.ui.after(0, lambda p=partition: self._set_status(f"正在拷贝 {p} 盘 ({done}/{total})"))
+        except Exception:
+            pass
+
+    # ==================== 清理退出 ====================
+
+    def shutdown(self):
+        """清理所有后台进程和资源 (窗口关闭 / 异常退出 / atexit 时调用)
+
+        确保:
+        - 校验线程安全终止
+        - 文件服务器 (HTTPS) 正确关闭, 释放端口和线程
+        - DHCP 服务器 (UDP) 正确关闭, 释放端口和 socket
+        - 系统休眠策略恢复 (不再阻止锁屏/休眠)
+        """
+        self._log("[清理] 正在关闭所有后台进程...")
+
+        # 1. 停止校验线程
+        if self._verify_thread and self._verify_thread.is_alive():
+            self._stop_verify = True
+            try:
+                self._verify_thread.join(timeout=3)
+            except Exception:
+                pass
+
+        # 2. 停止文件服务器 (释放 HTTPS 端口 + 线程)
+        if self._file_server:
+            try:
+                self._file_server.stop()
+            except Exception:
+                pass
+            self._file_server = None
+
+        # 3. 停止 DHCP 服务器 (释放 UDP 端口 + socket)
+        if self._dhcp_server:
+            try:
+                self._dhcp_server.stop()
+            except Exception:
+                pass
+            self._dhcp_server = None
+
+        # 4. 恢复系统休眠策略 (即使 FileServer.stop() 已调过, 这里再兜底一次)
+        try:
+            _allow_sleep()
+        except Exception:
+            pass
+
+        self._transferring = False
+        self._use_dhcp = False

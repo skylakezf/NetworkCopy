@@ -16,36 +16,51 @@ class WinGUI(Tk):
         # 注册验证码输入校验命令 (仅英文数字, 最多 4 位)
         self._auth_vcmd = (self.register(self._auth_validate), "%P")
         self.tk_label_mqfzd8tn = self.__tk_label_mqfzd8tn(self)
-        self.tk_label_mqfzgrmh = self.__tk_label_mqfzgrmh(self)
+        self.tk_label_mqg0h1xg = self.__tk_label_mqg0h1xg(self)
+        self.tk_label_winpe = self.__tk_label_winpe(self)
         self.tk_select_box_mqfzkd6x = self.__tk_select_box_mqfzkd6x(self)
-        self.tk_button_mqfzl35t = self.__tk_button_mqfzl35t(self)
-        self.tk_select_box_mqfzmzbe = self.__tk_select_box_mqfzmzbe(self)
+        self.tk_select_box_mqg0hm2h = self.__tk_select_box_mqg0hm2h(self)
+        # 运行环境单选 (WinPE / 正常系统) — 必须先创建 winpe_var 再建单选按钮
+        self.winpe_var = _tk.StringVar()
+        self.tk_radio_winpe = self.__tk_radio_winpe(self)
+        self.tk_radio_normal = self.__tk_radio_normal(self)
+
+        self.tk_label_mqfzgrmh = self.__tk_label_mqfzgrmh(self)
         self.tk_label_mqfzs0t6 = self.__tk_label_mqfzs0t6(self)
+        self.tk_select_box_mqfzmzbe = self.__tk_select_box_mqfzmzbe(self)
         self.tk_select_box_mqfzsdz4 = self.__tk_select_box_mqfzsdz4(self)
         self.tk_select_box_mqfzuo2y = self.__tk_select_box_mqfzuo2y(self)
         self.tk_select_box_mqfzwehm = self.__tk_select_box_mqfzwehm(self)
-        self.tk_label_mqg0h1xg = self.__tk_label_mqg0h1xg(self)
-        self.tk_select_box_mqg0hm2h = self.__tk_select_box_mqg0hm2h(self)
+
         self.tk_label_discover = self.__tk_label_discover(self)
         self.tk_select_box_discover = self.__tk_select_box_discover(self)
         self.tk_button_dhcp = self.__tk_button_dhcp(self)
+        self.tk_button_mqfzl35t = self.__tk_button_mqfzl35t(self)
+
         self.tk_label_ip_manual = self.__tk_label_ip_manual(self)
         self.ip_octet1_var = _tk.StringVar()
-        self.tk_ip_octet1 = self.__tk_ip_octet(self, self.ip_octet1_var, 100)
-        self.tk_label_dot1 = self.__tk_dot_label(self, 144)
+        self.tk_ip_octet1 = self.__tk_ip_octet(self, self.ip_octet1_var, 104)
+        self.tk_label_dot1 = self.__tk_dot_label(self, 148)
         self.ip_octet2_var = _tk.StringVar()
-        self.tk_ip_octet2 = self.__tk_ip_octet(self, self.ip_octet2_var, 156)
-        self.tk_label_dot2 = self.__tk_dot_label(self, 200)
+        self.tk_ip_octet2 = self.__tk_ip_octet(self, self.ip_octet2_var, 160)
+        self.tk_label_dot2 = self.__tk_dot_label(self, 204)
         self.ip_octet3_var = _tk.StringVar()
-        self.tk_ip_octet3 = self.__tk_ip_octet(self, self.ip_octet3_var, 212)
-        self.tk_label_dot3 = self.__tk_dot_label(self, 256)
+        self.tk_ip_octet3 = self.__tk_ip_octet(self, self.ip_octet3_var, 216)
+        self.tk_label_dot3 = self.__tk_dot_label(self, 260)
         self.ip_octet4_var = _tk.StringVar()
-        self.tk_ip_octet4 = self.__tk_ip_octet(self, self.ip_octet4_var, 268)
+        self.tk_ip_octet4 = self.__tk_ip_octet(self, self.ip_octet4_var, 272)
+
         self.tk_label_auth_title = self.__tk_label_auth_title(self)
         self.tk_label_auth_code = self.__tk_label_auth_code(self)
         # 目标设备: 验证码输入框 (源设备不需要输入, 只需显示)
         self.tk_label_auth_input_title = self.__tk_label_auth_input_title(self)
         self.tk_entry_auth_input = self.__tk_entry_auth_input(self)
+        # 接收端: FullFilelist_DEF.csv 手动选择框 (默认隐藏, 选择目标设备后显示)
+        self.csv_path_var = _tk.StringVar()
+        self.tk_label_csv = self.__tk_label_csv(self)
+        self.tk_entry_csv = self.__tk_entry_csv(self)
+        self.tk_button_browse_csv = self.__tk_button_browse_csv(self)
+
         self.tk_label_status = self.__tk_label_status(self)
         self.tk_progress_bar = self.__tk_progress_bar(self)
         self.tk_file_progress_bar = self.__tk_file_progress_bar(self)
@@ -55,7 +70,7 @@ class WinGUI(Tk):
     def __win(self):
         self.title("磁盘拷贝工具 By ZhiyuChen")
         width = 640
-        height = 640
+        height = 730
         screenwidth = self.winfo_screenwidth()
         screenheight = self.winfo_screenheight()
         x = (screenwidth - width) // 2
@@ -63,88 +78,112 @@ class WinGUI(Tk):
         self.geometry(f"{width}x{height}+{x}+{y}")
         self.resizable(width=False, height=False)
 
-    # ==================== 布局 ====================
+    # ==================== 第一行: 网卡 / 设备类型 / 运行环境 ====================
 
     def __tk_label_mqfzd8tn(self, parent):
         label = Label(parent, text="选择网卡", anchor="w")
-        label.place(x=20, y=18, width=80, height=24)
+        label.place(x=20, y=16, width=80, height=22)
         return label
 
     def __tk_label_mqg0h1xg(self, parent):
         label = Label(parent, text="设备类型", anchor="w")
-        label.place(x=340, y=18, width=80, height=24)
+        label.place(x=340, y=16, width=80, height=22)
+        return label
+
+    def __tk_label_winpe(self, parent):
+        label = Label(parent, text="运行环境", anchor="w",
+                      font=("Microsoft YaHei UI", 10, "bold"))
+        label.place(x=500, y=16, width=110, height=20)
         return label
 
     def __tk_select_box_mqfzkd6x(self, parent):
         cb = Combobox(parent, state="readonly")
         cb['values'] = ("扫描中...",)
-        cb.place(x=20, y=44, width=300, height=28)
+        cb.place(x=20, y=42, width=300, height=28)
         return cb
 
     def __tk_select_box_mqg0hm2h(self, parent):
         cb = Combobox(parent, state="readonly")
         cb['values'] = ("源设备", "目标设备")
-        cb.place(x=340, y=44, width=140, height=28)
+        cb.place(x=340, y=42, width=140, height=28)
         return cb
+
+    def __tk_radio_winpe(self, parent):
+        rb = Radiobutton(parent, text="WinPE 下", variable=self.winpe_var,
+                         value="winpe")
+        rb.place(x=500, y=40, width=110, height=20)
+        return rb
+
+    def __tk_radio_normal(self, parent):
+        rb = Radiobutton(parent, text="正常系统", variable=self.winpe_var,
+                         value="normal")
+        rb.place(x=500, y=60, width=110, height=20)
+        return rb
+
+    # ==================== 第二行: 磁盘 / PE 盘符映射 ====================
 
     def __tk_label_mqfzgrmh(self, parent):
         label = Label(parent, text="选择磁盘", anchor="w")
-        label.place(x=20, y=90, width=80, height=24)
+        label.place(x=20, y=90, width=80, height=22)
         return label
 
     def __tk_label_mqfzs0t6(self, parent):
         label = Label(parent, text="PE 盘符映射:    D →          E →          F →", anchor="w")
-        label.place(x=180, y=90, width=320, height=24)
+        label.place(x=180, y=90, width=320, height=22)
         return label
 
     def __tk_select_box_mqfzmzbe(self, parent):
         cb = Combobox(parent, state="readonly")
         cb['values'] = ("请先选择设备类型",)
-        cb.place(x=20, y=118, width=145, height=28)
+        cb.place(x=20, y=116, width=145, height=28)
         return cb
 
     def __tk_select_box_mqfzsdz4(self, parent):
         cb = Combobox(parent, state="readonly")
         cb['values'] = ()
-        cb.place(x=220, y=118, width=55, height=28)
+        cb.place(x=220, y=116, width=55, height=28)
         return cb
 
     def __tk_select_box_mqfzuo2y(self, parent):
         cb = Combobox(parent, state="readonly")
         cb['values'] = ()
-        cb.place(x=310, y=118, width=55, height=28)
+        cb.place(x=310, y=116, width=55, height=28)
         return cb
 
     def __tk_select_box_mqfzwehm(self, parent):
         cb = Combobox(parent, state="readonly")
         cb['values'] = ()
-        cb.place(x=400, y=118, width=55, height=28)
+        cb.place(x=400, y=116, width=55, height=28)
         return cb
+
+    # ==================== 第三行: 发现设备 / DHCP / 开始 ====================
 
     def __tk_label_discover(self, parent):
         label = Label(parent, text="发现设备", anchor="w")
-        label.place(x=20, y=165, width=80, height=24)
+        label.place(x=20, y=156, width=80, height=22)
         return label
 
     def __tk_select_box_discover(self, parent):
         cb = Combobox(parent, state="readonly")
         cb['values'] = ("等待 DHCP 响应...",)
-        cb.place(x=100, y=165, width=265, height=28)
+        cb.place(x=100, y=156, width=258, height=28)
         return cb
 
     def __tk_button_dhcp(self, parent):
         btn = Button(parent, text="开启DHCP", takefocus=False)
-        btn.place(x=372, y=165, width=108, height=28)
+        btn.place(x=366, y=156, width=100, height=28)
         return btn
 
     def __tk_button_mqfzl35t(self, parent):
         btn = Button(parent, text="开始传输/接收", takefocus=False)
-        btn.place(x=490, y=165, width=115, height=28)
+        btn.place(x=474, y=156, width=136, height=28)
         return btn
+
+    # ==================== 第四行: 手动 IP (目标设备) ====================
 
     def __tk_label_ip_manual(self, parent):
         label = Label(parent, text="源设备IP(手动):", anchor="w")
-        label.place(x=20, y=195, width=80, height=24)
+        label.place(x=20, y=192, width=82, height=22)
         return label
 
     def __tk_ip_octet(self, parent, var, x):
@@ -152,8 +191,13 @@ class WinGUI(Tk):
             parent, textvariable=var, width=4, justify="center",
             validate="key", validatecommand=self._octet_vcmd,
         )
-        entry.place(x=x, y=195, width=42, height=28)
+        entry.place(x=x, y=192, width=42, height=28)
         return entry
+
+    def __tk_dot_label(self, parent, x):
+        label = Label(parent, text=".", font=("Microsoft YaHei UI", 11, "bold"))
+        label.place(x=x, y=192, width=10, height=22)
+        return label
 
     def _octet_validate(self, new_value: str) -> bool:
         """限制手动 IP 每个文本框只能输入 0~255 的纯数字。
@@ -176,14 +220,24 @@ class WinGUI(Tk):
             return False
         return all(c.isalnum() for c in new_value)
 
-    def __tk_dot_label(self, parent, x):
-        label = Label(parent, text=".", font=("Microsoft YaHei UI", 11, "bold"))
-        label.place(x=x, y=195, width=10, height=24)
+    # ==================== 第五行: 连接验证码 ====================
+
+    def __tk_label_auth_input_title(self, parent):
+        label = _tk.Label(parent, text="连接验证码:", anchor="w",
+                          font=("Microsoft YaHei UI", 12, "bold"))
+        label.place(x=20, y=228, width=95, height=24)
         return label
+
+    def __tk_entry_auth_input(self, parent):
+        entry = Entry(parent, font=("Microsoft YaHei UI", 16, "bold"),
+                      justify="center", validate="key",
+                      validatecommand=self._auth_vcmd)
+        entry.place(x=118, y=226, width=160, height=30)
+        return entry
 
     def __tk_label_auth_title(self, parent):
         label = Label(parent, text="连接验证码", anchor="e")
-        label.place(x=340, y=195, width=80, height=28)
+        label.place(x=340, y=228, width=80, height=28)
         return label
 
     def __tk_label_auth_code(self, parent):
@@ -194,45 +248,65 @@ class WinGUI(Tk):
             fg="#D32F2F", bg="#FFF3E0",
             relief="groove", bd=1,
         )
-        label.place(x=428, y=190, width=187, height=36)
+        label.place(x=428, y=224, width=182, height=34)
         return label
 
-    def __tk_label_auth_input_title(self, parent):
-        label = _tk.Label(parent, text="连接验证码:", anchor="w",
-                          font=("Microsoft YaHei UI", 12, "bold"))
-        label.place(x=20, y=195, width=95, height=24)
+    # ==================== 第六行: 接收端 CSV 选择框 ====================
+
+    def __tk_label_csv(self, parent):
+        label = Label(parent, text="FullFilelist_DEF.csv:", anchor="w")
+        label.place(x=20, y=268, width=140, height=24)
         return label
 
-    def __tk_entry_auth_input(self, parent):
-        entry = Entry(parent, font=("Microsoft YaHei UI", 16, "bold"),
-                      justify="center", validate="key",
-                      validatecommand=self._auth_vcmd)
-        entry.place(x=118, y=193, width=160, height=30)
+    def __tk_entry_csv(self, parent):
+        entry = Entry(parent, textvariable=self.csv_path_var,
+                      state="readonly", font=("Microsoft YaHei UI", 9))
+        entry.place(x=165, y=266, width=355, height=26)
         return entry
+
+    def __tk_button_browse_csv(self, parent):
+        btn = Button(parent, text="浏览...", takefocus=False,
+                     command=self._on_browse_csv)
+        btn.place(x=525, y=266, width=85, height=26)
+        return btn
+
+    def _on_browse_csv(self):
+        """打开文件选择对话框, 让用户手动指定 FullFilelist_DEF.csv"""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="选择 FullFilelist_DEF.csv",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+        )
+        if path:
+            self.csv_path_var.set(path)
+
+    # ==================== 状态 / 进度条 ====================
 
     def __tk_label_status(self, parent):
         label = Label(parent, text="就绪", anchor="w", foreground="#555555")
-        label.place(x=20, y=235, width=595, height=20)
+        label.place(x=20, y=304, width=595, height=20)
         return label
 
     def __tk_progress_bar(self, parent):
         pb = Progressbar(parent, mode="determinate", maximum=100, value=0)
-        pb.place(x=20, y=260, width=595, height=22)
+        pb.place(x=20, y=330, width=595, height=22)
         return pb
 
     def __tk_file_progress_bar(self, parent):
         pb = Progressbar(parent, mode="determinate", maximum=100, value=0)
-        pb.place(x=20, y=288, width=595, height=22)
+        pb.place(x=20, y=358, width=595, height=22)
         return pb
+
+    # ==================== 日志 ====================
 
     def __tk_label_mqg0zfmi(self, parent):
         label = Label(parent, text="日志", anchor="w")
-        label.place(x=20, y=318, width=50, height=24)
+        label.place(x=20, y=390, width=50, height=22)
         return label
 
     def __tk_text_mqg105ch(self, parent):
         text = Text(parent)
-        text.place(x=20, y=346, width=595, height=265)
+        text.place(x=20, y=418, width=595, height=294)
         return text
 
     # ==================== 滚动条 ====================
@@ -285,7 +359,7 @@ class Win(WinGUI):
         vbar = Scrollbar(self)
         vbar.config(command=self.tk_text_mqg105ch.yview)
         self.tk_text_mqg105ch.configure(yscrollcommand=vbar.set)
-        vbar.place(x=614, y=346, width=16, height=265)
+        vbar.place(x=614, y=418, width=16, height=294)
 
     def __style_config(self):
         """统一字体和样式"""
@@ -301,20 +375,20 @@ class Win(WinGUI):
         self.tk_select_box_discover.place_forget()
 
     def show_discover(self):
-        self.tk_label_discover.place(x=20, y=165, width=80, height=24)
-        self.tk_select_box_discover.place(x=100, y=165, width=265, height=28)
+        self.tk_label_discover.place(x=20, y=156, width=80, height=22)
+        self.tk_select_box_discover.place(x=100, y=156, width=258, height=28)
 
     def hide_dhcp(self):
         self.tk_button_dhcp.place_forget()
 
     def show_dhcp(self):
-        self.tk_button_dhcp.place(x=372, y=165, width=108, height=28)
+        self.tk_button_dhcp.place(x=366, y=156, width=100, height=28)
 
     def show_auth_code(self, code: str):
         """在专用区域醒目显示连接验证码"""
         self.tk_label_auth_code.config(text=code)
-        self.tk_label_auth_title.place(x=340, y=195, width=80, height=28)
-        self.tk_label_auth_code.place(x=428, y=190, width=187, height=36)
+        self.tk_label_auth_title.place(x=340, y=228, width=80, height=28)
+        self.tk_label_auth_code.place(x=428, y=224, width=182, height=34)
 
     def hide_auth_code(self):
         self.tk_label_auth_code.config(text="----")
@@ -333,19 +407,20 @@ class Win(WinGUI):
         self.tk_ip_octet4.place_forget()
 
     def show_manual_ip(self):
-        self.tk_label_ip_manual.place(x=20, y=195, width=80, height=24)
-        self.tk_ip_octet1.place(x=100, y=193, width=40, height=28)
-        self.tk_label_dot1.place(x=144, y=195, width=10, height=24)
-        self.tk_ip_octet2.place(x=156, y=193, width=40, height=28)
-        self.tk_label_dot2.place(x=200, y=195, width=10, height=24)
-        self.tk_ip_octet3.place(x=212, y=193, width=40, height=28)
-        self.tk_label_dot3.place(x=256, y=195, width=10, height=24)
-        self.tk_ip_octet4.place(x=268, y=193, width=40, height=28)
+        # 接收端手动 IP 直连行
+        self.tk_label_ip_manual.place(x=20, y=192, width=82, height=22)
+        self.tk_ip_octet1.place(x=104, y=192, width=42, height=28)
+        self.tk_label_dot1.place(x=148, y=192, width=10, height=22)
+        self.tk_ip_octet2.place(x=160, y=192, width=42, height=28)
+        self.tk_label_dot2.place(x=204, y=192, width=10, height=22)
+        self.tk_ip_octet3.place(x=216, y=192, width=42, height=28)
+        self.tk_label_dot3.place(x=260, y=192, width=10, height=22)
+        self.tk_ip_octet4.place(x=272, y=192, width=42, height=28)
 
     # ---- 目标设备验证码输入框 ----
     def show_auth_input(self):
-        self.tk_label_auth_input_title.place(x=20, y=195, width=95, height=24)
-        self.tk_entry_auth_input.place(x=118, y=193, width=160, height=30)
+        self.tk_label_auth_input_title.place(x=20, y=228, width=95, height=24)
+        self.tk_entry_auth_input.place(x=118, y=226, width=160, height=30)
 
     def hide_auth_input(self):
         self.tk_label_auth_input_title.place_forget()
@@ -357,6 +432,24 @@ class Win(WinGUI):
     def set_auth_input(self, code: str):
         self.tk_entry_auth_input.delete(0, "end")
         self.tk_entry_auth_input.insert(0, code)
+
+    # ---- 接收端 FullFilelist_DEF.csv 选择框 ----
+    def show_csv_selector(self):
+        self.tk_label_csv.place(x=20, y=268, width=140, height=24)
+        self.tk_entry_csv.place(x=165, y=266, width=355, height=26)
+        self.tk_button_browse_csv.place(x=525, y=266, width=85, height=26)
+
+    def hide_csv_selector(self):
+        self.tk_label_csv.place_forget()
+        self.tk_entry_csv.place_forget()
+        self.tk_button_browse_csv.place_forget()
+        self.csv_path_var.set("")
+
+    def get_csv_path(self) -> str:
+        return self.csv_path_var.get().strip()
+
+    def set_csv_path(self, path: str):
+        self.csv_path_var.set(path)
 
 
 if __name__ == "__main__":
