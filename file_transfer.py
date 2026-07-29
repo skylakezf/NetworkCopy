@@ -1090,6 +1090,7 @@ def download_files(
     auth_code: str = "",
     overwrite: bool = False,
     stop_check=None,
+    conflict_callback=None,
 ):
     """
     从源设备多线程并行下载 D/E/F 分区数据 (HTTPS + 验证码鉴权)
@@ -1098,6 +1099,8 @@ def download_files(
     auth_code: 源设备显示的验证码 (pwd)
     max_workers: 并行下载线程数 (默认 6)
     partition_count: NTFS 分区数 (2/3/4) — 2 分区时 D 盘仅下载 User 文件夹
+    conflict_callback: 同名文件冲突回调 conflicts → set of paths to skip
+                       (参数: list[dict], log_function → set[str])
     """
     import urllib.request
     import urllib.error
@@ -1112,7 +1115,7 @@ def download_files(
             base_url, pwd, local_partition_map, log_callback,
             progress_callback, partition_progress_callback,
             max_workers, partition_count, auth_code, overwrite,
-            stop_check,
+            stop_check, conflict_callback,
         )
     finally:
         _allow_sleep()  # 传输结束, 恢复系统正常休眠策略
@@ -1131,6 +1134,7 @@ def _download_files_inner(
     auth_code: str = "",
     overwrite: bool = False,
     stop_check=None,
+    conflict_callback=None,
 ):
     # 使用可变列表包装，避免闭包中赋值问题
     completed_files = [0]
@@ -1277,6 +1281,52 @@ def _download_files_inner(
         if skipped_files > 0:
             log(f"断点续传: 跳过 {skipped_files} 个已存在文件 ({_fmt_size(skipped_bytes)})")
     all_download_tasks = remaining_tasks
+
+    # 冲突检测: 同名文件已存在但大小不同 → 提示用户决定保留/覆盖
+    if not overwrite and conflict_callback and all_download_tasks:
+        conflicts = []
+        conflict_seen = set()  # 同路径只记录一次
+        for task in all_download_tasks:
+            _, rel_path, fsize, target_path, mtime = task
+            if target_path in conflict_seen:
+                continue
+            if os.path.isfile(target_path):
+                existing_size = os.path.getsize(target_path)
+                if existing_size != fsize:
+                    try:
+                        existing_mtime = os.path.getmtime(target_path)
+                    except OSError:
+                        existing_mtime = 0
+                    conflicts.append({
+                        "rel_path": rel_path,
+                        "target_path": target_path,
+                        "src_size": fsize,
+                        "dst_size": existing_size,
+                        "src_mtime": mtime,
+                        "dst_mtime": existing_mtime,
+                    })
+                    conflict_seen.add(target_path)
+
+        if conflicts:
+            log(f"\n检测到 {len(conflicts)} 个同名文件冲突 (源端/目标端大小不同), 等待用户决定...")
+            skip_paths = conflict_callback(conflicts, log)
+            if skip_paths:
+                # 用户选择保留目标端文件 → 过滤掉这些任务
+                filtered_tasks = []
+                for task in all_download_tasks:
+                    if task[3] in skip_paths:
+                        skipped_files += 1
+                        skipped_bytes += task[2]
+                        _mtime = task[4]
+                        if _mtime:
+                            try:
+                                os.utime(task[3], (_mtime, _mtime))
+                            except OSError:
+                                pass
+                    else:
+                        filtered_tasks.append(task)
+                all_download_tasks = filtered_tasks
+                log(f"用户选择保留 {len(skip_paths)} 个已有文件")
 
     # 初始化进度: 已跳过的文件计入已完成
     completed_files[0] = skipped_files

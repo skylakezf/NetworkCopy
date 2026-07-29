@@ -956,6 +956,7 @@ class Controller:
                 partition_progress_callback=self._partition_progress,
                 partition_count=self._ntfs_partition_count,
                 auth_code=self._auth_code,
+                conflict_callback=self._resolve_conflicts,
             )
             self.ui.after(0, lambda: self._on_download_complete(success, files, bytes_done, errors))
 
@@ -1163,6 +1164,139 @@ class Controller:
             self.ui.after(0, lambda p=partition: self._set_status(f"正在拷贝 {p} 盘 ({done}/{total})"))
         except Exception:
             pass
+
+    # ==================== 冲突处理 ====================
+
+    def _resolve_conflicts(self, conflicts: list, log_callback) -> set:
+        """同名文件冲突回调 (在 worker 线程中调用, 阻塞等待用户决定)
+
+        通过 threading.Event + ui.after 实现跨线程对话框:
+          worker 线程 → ui.after → 主线程弹窗 → 用户点击 → Event.set → worker 线程继续
+
+        Args:
+            conflicts: [{"rel_path", "target_path", "src_size", "dst_size",
+                          "src_mtime", "dst_mtime"}, ...]
+            log_callback: 日志回调
+        Returns:
+            set[str]: 用户选择保留的目标路径 (这些文件不会被重新下载)
+        """
+        if not conflicts:
+            return set()
+
+        event = threading.Event()
+        result: list = [set()]  # 可变容器供闭包写入; 默认空集 = 全部覆盖
+
+        def _show_dialog():
+            try:
+                dialog = tk.Toplevel(self.ui)
+                dialog.title(f"文件冲突 ({len(conflicts)} 个同名文件)")
+                dialog.geometry("750x480")
+                dialog.resizable(True, True)
+                dialog.transient(self.ui)
+                dialog.grab_set()
+
+                # 说明文字
+                tk.Label(
+                    dialog,
+                    text=f"以下 {len(conflicts)} 个文件在目标端已存在，但大小与源端不同。\n"
+                         "请选择保留已存在的文件，或覆盖为目标端重新下载。",
+                    justify=tk.LEFT,
+                    pady=10,
+                    fg="#555",
+                ).pack(fill=tk.X, padx=15, pady=(10, 5))
+
+                # 表头
+                header_frame = tk.Frame(dialog, bg="#e0e0e0")
+                header_frame.pack(fill=tk.X, padx=15, pady=(0, 0))
+                tk.Label(header_frame, text="文件路径", width=42, anchor=tk.W,
+                         bg="#e0e0e0", font=("", 9, "bold")).pack(side=tk.LEFT, padx=4)
+                tk.Label(header_frame, text="源端大小", width=14, anchor=tk.W,
+                         bg="#e0e0e0", font=("", 9, "bold")).pack(side=tk.LEFT, padx=4)
+                tk.Label(header_frame, text="目标端大小", width=14, anchor=tk.W,
+                         bg="#e0e0e0", font=("", 9, "bold")).pack(side=tk.LEFT, padx=4)
+
+                # 可滚动冲突列表
+                list_frame = tk.Frame(dialog)
+                list_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
+
+                canvas = tk.Canvas(list_frame, highlightthickness=0)
+                scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL, command=canvas.yview)
+                inner = tk.Frame(canvas)
+
+                inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+                canvas.create_window((0, 0), window=inner, anchor=tk.NW)
+                canvas.configure(yscrollcommand=scrollbar.set)
+
+                # 鼠标滚轮支持
+                def _on_mousewheel(event):
+                    canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                canvas.bind_all("<MouseWheel>", _on_mousewheel)
+                dialog.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+                canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+                # 渲染每个冲突文件
+                for i, c in enumerate(conflicts):
+                    bg = "#f8f8f8" if i % 2 == 0 else "#ffffff"
+                    row = tk.Frame(inner, bg=bg)
+                    row.pack(fill=tk.X)
+
+                    path_text = c.get("rel_path", c.get("target_path", "?"))
+                    src_size = c.get("src_size", 0)
+                    dst_size = c.get("dst_size", 0)
+
+                    import file_transfer as _ft
+                    tk.Label(row, text=path_text, width=42, anchor=tk.W, bg=bg,
+                             font=("Consolas", 8)).pack(side=tk.LEFT, padx=4)
+                    tk.Label(row, text=_ft._fmt_size(src_size), width=14, anchor=tk.E, bg=bg,
+                             font=("Consolas", 8)).pack(side=tk.LEFT, padx=4)
+                    tk.Label(row, text=_ft._fmt_size(dst_size), width=14, anchor=tk.E, bg=bg,
+                             font=("Consolas", 8)).pack(side=tk.LEFT, padx=4)
+
+                # 底部按钮栏
+                btn_frame = tk.Frame(dialog)
+                btn_frame.pack(fill=tk.X, padx=15, pady=(10, 15))
+
+                def _on_skip_all():
+                    """保留所有已存在文件 (跳过下载)"""
+                    result[0] = {c["target_path"] for c in conflicts}
+                    log_callback(f"冲突: 用户选择保留 {len(conflicts)} 个已存在文件")
+                    event.set()
+                    dialog.destroy()
+
+                def _on_overwrite_all():
+                    """覆盖所有 (重新下载)"""
+                    result[0] = set()
+                    log_callback(f"冲突: 用户选择覆盖 {len(conflicts)} 个文件, 重新下载")
+                    event.set()
+                    dialog.destroy()
+
+                tk.Button(
+                    btn_frame, text=f"保留已有文件 ({len(conflicts)} 个)",
+                    command=_on_skip_all, bg="#4CAF50", fg="white",
+                    font=("", 10, "bold"), width=22, height=2,
+                ).pack(side=tk.LEFT, padx=(0, 10))
+
+                tk.Button(
+                    btn_frame, text=f"覆盖重新下载 ({len(conflicts)} 个)",
+                    command=_on_overwrite_all, bg="#f44336", fg="white",
+                    font=("", 10, "bold"), width=22, height=2,
+                ).pack(side=tk.LEFT)
+
+                # 窗口关闭按钮 = 保留已有文件 (安全默认)
+                dialog.protocol("WM_DELETE_WINDOW", _on_skip_all)
+
+                # 5 分钟超时自动选择保留 (安全默认)
+                dialog.after(300000, lambda: (_on_skip_all() if not event.is_set() else None))
+
+            except Exception as ex:
+                log_callback(f"[X] 冲突对话框异常: {ex}")
+                event.set()
+
+        self.ui.after(0, _show_dialog)
+        event.wait()  # 阻塞 worker 线程, 等待用户点击
+        return result[0]
 
     # ==================== 清理退出 ====================
 
