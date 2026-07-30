@@ -1,76 +1,51 @@
 """
-磁盘拷贝工具 GUI
-基于 Tkinter/ttk 布局
+磁盘拷贝工具 GUI - 横板向导式布局 (ttkbootstrap)
+适配: 1280x700 低分辨率低色域屏幕
+左侧: 步骤内容区  右侧: 步骤指示器 (200px)
+设计: 参照页面展示.pptx
 """
 import tkinter as _tk
 from tkinter import *
-from tkinter.ttk import *
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
 
 
-class WinGUI(Tk):
+# ===== 设计系统颜色 (低色域优化) =====
+C_PRIMARY    = "#2B2D42"   # 深蓝灰 - 标题、主按钮
+C_TEXT       = "#1a1a2e"   # 主文字
+C_TEXT_SEC   = "#555555"   # 次要文字 (加深以适应低色域)
+C_TEXT_MUTED = "#777777"   # 辅助文字 (加深)
+C_GREEN      = "#4CAF50"   # 完成/成功
+C_GREEN_BG   = "#E8F5E9"   # 完成背景
+C_BLUE       = "#2196F3"   # 当前步骤
+C_GRAY       = "#999999"   # 未开始
+C_GRAY_BG    = "#dddddd"   # 未开始背景 (加深以适应低色域)
+C_SIDEBAR_BG = "#f0f0f0"   # 侧边栏背景 (加深)
+C_CARD_BORDER= "#cccccc"   # 卡片边框 (加深)
+C_CONSOLE_BG = "#2B2B2B"   # 控制台深色背景
+C_CONSOLE_FG = "#E0E0E0"   # 控制台文字
+C_RED        = "#D32F2F"   # 验证码红色
+C_RED_BG     = "#FFF3E0"   # 验证码背景
+C_SEP        = "#cccccc"   # 分隔线 (加深)
+C_WHITE      = "#ffffff"
+
+
+class WinGUI(ttk.Window):
     def __init__(self):
-        super().__init__()
+        super().__init__(themename="flatly")
         self.__win()
-        # 注册 IP 每段 (0~255) 输入校验命令, 供 4 个文本框复用
         self._octet_vcmd = (self.register(self._octet_validate), "%P")
-        # 注册验证码输入校验命令 (仅英文数字, 最多 4 位)
         self._auth_vcmd = (self.register(self._auth_validate), "%P")
-        self.tk_label_mqfzd8tn = self.__tk_label_mqfzd8tn(self)
-        self.tk_label_mqg0h1xg = self.__tk_label_mqg0h1xg(self)
-        self.tk_label_winpe = self.__tk_label_winpe(self)
-        self.tk_select_box_mqfzkd6x = self.__tk_select_box_mqfzkd6x(self)
-        self.tk_select_box_mqg0hm2h = self.__tk_select_box_mqg0hm2h(self)
-        # 运行环境单选 (WinPE / 正常系统) — 必须先创建 winpe_var 再建单选按钮
-        self.winpe_var = _tk.StringVar()
-        self.tk_radio_winpe = self.__tk_radio_winpe(self)
-        self.tk_radio_normal = self.__tk_radio_normal(self)
-
-        self.tk_label_mqfzgrmh = self.__tk_label_mqfzgrmh(self)
-        self.tk_label_mqfzs0t6 = self.__tk_label_mqfzs0t6(self)
-        self.tk_select_box_mqfzmzbe = self.__tk_select_box_mqfzmzbe(self)
-        self.tk_select_box_mqfzsdz4 = self.__tk_select_box_mqfzsdz4(self)
-        self.tk_select_box_mqfzuo2y = self.__tk_select_box_mqfzuo2y(self)
-        self.tk_select_box_mqfzwehm = self.__tk_select_box_mqfzwehm(self)
-
-        self.tk_label_discover = self.__tk_label_discover(self)
-        self.tk_select_box_discover = self.__tk_select_box_discover(self)
-        self.tk_button_dhcp = self.__tk_button_dhcp(self)
-        self.tk_button_mqfzl35t = self.__tk_button_mqfzl35t(self)
-
-        self.tk_label_ip_manual = self.__tk_label_ip_manual(self)
-        self.ip_octet1_var = _tk.StringVar()
-        self.tk_ip_octet1 = self.__tk_ip_octet(self, self.ip_octet1_var, 104)
-        self.tk_label_dot1 = self.__tk_dot_label(self, 148)
-        self.ip_octet2_var = _tk.StringVar()
-        self.tk_ip_octet2 = self.__tk_ip_octet(self, self.ip_octet2_var, 160)
-        self.tk_label_dot2 = self.__tk_dot_label(self, 204)
-        self.ip_octet3_var = _tk.StringVar()
-        self.tk_ip_octet3 = self.__tk_ip_octet(self, self.ip_octet3_var, 216)
-        self.tk_label_dot3 = self.__tk_dot_label(self, 260)
-        self.ip_octet4_var = _tk.StringVar()
-        self.tk_ip_octet4 = self.__tk_ip_octet(self, self.ip_octet4_var, 272)
-
-        self.tk_label_auth_title = self.__tk_label_auth_title(self)
-        self.tk_label_auth_code = self.__tk_label_auth_code(self)
-        # 目标设备: 验证码输入框 (源设备不需要输入, 只需显示)
-        self.tk_label_auth_input_title = self.__tk_label_auth_input_title(self)
-        self.tk_entry_auth_input = self.__tk_entry_auth_input(self)
-        # 接收端: FullFilelist_DEF.csv 手动选择框 (默认隐藏, 选择目标设备后显示)
-        self.csv_path_var = _tk.StringVar()
-        self.tk_label_csv = self.__tk_label_csv(self)
-        self.tk_entry_csv = self.__tk_entry_csv(self)
-        self.tk_button_browse_csv = self.__tk_button_browse_csv(self)
-
-        self.tk_label_status = self.__tk_label_status(self)
-        self.tk_progress_bar = self.__tk_progress_bar(self)
-        self.tk_file_progress_bar = self.__tk_file_progress_bar(self)
-        self.tk_label_mqg0zfmi = self.__tk_label_mqg0zfmi(self)
-        self.tk_text_mqg105ch = self.__tk_text_mqg105ch(self)
+        self._build_layout()
+        self._step = 0
+        self._total_steps = 5
+        self._device_type = None  # "source" or "target"
+        self._role_display = "未选择"
 
     def __win(self):
         self.title("磁盘拷贝工具 By ZhiyuChen")
-        width = 640
-        height = 730
+        width = 1280
+        height = 700
         screenwidth = self.winfo_screenwidth()
         screenheight = self.winfo_screenheight()
         x = (screenwidth - width) // 2
@@ -78,132 +53,727 @@ class WinGUI(Tk):
         self.geometry(f"{width}x{height}+{x}+{y}")
         self.resizable(width=False, height=False)
 
-    # ==================== 第一行: 网卡 / 设备类型 / 运行环境 ====================
+    # ==================== 主布局 ====================
 
-    def __tk_label_mqfzd8tn(self, parent):
-        label = Label(parent, text="选择网卡", anchor="w")
-        label.place(x=20, y=16, width=80, height=22)
-        return label
+    def _build_layout(self):
+        # 顶部标题栏
+        title_frame = _tk.Frame(self, bg=C_WHITE)
+        title_frame.pack(fill=X, padx=0, pady=0)
 
-    def __tk_label_mqg0h1xg(self, parent):
-        label = Label(parent, text="设备类型", anchor="w")
-        label.place(x=340, y=16, width=80, height=22)
-        return label
+        _tk.Label(title_frame, text="磁盘拷贝工具",
+                  font=("Microsoft YaHei UI", 14, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(side=LEFT, padx=14, pady=8)
 
-    def __tk_label_winpe(self, parent):
-        label = Label(parent, text="运行环境", anchor="w",
-                      font=("Microsoft YaHei UI", 10, "bold"))
-        label.place(x=500, y=16, width=110, height=20)
-        return label
+        self.tk_label_role = _tk.Label(title_frame,
+                                       text="当前角色：未选择",
+                                       font=("Microsoft YaHei UI", 9),
+                                       fg=C_BLUE, bg=C_WHITE)
+        self.tk_label_role.pack(side=RIGHT, padx=14, pady=8)
 
-    def __tk_select_box_mqfzkd6x(self, parent):
-        cb = Combobox(parent, state="readonly")
-        cb['values'] = ("扫描中...",)
-        cb.place(x=20, y=42, width=300, height=28)
-        return cb
+        # 分隔线
+        _tk.Frame(self, height=1, bg=C_SEP).pack(fill=X, padx=0)
 
-    def __tk_select_box_mqg0hm2h(self, parent):
-        cb = Combobox(parent, state="readonly")
-        cb['values'] = ("源设备", "目标设备")
-        cb.place(x=340, y=42, width=140, height=28)
-        return cb
+        # 主体: 左右分栏
+        main = _tk.Frame(self, bg=C_WHITE)
+        main.pack(fill=BOTH, expand=True, padx=0, pady=0)
 
-    def __tk_radio_winpe(self, parent):
-        rb = Radiobutton(parent, text="WinPE 下", variable=self.winpe_var,
-                         value="winpe")
-        rb.place(x=500, y=40, width=110, height=20)
-        return rb
+        # 左侧内容区
+        self._content_frame = _tk.Frame(main, bg=C_WHITE)
+        self._content_frame.pack(side=LEFT, fill=BOTH, expand=True)
 
-    def __tk_radio_normal(self, parent):
-        rb = Radiobutton(parent, text="正常系统", variable=self.winpe_var,
-                         value="normal")
-        rb.place(x=500, y=60, width=110, height=20)
-        return rb
+        # 右侧步骤指示器 (200px)
+        self._build_step_indicator(main)
 
-    # ==================== 第二行: 磁盘 / PE 盘符映射 ====================
+        # 底部导航按钮
+        self._build_nav_buttons()
 
-    def __tk_label_mqfzgrmh(self, parent):
-        label = Label(parent, text="选择磁盘", anchor="w")
-        label.place(x=20, y=90, width=80, height=22)
-        return label
+        # 底部状态栏
+        self._build_status_bar()
 
-    def __tk_label_mqfzs0t6(self, parent):
-        label = Label(parent, text="PE 盘符映射:    D →          E →          F →", anchor="w")
-        label.place(x=180, y=90, width=320, height=22)
-        return label
+        # 构建各步骤页面
+        self._build_step0_role()
+        self._build_step1_nic()
+        self._build_step2_disk()
+        self._build_step3_connect()
+        self._build_step4_transfer()
 
-    def __tk_select_box_mqfzmzbe(self, parent):
-        cb = Combobox(parent, state="readonly")
-        cb['values'] = ("请先选择设备类型",)
-        cb.place(x=20, y=116, width=145, height=28)
-        return cb
+        # 初始显示步骤 0
+        self._show_step(0)
 
-    def __tk_select_box_mqfzsdz4(self, parent):
-        cb = Combobox(parent, state="readonly")
-        cb['values'] = ()
-        cb.place(x=220, y=116, width=55, height=28)
-        return cb
+    # ==================== 右侧步骤指示器 ====================
 
-    def __tk_select_box_mqfzuo2y(self, parent):
-        cb = Combobox(parent, state="readonly")
-        cb['values'] = ()
-        cb.place(x=310, y=116, width=55, height=28)
-        return cb
+    def _build_step_indicator(self, parent):
+        side = _tk.Frame(parent, width=280, bg=C_SIDEBAR_BG)
+        side.pack(side=RIGHT, fill=Y)
+        side.pack_propagate(False)
 
-    def __tk_select_box_mqfzwehm(self, parent):
-        cb = Combobox(parent, state="readonly")
-        cb['values'] = ()
-        cb.place(x=400, y=116, width=55, height=28)
-        return cb
+        hdr = _tk.Frame(side, bg=C_SIDEBAR_BG)
+        hdr.pack(fill=X, padx=14, pady=(14, 8))
+        _tk.Label(hdr, text="步骤指引", font=("Microsoft YaHei UI", 13, "bold"),
+                  fg=C_TEXT, bg=C_SIDEBAR_BG).pack(anchor=W)
+        _tk.Frame(side, height=1, bg=C_SEP).pack(fill=X, padx=14)
 
-    # ==================== 第三行: 发现设备 / DHCP / 开始 ====================
+        self._step_items = []
+        steps = [
+            ("1", "选择设备类型", "选择发送方或接收方"),
+            ("2", "选择磁盘与分区", "识别磁盘并配置盘符映射"),
+            ("3", "开始传输", "启动服务并传输文件"),
+        ]
+        for num, title, desc in steps:
+            item = self._build_step_item(side, num, title, desc)
+            self._step_items.append(item)
 
-    def __tk_label_discover(self, parent):
-        label = Label(parent, text="发现设备", anchor="w")
-        label.place(x=20, y=156, width=80, height=22)
-        return label
+    def _build_step_item(self, parent, num, title, desc):
+        container = _tk.Frame(parent, bg=C_SIDEBAR_BG)
+        container.pack(fill=X, padx=14, pady=(10, 0))
 
-    def __tk_select_box_discover(self, parent):
-        cb = Combobox(parent, state="readonly")
-        cb['values'] = ("等待 DHCP 响应...",)
-        cb.place(x=100, y=156, width=258, height=28)
-        return cb
+        row = _tk.Frame(container, bg=C_SIDEBAR_BG)
+        row.pack(fill=X)
 
-    def __tk_button_dhcp(self, parent):
-        btn = Button(parent, text="开启DHCP", takefocus=False)
-        btn.place(x=366, y=156, width=100, height=28)
-        return btn
+        circle = _tk.Label(row, text=num,
+                           font=("Microsoft YaHei UI", 10, "bold"),
+                           fg=C_GRAY, bg=C_GRAY_BG,
+                           width=4, anchor=CENTER)
+        circle.pack(side=LEFT, padx=(0, 10))
 
-    def __tk_button_mqfzl35t(self, parent):
-        btn = Button(parent, text="开始传输/接收", takefocus=False)
-        btn.place(x=474, y=156, width=136, height=28)
-        return btn
+        lbl = _tk.Label(row, text=title,
+                        font=("Microsoft YaHei UI", 10),
+                        fg=C_GRAY, bg=C_SIDEBAR_BG, anchor=W)
+        lbl.pack(side=LEFT, fill=X)
 
-    # ==================== 第四行: 手动 IP (目标设备) ====================
+        desc_lbl = _tk.Label(container, text=desc,
+                             font=("Microsoft YaHei UI", 9),
+                             fg=C_TEXT_MUTED, bg=C_SIDEBAR_BG,
+                             anchor=W, wraplength=240, justify=LEFT)
+        desc_lbl.pack(fill=X, padx=(36, 0), pady=(2, 0))
 
-    def __tk_label_ip_manual(self, parent):
-        label = Label(parent, text="源设备IP(手动):", anchor="w")
-        label.place(x=20, y=192, width=82, height=22)
-        return label
+        return {
+            "circle": circle,
+            "title": lbl,
+            "desc": desc_lbl,
+            "num": num,
+            "title_text": title,
+            "desc_text": desc,
+        }
 
-    def __tk_ip_octet(self, parent, var, x):
-        entry = Entry(
-            parent, textvariable=var, width=4, justify="center",
-            validate="key", validatecommand=self._octet_vcmd,
+    def _update_step_indicator(self, current: int):
+        map_ui_to_side = {0: 0, 1: 0, 2: 1, 3: 2, 4: 2}
+        side_current = map_ui_to_side.get(current, 0)
+
+        desc_map = {
+            0: ("选择发送方或接收方", "请选择[源设备]或[目标设备]"),
+            1: ("已选择直连网卡", "请选择设备类型"),
+            2: ("已选择磁盘", "请选择磁盘并配置盘符映射"),
+            3: ("准备连接", "配置连接参数"),
+            4: ("启动 HTTP 服务", "开始发送文件"),
+        }
+
+        for i, item in enumerate(self._step_items):
+            circle = item["circle"]
+            lbl = item["title"]
+            desc = item["desc"]
+
+            if i < side_current:
+                circle.configure(fg=C_GREEN, bg=C_GREEN_BG)
+                lbl.configure(fg=C_GREEN, font=("Microsoft YaHei UI", 10, "bold"))
+                if i == 0:
+                    role_text = ("已选择：发送方" if self._device_type == "source"
+                                 else "已选择：接收方" if self._device_type
+                                 else "已完成")
+                    desc.configure(text=role_text, fg=C_GREEN)
+                elif i == 1:
+                    desc.configure(text="已配置分区盘符映射", fg=C_GREEN)
+                else:
+                    desc.configure(text="传输服务已启动", fg=C_GREEN)
+
+            elif i == side_current:
+                circle.configure(fg=C_WHITE, bg=C_BLUE)
+                lbl.configure(fg=C_BLUE, font=("Microsoft YaHei UI", 10, "bold"))
+                d_title, d_detail = desc_map.get(current, ("", ""))
+                desc.configure(text=f"{d_title}\n{d_detail}", fg=C_TEXT_SEC)
+
+            else:
+                circle.configure(fg=C_GRAY, bg=C_GRAY_BG)
+                lbl.configure(fg=C_GRAY, font=("Microsoft YaHei UI", 10))
+                desc.configure(text=item["desc_text"], fg=C_TEXT_MUTED)
+
+    # ==================== 底部导航 ====================
+
+    def _build_nav_buttons(self):
+        nav = _tk.Frame(self, bg=C_WHITE)
+        nav.pack(fill=X, padx=14, pady=(6, 10))
+
+        btn_frame = _tk.Frame(nav, bg=C_WHITE)
+        btn_frame.pack(side=RIGHT)
+
+        self.tk_button_prev = ttk.Button(btn_frame, text="< 上一步", takefocus=False,
+                                         bootstyle="secondary-outline", width=12)
+        self.tk_button_prev.pack(side=LEFT, padx=(0, 8))
+
+        self.tk_button_next = ttk.Button(btn_frame, text="下一步 >", takefocus=False,
+                                         bootstyle="primary", width=12)
+        self.tk_button_next.pack(side=LEFT)
+
+        self.tk_button_mqfzl35t = ttk.Button(btn_frame, text="开始传输", takefocus=False,
+                                             bootstyle="success", width=14)
+
+    def set_button_prev(self, state: str, text: str = "< 上一步"):
+        if state == "disabled":
+            self.tk_button_prev.configure(state=DISABLED)
+        else:
+            self.tk_button_prev.configure(state=NORMAL)
+        self.tk_button_prev.configure(text=text)
+
+    def set_button_next(self, state: str, text: str = "下一步 >"):
+        if state == "disabled":
+            self.tk_button_next.configure(state=DISABLED)
+            self.tk_button_next.pack_forget()
+        else:
+            self.tk_button_next.configure(state=NORMAL, text=text)
+            if not self.tk_button_next.winfo_ismapped():
+                self.tk_button_next.pack(side=LEFT, padx=(0, 8))
+
+    def show_start_button(self):
+        self.tk_button_mqfzl35t.pack(side=LEFT, padx=(0, 0))
+
+    def hide_start_button(self):
+        self.tk_button_mqfzl35t.pack_forget()
+
+    # ==================== 步骤页面切换 ====================
+
+    _pages = {}
+
+    def _show_step(self, step: int):
+        for s, frame in self._pages.items():
+            frame.pack_forget()
+        if step in self._pages:
+            self._pages[step].pack(fill=BOTH, expand=True)
+        self._step = step
+        self._update_step_indicator(step)
+
+    def go_step(self, step: int):
+        self._show_step(step)
+
+    def _build_status_bar(self):
+        status_frame = _tk.Frame(self, bg=C_SIDEBAR_BG)
+        status_frame.pack(fill=X, padx=0, pady=0)
+
+        self.tk_label_status = _tk.Label(status_frame, text="",
+                                          font=("Microsoft YaHei UI", 8),
+                                          fg=C_TEXT_MUTED, bg=C_SIDEBAR_BG,
+                                          padx=14, pady=1, anchor=W)
+        self.tk_label_status.pack(fill=X)
+
+    # ==================== 步骤 0: 选择角色 ====================
+
+    def _build_step0_role(self):
+        page = _tk.Frame(self._content_frame, bg=C_WHITE)
+        self._pages[0] = page
+
+        inner = _tk.Frame(page, bg=C_WHITE)
+        inner.place(relx=0.5, rely=0.42, anchor=CENTER)
+
+        _tk.Label(inner, text="请选择当前设备的角色",
+                  font=("Microsoft YaHei UI", 16, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(pady=(0, 4))
+
+        _tk.Label(inner, text="新设备是接收方，旧设备是发送方",
+                  font=("Microsoft YaHei UI", 10),
+                  fg=C_TEXT_SEC, bg=C_WHITE).pack(pady=(0, 30))
+
+        cards = _tk.Frame(inner, bg=C_WHITE)
+        cards.pack()
+
+        # 发送方卡片
+        old_card = _tk.Frame(cards, relief=SOLID, bd=1,
+                             padx=20, pady=20, bg=C_WHITE,
+                             highlightbackground=C_CARD_BORDER,
+                             highlightthickness=1)
+        old_card.pack(side=LEFT, padx=(0, 20))
+        old_card.bind("<Button-1>", lambda e: self._on_select_role("source"))
+
+        _tk.Label(old_card, text="发送方",
+                  font=("Microsoft YaHei UI", 16, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(pady=(0, 2))
+        _tk.Label(old_card, text="源设备 - 旧设备",
+                  font=("Microsoft YaHei UI", 9),
+                  fg=C_TEXT_SEC, bg=C_WHITE).pack()
+        _tk.Label(old_card, text="本设备上有旧数据，需要发送到新设备",
+                  font=("Microsoft YaHei UI", 8),
+                  fg=C_TEXT_MUTED, bg=C_WHITE).pack(pady=(6, 14))
+        self.tk_btn_source = ttk.Button(old_card, text="选择发送方",
+                                        command=lambda: self._on_select_role("source"),
+                                        bootstyle="primary", takefocus=False, width=14)
+        self.tk_btn_source.pack()
+
+        # 接收方卡片
+        new_card = _tk.Frame(cards, relief=SOLID, bd=1,
+                             padx=20, pady=20, bg=C_WHITE,
+                             highlightbackground=C_CARD_BORDER,
+                             highlightthickness=1)
+        new_card.pack(side=LEFT)
+        new_card.bind("<Button-1>", lambda e: self._on_select_role("target"))
+
+        _tk.Label(new_card, text="接收方",
+                  font=("Microsoft YaHei UI", 16, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(pady=(0, 2))
+        _tk.Label(new_card, text="目标设备 - 新设备",
+                  font=("Microsoft YaHei UI", 9),
+                  fg=C_TEXT_SEC, bg=C_WHITE).pack()
+        _tk.Label(new_card, text="这是一台新设备，需要接收旧设备的数据",
+                  font=("Microsoft YaHei UI", 8),
+                  fg=C_TEXT_MUTED, bg=C_WHITE).pack(pady=(6, 14))
+        self.tk_btn_target = ttk.Button(new_card, text="选择接收方",
+                                        command=lambda: self._on_select_role("target"),
+                                        bootstyle="primary", takefocus=False, width=14)
+        self.tk_btn_target.pack()
+
+        for card in (old_card, new_card):
+            _bind_card_hover(card, "#f5f5f5")
+
+    def _on_select_role(self, role: str):
+        self._device_type = role
+        self._role_display = "发送方" if role == "source" else "接收方"
+        if hasattr(self, 'tk_label_role'):
+            self.tk_label_role.configure(text=f"当前角色：{self._role_display}")
+        if hasattr(self, 'ctl') and hasattr(self.ctl, '_on_role_selected'):
+            self.ctl._on_role_selected(role)
+
+    # ==================== 步骤 1: 选择网卡 ====================
+
+    def _build_step1_nic(self):
+        page = _tk.Frame(self._content_frame, bg=C_WHITE)
+        self._pages[1] = page
+
+        inner = _tk.Frame(page, bg=C_WHITE)
+        inner.pack(fill=BOTH, expand=True, padx=40, pady=28)
+
+        _tk.Label(inner, text="选择网卡",
+                  font=("Microsoft YaHei UI", 14, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 4))
+
+        _tk.Label(inner, text="请选择用于直连传输的网卡（网线直连的 IP 通常为 169.254 开头）",
+                  font=("Microsoft YaHei UI", 9), fg=C_TEXT_SEC,
+                  wraplength=700, justify=LEFT, bg=C_WHITE).pack(anchor=W, pady=(0, 12))
+
+        _tk.Label(inner, text="网卡优先级: USB 网卡 > 169.254 网段 > 内置网卡",
+                  font=("Microsoft YaHei UI", 8), fg=C_TEXT_MUTED,
+                  bg=C_WHITE).pack(anchor=W, pady=(0, 8))
+
+        self.tk_select_box_mqfzkd6x = ttk.Combobox(inner, state="readonly",
+                                                    font=("Microsoft YaHei UI", 9))
+        self.tk_select_box_mqfzkd6x['values'] = ("扫描中...",)
+        self.tk_select_box_mqfzkd6x.pack(fill=X, pady=(0, 10))
+
+        self.tk_label_nic_detail = _tk.Label(inner, text="",
+                                             font=("Microsoft YaHei UI", 8),
+                                             fg=C_TEXT_SEC, bg=C_WHITE,
+                                             wraplength=700, justify=LEFT)
+        self.tk_label_nic_detail.pack(fill=X, pady=(0, 12))
+
+        # 兼容旧控件 (隐藏)
+        self.tk_select_box_mqg0hm2h = ttk.Combobox(page, state="readonly")
+        self.winpe_var = _tk.StringVar(
+            value="winpe" if __import__('os').path.exists("X:\\Windows\\System32") else "normal")
+
+    # ==================== 步骤 2: 选择磁盘 ====================
+
+    def _build_step2_disk(self):
+        page = _tk.Frame(self._content_frame, bg=C_WHITE)
+        self._pages[2] = page
+
+        inner = _tk.Frame(page, bg=C_WHITE)
+        inner.pack(fill=BOTH, expand=True, padx=40, pady=28)
+
+        _tk.Label(inner, text="选择磁盘",
+                  font=("Microsoft YaHei UI", 14, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 4))
+
+        _tk.Label(inner, text="识别物理磁盘并配置分区盘符映射",
+                  font=("Microsoft YaHei UI", 9), fg=C_TEXT_SEC,
+                  wraplength=700, justify=LEFT, bg=C_WHITE).pack(anchor=W, pady=(0, 12))
+
+        # 磁盘选择
+        self.tk_select_box_mqfzmzbe = ttk.Combobox(inner, state="readonly",
+                                                    font=("Microsoft YaHei UI", 9))
+        self.tk_select_box_mqfzmzbe['values'] = ("请先选择设备类型",)
+        self.tk_select_box_mqfzmzbe.pack(fill=X, pady=(0, 4))
+
+        self.tk_label_auto_disk = _tk.Label(inner, text="",
+                                            font=("Microsoft YaHei UI", 8, "italic"),
+                                            fg=C_TEXT_MUTED, bg=C_WHITE)
+        self.tk_label_auto_disk.pack(anchor=W, pady=(0, 14))
+
+        # 分隔线
+        _tk.Frame(inner, height=1, bg=C_SEP).pack(fill=X, pady=(0, 12))
+
+        # 分区盘符映射
+        _tk.Label(inner, text="分区盘符映射（源 D / E / F > 当前系统盘符）",
+                  font=("Microsoft YaHei UI", 10, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 10))
+
+        map_frame = _tk.Frame(inner, bg=C_WHITE)
+        map_frame.pack(fill=X)
+
+        for drive, attr in [("D", "tk_select_box_mqfzsdz4"),
+                            ("E", "tk_select_box_mqfzuo2y"),
+                            ("F", "tk_select_box_mqfzwehm")]:
+            row = _tk.Frame(map_frame, bg=C_WHITE)
+            row.pack(fill=X, pady=3)
+            _tk.Label(row, text=f"{drive} >", width=5, anchor=E,
+                      font=("Microsoft YaHei UI", 10), fg=C_TEXT,
+                      bg=C_WHITE).pack(side=LEFT, padx=(0, 6))
+            cb = ttk.Combobox(row, state="readonly", width=8,
+                              font=("Microsoft YaHei UI", 9))
+            cb.pack(side=LEFT)
+            setattr(self, attr, cb)
+
+        # 运行环境
+        env_frame = _tk.Frame(inner, bg=C_WHITE)
+        env_frame.pack(fill=X, pady=(18, 0))
+
+        _tk.Label(env_frame, text="运行环境",
+                  font=("Microsoft YaHei UI", 10, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 6))
+
+        radio_frame = _tk.Frame(env_frame, bg=C_WHITE)
+        radio_frame.pack(anchor=W)
+
+        self.winpe_var = _tk.StringVar(value="normal")
+        ttk.Radiobutton(radio_frame, text="WinPE 环境",
+                        variable=self.winpe_var, value="winpe",
+                        bootstyle="primary").pack(side=LEFT, padx=(0, 20))
+        ttk.Radiobutton(radio_frame, text="正常系统",
+                        variable=self.winpe_var, value="normal",
+                        bootstyle="primary").pack(side=LEFT)
+
+    # ==================== 步骤 3: 连接设置 ====================
+
+    def _build_step3_connect(self):
+        page = _tk.Frame(self._content_frame, bg=C_WHITE)
+        self._pages[3] = page
+
+        inner = _tk.Frame(page, bg=C_WHITE)
+        inner.pack(fill=BOTH, expand=True, padx=40, pady=28)
+
+        # ---- 发送方 (旧电脑) 页面 ----
+        self._src_connect = _tk.Frame(inner, bg=C_WHITE)
+
+        _tk.Label(self._src_connect, text="准备就绪",
+                  font=("Microsoft YaHei UI", 16, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=CENTER, pady=(0, 4))
+
+        _tk.Label(self._src_connect, text="点击下方按钮启动 HTTP 文件传输服务",
+                  font=("Microsoft YaHei UI", 10), fg=C_TEXT_SEC,
+                  bg=C_WHITE).pack(anchor=CENTER, pady=(0, 20))
+
+        # 验证码框
+        auth_box = _tk.Frame(self._src_connect, bg=C_WHITE,
+                             relief=SOLID, bd=1,
+                             highlightbackground=C_CARD_BORDER,
+                             highlightthickness=1)
+        auth_box.pack(fill=X, pady=(0, 10))
+
+        _tk.Label(auth_box, text="验证码",
+                  font=("Microsoft YaHei UI", 9, "bold"),
+                  fg=C_TEXT_SEC, bg=C_WHITE).pack(anchor=W, padx=14, pady=(10, 4))
+
+        code_row = _tk.Frame(auth_box, bg=C_WHITE)
+        code_row.pack(fill=X, padx=14, pady=(4, 10))
+
+        _tk.Label(code_row, text="当前验证码:",
+                  font=("Microsoft YaHei UI", 10),
+                  fg=C_TEXT, bg=C_WHITE).pack(side=LEFT, padx=(0, 8))
+
+        self.tk_label_auth_code = _tk.Label(
+            code_row, text="----",
+            font=("Consolas", 24, "bold"),
+            fg=C_RED, bg=C_RED_BG,
+            padx=14, pady=4,
         )
-        entry.place(x=x, y=192, width=42, height=28)
-        return entry
+        self.tk_label_auth_code.pack(side=LEFT)
 
-    def __tk_dot_label(self, parent, x):
-        label = Label(parent, text=".", font=("Microsoft YaHei UI", 11, "bold"))
-        label.place(x=x, y=192, width=10, height=22)
-        return label
+        # 状态信息
+        self.tk_label_src_status = _tk.Label(self._src_connect,
+                                             text="验证码: ---- 等待目标设备连接...",
+                                             font=("Microsoft YaHei UI", 8),
+                                             fg=C_TEXT_MUTED, bg=C_WHITE)
+        self.tk_label_src_status.pack(anchor=W, pady=(6, 0))
+
+        # ---- 接收方 (新电脑) 页面 ----
+        self._tgt_connect = _tk.Frame(inner, bg=C_WHITE)
+
+        _tk.Label(self._tgt_connect, text="接收方 - 连接设置",
+                  font=("Microsoft YaHei UI", 14, "bold"),
+                  fg=C_BLUE, bg=C_WHITE).pack(anchor=W, pady=(0, 12))
+
+        self.tk_button_dhcp = ttk.Button(self._tgt_connect,
+                                         text="寻找旧电脑", takefocus=False,
+                                         bootstyle="primary", width=16)
+        self.tk_button_dhcp.pack(anchor=W, pady=(0, 4))
+
+        self.tk_label_dhcp_status = _tk.Label(self._tgt_connect, text="",
+                                              font=("Microsoft YaHei UI", 8),
+                                              fg=C_TEXT_SEC,
+                                              wraplength=700, justify=LEFT,
+                                              bg=C_WHITE)
+        self.tk_label_dhcp_status.pack(fill=X, pady=(0, 6))
+
+        self.tk_label_discover = _tk.Label(self._tgt_connect, text="发现的设备",
+                                           font=("Microsoft YaHei UI", 9, "bold"),
+                                           fg=C_TEXT, bg=C_WHITE)
+        self.tk_label_discover.pack(anchor=W, pady=(6, 4))
+
+        self.tk_select_box_discover = ttk.Combobox(self._tgt_connect, state="readonly",
+                                                    font=("Microsoft YaHei UI", 9))
+        self.tk_select_box_discover['values'] = ("等待 DHCP 响应...",)
+        self.tk_select_box_discover.set("等待 DHCP 响应...")
+        self.tk_select_box_discover.pack(fill=X, pady=(0, 6))
+
+        # 高级: 手动 IP
+        self._advanced_frame = _tk.Frame(self._tgt_connect, bg=C_SIDEBAR_BG, padx=10, pady=8)
+        self._advanced_frame.pack(fill=X, pady=(6, 0))
+        for w in self._advanced_frame.winfo_children():
+            w.pack_forget()
+
+        self.tk_var_advanced = _tk.BooleanVar(value=False)
+        self.tk_check_advanced = ttk.Checkbutton(
+            self._tgt_connect, text="高级: 手动输入 IP 地址",
+            variable=self.tk_var_advanced,
+            bootstyle="secondary",
+            command=self._toggle_advanced_ip
+        )
+
+        _tk.Label(self._advanced_frame, text="源设备 (旧电脑) IP 地址:",
+                  font=("Microsoft YaHei UI", 8), fg=C_TEXT_SEC,
+                  bg=C_SIDEBAR_BG).pack(side=LEFT, padx=(0, 4))
+        self.tk_entry_const = ttk.Entry(self._advanced_frame, width=16,
+                                         font=("Microsoft YaHei UI", 8))
+        self.tk_entry_const.pack(side=LEFT, padx=(0, 4))
+
+        # 验证码输入
+        code_label = _tk.Frame(self._tgt_connect, bg=C_WHITE)
+        code_label.pack(fill=X, pady=(12, 0))
+        _tk.Label(code_label, text="请输入旧电脑上显示的连接验证码:",
+                  font=("Microsoft YaHei UI", 9, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W)
+
+        self.tk_entry_code = ttk.Entry(self._tgt_connect, font=("Consolas", 16, "bold"),
+                                       justify=CENTER, width=6,
+                                       validate="key", validatecommand=self._auth_vcmd)
+        self.tk_entry_code.pack(pady=(4, 4))
+
+        self.tk_entry_code.bind("<KeyRelease>", self._on_auth_key)
+
+        # CSV 选择器
+        self.csv_path_var = _tk.StringVar()
+        self._csv_frame = _tk.Frame(self._tgt_connect, bg=C_WHITE)
+        self._csv_frame.pack(fill=X, pady=(10, 0))
+
+        _tk.Label(self._csv_frame, text="FullFilelist_DEF.csv (可选):",
+                  font=("Microsoft YaHei UI", 8), fg=C_TEXT_SEC,
+                  bg=C_WHITE).pack(side=LEFT, padx=(0, 4))
+        self.tk_entry_csv = ttk.Entry(self._csv_frame, textvariable=self.csv_path_var,
+                                       state="readonly", font=("Microsoft YaHei UI", 8),
+                                       width=30)
+        self.tk_entry_csv.pack(side=LEFT, padx=(0, 4))
+        self.tk_button_browse_csv = ttk.Button(self._csv_frame, text="浏览...",
+                                                takefocus=False, width=8,
+                                                bootstyle="secondary",
+                                                command=self._on_browse_csv)
+        self.tk_button_browse_csv.pack(side=LEFT)
+
+    def _toggle_advanced_ip(self):
+        if self.tk_var_advanced.get():
+            for w in self._advanced_frame.winfo_children():
+                w.pack(side=LEFT, padx=(0, 4))
+        else:
+            for w in self._advanced_frame.winfo_children():
+                w.pack_forget()
+
+    def _on_auth_key(self, event=None):
+        current = self.tk_entry_code.get()
+        upper = current.upper()
+        if upper != current:
+            self.tk_entry_code.delete(0, END)
+            self.tk_entry_code.insert(0, upper[:4])
+        elif len(current) > 4:
+            self.tk_entry_code.delete(4, END)
+
+    def _on_browse_csv(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="选择 FullFilelist_DEF.csv",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+        )
+        if path:
+            self.csv_path_var.set(path)
+
+    # ==================== 步骤 4: 传输进度 ====================
+
+    def _build_step4_transfer(self):
+        page = _tk.Frame(self._content_frame, bg=C_WHITE)
+        self._pages[4] = page
+
+        inner = _tk.Frame(page, bg=C_WHITE)
+        inner.pack(fill=BOTH, expand=True, padx=40, pady=20)
+
+        _tk.Label(inner, text="传输中...",
+                  font=("Microsoft YaHei UI", 14, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 4))
+
+        self.tk_label_transfer_status = _tk.Label(inner, text="等待开始...",
+                                                   font=("Microsoft YaHei UI", 8),
+                                                   fg=C_TEXT_SEC,
+                                                   wraplength=700, justify=LEFT,
+                                                   bg=C_WHITE)
+        self.tk_label_transfer_status.pack(fill=X, pady=(0, 8))
+
+        # 总进度条
+        _tk.Label(inner, text="总进度",
+                  font=("Microsoft YaHei UI", 8, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W)
+        self.tk_progress_bar = ttk.Progressbar(inner, mode="determinate",
+                                                maximum=100, value=0, bootstyle="success")
+        self.tk_progress_bar.pack(fill=X, pady=(2, 8))
+
+        # 分区进度条
+        _tk.Label(inner, text="当前分区进度",
+                  font=("Microsoft YaHei UI", 8, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W)
+        self.tk_file_progress_bar = ttk.Progressbar(inner, mode="determinate",
+                                                     maximum=100, value=0, bootstyle="info")
+        self.tk_file_progress_bar.pack(fill=X, pady=(2, 8))
+
+        # 日志区域 - 深色背景
+        log_header = _tk.Frame(inner, bg=C_WHITE)
+        log_header.pack(fill=X, pady=(4, 2))
+        _tk.Label(log_header, text="传输日志",
+                  font=("Microsoft YaHei UI", 9, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(side=LEFT)
+
+        self.tk_text_mqg105ch = _tk.Text(inner, wrap=WORD, font=("Consolas", 8),
+                                         bg=C_CONSOLE_BG, fg=C_CONSOLE_FG,
+                                         bd=1, relief=SOLID,
+                                         insertbackground=C_CONSOLE_FG,
+                                         selectbackground="#404040")
+        self.tk_text_mqg105ch.pack(fill=BOTH, expand=True)
+        self.tk_text_mqg105ch.configure(state=NORMAL)
+
+        scroll = ttk.Scrollbar(self.tk_text_mqg105ch, orient=VERTICAL,
+                               bootstyle="dark-round")
+        scroll.config(command=self.tk_text_mqg105ch.yview)
+        self.tk_text_mqg105ch.configure(yscrollcommand=scroll.set)
+
+    # ==================== 显示/隐藏方法 (兼容 control.py) ====================
+
+    def show_discover(self):
+        if hasattr(self, 'tk_label_discover'):
+            self.tk_label_discover.pack(anchor=W, pady=(6, 4))
+        if hasattr(self, 'tk_select_box_discover'):
+            self.tk_select_box_discover.pack(fill=X, pady=(0, 6))
+
+    def hide_discover(self):
+        if hasattr(self, 'tk_label_discover'):
+            self.tk_label_discover.pack_forget()
+        if hasattr(self, 'tk_select_box_discover'):
+            self.tk_select_box_discover.pack_forget()
+
+    def show_dhcp(self):
+        if hasattr(self, 'tk_button_dhcp'):
+            self.tk_button_dhcp.pack(anchor=W, pady=(0, 4),
+                                     before=self.tk_label_dhcp_status)
+
+    def hide_dhcp(self):
+        if hasattr(self, 'tk_button_dhcp'):
+            self.tk_button_dhcp.pack_forget()
+
+    def show_auth_code(self, code: str):
+        if hasattr(self, 'tk_label_auth_code'):
+            self.tk_label_auth_code.config(text=code)
+        if hasattr(self, 'tk_label_src_status'):
+            self.tk_label_src_status.config(text=f"验证码: {code}  等待目标设备连接...")
+
+    def hide_auth_code(self):
+        if hasattr(self, 'tk_label_auth_code'):
+            self.tk_label_auth_code.config(text="----")
+        if hasattr(self, 'tk_label_src_status'):
+            self.tk_label_src_status.config(text="验证码: ---- 等待目标设备连接...")
+
+    def show_auth_input(self):
+        pass
+
+    def hide_auth_input(self):
+        pass
+
+    def show_manual_ip(self):
+        if hasattr(self, 'tk_check_advanced'):
+            self.tk_check_advanced.pack(anchor=W, pady=(12, 0))
+
+    def hide_manual_ip(self):
+        if hasattr(self, 'tk_check_advanced'):
+            self.tk_check_advanced.pack_forget()
+        if hasattr(self, '_advanced_frame'):
+            for w in self._advanced_frame.winfo_children():
+                w.pack_forget()
+
+    def show_csv_selector(self):
+        pass
+
+    def hide_csv_selector(self):
+        pass
+
+    def get_auth_input(self) -> str:
+        try:
+            return self.tk_entry_code.get().strip().upper()
+        except Exception:
+            return ""
+
+    def set_auth_input(self, code: str):
+        try:
+            self.tk_entry_code.delete(0, "end")
+            self.tk_entry_code.insert(0, code)
+        except Exception:
+            pass
+
+    def get_csv_path(self) -> str:
+        return self.csv_path_var.get().strip() if hasattr(self, 'csv_path_var') else ""
+
+    def set_csv_path(self, path: str):
+        if hasattr(self, 'csv_path_var'):
+            self.csv_path_var.set(path)
+
+    # ==================== 状态方法 ====================
+
+    def set_step_state(self, step: int, state: str):
+        if step < len(self._step_items):
+            item = self._step_items[step]
+            if state == "done":
+                item["circle"].configure(fg=C_GREEN, bg=C_GREEN_BG)
+                item["title"].configure(fg=C_GREEN)
+            elif state == "active":
+                item["circle"].configure(fg=C_WHITE, bg=C_BLUE)
+                item["title"].configure(fg=C_BLUE)
+
+    def set_status(self, text: str):
+        pass
+
+    def log(self, text: str):
+        if hasattr(self, 'tk_text_mqg105ch'):
+            self.tk_text_mqg105ch.configure(state=NORMAL)
+            self.tk_text_mqg105ch.insert(END, text + "\n")
+            self.tk_text_mqg105ch.see(END)
+            self.tk_text_mqg105ch.configure(state=DISABLED)
+
+    def clear_log(self):
+        if hasattr(self, 'tk_text_mqg105ch'):
+            self.tk_text_mqg105ch.configure(state=NORMAL)
+            self.tk_text_mqg105ch.delete("1.0", END)
+            self.tk_text_mqg105ch.configure(state=NORMAL)
+
+    # ==================== 验证函数 ====================
 
     def _octet_validate(self, new_value: str) -> bool:
-        """限制手动 IP 每个文本框只能输入 0~255 的纯数字。
-
-        允许空字符串 (便于删除/编辑); 拒绝非数字、超过 3 位、或数值 > 255。
-        """
         if new_value == "":
             return True
         if not new_value.isdigit():
@@ -215,136 +785,25 @@ class WinGUI(Tk):
         return True
 
     def _auth_validate(self, new_value: str) -> bool:
-        """限制验证码输入框: 最多 4 位, 仅允许英文/数字 (大小写不敏感)。"""
         if len(new_value) > 4:
             return False
-        return all(c.isalnum() for c in new_value)
+        return all(c.isalnum() or c.isalpha() for c in new_value)
 
-    # ==================== 第五行: 连接验证码 ====================
 
-    def __tk_label_auth_input_title(self, parent):
-        label = _tk.Label(parent, text="连接验证码:", anchor="w",
-                          font=("Microsoft YaHei UI", 12, "bold"))
-        label.place(x=20, y=228, width=95, height=24)
-        return label
+# ==================== 工具函数 ====================
 
-    def __tk_entry_auth_input(self, parent):
-        entry = Entry(parent, font=("Microsoft YaHei UI", 16, "bold"),
-                      justify="center", validate="key",
-                      validatecommand=self._auth_vcmd)
-        entry.place(x=118, y=226, width=160, height=30)
-        return entry
+def _bind_card_hover(card: _tk.Frame, hover_color: str):
+    def _apply(color):
+        card.configure(bg=color)
+        for child in card.winfo_children():
+            if isinstance(child, _tk.Label):
+                try:
+                    child.configure(bg=color)
+                except Exception:
+                    pass
 
-    def __tk_label_auth_title(self, parent):
-        label = Label(parent, text="连接验证码", anchor="e")
-        label.place(x=340, y=228, width=80, height=28)
-        return label
-
-    def __tk_label_auth_code(self, parent):
-        # 用原生 tk.Label 以便自定义大字体/前景/背景 (ttk.Label 受主题限制)
-        label = _tk.Label(
-            parent, text="----",
-            font=("Consolas", 16, "bold"),
-            fg="#D32F2F", bg="#FFF3E0",
-            relief="groove", bd=1,
-        )
-        label.place(x=428, y=224, width=182, height=34)
-        return label
-
-    # ==================== 第六行: 接收端 CSV 选择框 ====================
-
-    def __tk_label_csv(self, parent):
-        label = Label(parent, text="FullFilelist_DEF.csv:", anchor="w")
-        label.place(x=20, y=268, width=140, height=24)
-        return label
-
-    def __tk_entry_csv(self, parent):
-        entry = Entry(parent, textvariable=self.csv_path_var,
-                      state="readonly", font=("Microsoft YaHei UI", 9))
-        entry.place(x=165, y=266, width=355, height=26)
-        return entry
-
-    def __tk_button_browse_csv(self, parent):
-        btn = Button(parent, text="浏览...", takefocus=False,
-                     command=self._on_browse_csv)
-        btn.place(x=525, y=266, width=85, height=26)
-        return btn
-
-    def _on_browse_csv(self):
-        """打开文件选择对话框, 让用户手动指定 FullFilelist_DEF.csv"""
-        from tkinter import filedialog
-        path = filedialog.askopenfilename(
-            title="选择 FullFilelist_DEF.csv",
-            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
-        )
-        if path:
-            self.csv_path_var.set(path)
-
-    # ==================== 状态 / 进度条 ====================
-
-    def __tk_label_status(self, parent):
-        label = Label(parent, text="就绪", anchor="w", foreground="#555555")
-        label.place(x=20, y=304, width=595, height=20)
-        return label
-
-    def __tk_progress_bar(self, parent):
-        pb = Progressbar(parent, mode="determinate", maximum=100, value=0)
-        pb.place(x=20, y=330, width=595, height=22)
-        return pb
-
-    def __tk_file_progress_bar(self, parent):
-        pb = Progressbar(parent, mode="determinate", maximum=100, value=0)
-        pb.place(x=20, y=358, width=595, height=22)
-        return pb
-
-    # ==================== 日志 ====================
-
-    def __tk_label_mqg0zfmi(self, parent):
-        label = Label(parent, text="日志", anchor="w")
-        label.place(x=20, y=390, width=50, height=22)
-        return label
-
-    def __tk_text_mqg105ch(self, parent):
-        text = Text(parent)
-        text.place(x=20, y=418, width=595, height=294)
-        return text
-
-    # ==================== 滚动条 ====================
-
-    def scrollbar_autohide(self, vbar, hbar, widget):
-        def show():
-            if vbar: vbar.lift(widget)
-            if hbar: hbar.lift(widget)
-        def hide():
-            if vbar: vbar.lower(widget)
-            if hbar: hbar.lower(widget)
-        hide()
-        widget.bind("<Enter>", lambda e: show())
-        if vbar: vbar.bind("<Enter>", lambda e: show())
-        if vbar: vbar.bind("<Leave>", lambda e: hide())
-        if hbar: hbar.bind("<Enter>", lambda e: show())
-        if hbar: hbar.bind("<Leave>", lambda e: hide())
-        widget.bind("<Leave>", lambda e: hide())
-
-    def v_scrollbar(self, vbar, widget, x, y, w, h, pw, ph):
-        widget.configure(yscrollcommand=vbar.set)
-        vbar.config(command=widget.yview)
-        vbar.place(relx=(w + x) / pw, rely=y / ph, relheight=h / ph, anchor='ne')
-
-    def h_scrollbar(self, hbar, widget, x, y, w, h, pw, ph):
-        widget.configure(xscrollcommand=hbar.set)
-        hbar.config(command=widget.xview)
-        hbar.place(relx=x / pw, rely=(y + h) / ph, relwidth=w / pw, anchor='sw')
-
-    def create_bar(self, master, widget, is_vbar, is_hbar, x, y, w, h, pw, ph):
-        vbar, hbar = None, None
-        if is_vbar:
-            vbar = Scrollbar(master)
-            self.v_scrollbar(vbar, widget, x, y, w, h, pw, ph)
-        if is_hbar:
-            hbar = Scrollbar(master, orient="horizontal")
-            self.h_scrollbar(hbar, widget, x, y, w, h, pw, ph)
-        self.scrollbar_autohide(vbar, hbar, widget)
+    card.bind("<Enter>", lambda e: _apply(hover_color))
+    card.bind("<Leave>", lambda e: _apply(C_WHITE))
 
 
 class Win(WinGUI):
@@ -352,104 +811,19 @@ class Win(WinGUI):
         self.ctl = controller
         super().__init__()
         self.__style_config()
-        self._add_log_scrollbar()
         self.ctl.init(self)
 
-    def _add_log_scrollbar(self):
-        vbar = Scrollbar(self)
-        vbar.config(command=self.tk_text_mqg105ch.yview)
-        self.tk_text_mqg105ch.configure(yscrollcommand=vbar.set)
-        vbar.place(x=614, y=418, width=16, height=294)
-
     def __style_config(self):
-        """统一字体和样式"""
-        style = Style()
+        style = ttk.Style()
         default_font = ("Microsoft YaHei UI", 9)
         style.configure(".", font=default_font)
-        style.configure("TLabel", font=default_font, padding=(2, 0))
+        style.configure("TLabel", font=default_font)
         style.configure("TCombobox", font=default_font)
-        style.configure("TButton", font=("Microsoft YaHei UI", 9, "bold"))
-
-    def hide_discover(self):
-        self.tk_label_discover.place_forget()
-        self.tk_select_box_discover.place_forget()
-
-    def show_discover(self):
-        self.tk_label_discover.place(x=20, y=156, width=80, height=22)
-        self.tk_select_box_discover.place(x=100, y=156, width=258, height=28)
-
-    def hide_dhcp(self):
-        self.tk_button_dhcp.place_forget()
-
-    def show_dhcp(self):
-        self.tk_button_dhcp.place(x=366, y=156, width=100, height=28)
-
-    def show_auth_code(self, code: str):
-        """在专用区域醒目显示连接验证码"""
-        self.tk_label_auth_code.config(text=code)
-        self.tk_label_auth_title.place(x=340, y=228, width=80, height=28)
-        self.tk_label_auth_code.place(x=428, y=224, width=182, height=34)
-
-    def hide_auth_code(self):
-        self.tk_label_auth_code.config(text="----")
-        self.tk_label_auth_title.place_forget()
-        self.tk_label_auth_code.place_forget()
-
-    # ---- 手动 IP (源设备不需要, 默认隐藏) ----
-    def hide_manual_ip(self):
-        self.tk_label_ip_manual.place_forget()
-        self.tk_ip_octet1.place_forget()
-        self.tk_label_dot1.place_forget()
-        self.tk_ip_octet2.place_forget()
-        self.tk_label_dot2.place_forget()
-        self.tk_ip_octet3.place_forget()
-        self.tk_label_dot3.place_forget()
-        self.tk_ip_octet4.place_forget()
-
-    def show_manual_ip(self):
-        # 接收端手动 IP 直连行
-        self.tk_label_ip_manual.place(x=20, y=192, width=82, height=22)
-        self.tk_ip_octet1.place(x=104, y=192, width=42, height=28)
-        self.tk_label_dot1.place(x=148, y=192, width=10, height=22)
-        self.tk_ip_octet2.place(x=160, y=192, width=42, height=28)
-        self.tk_label_dot2.place(x=204, y=192, width=10, height=22)
-        self.tk_ip_octet3.place(x=216, y=192, width=42, height=28)
-        self.tk_label_dot3.place(x=260, y=192, width=10, height=22)
-        self.tk_ip_octet4.place(x=272, y=192, width=42, height=28)
-
-    # ---- 目标设备验证码输入框 ----
-    def show_auth_input(self):
-        self.tk_label_auth_input_title.place(x=20, y=228, width=95, height=24)
-        self.tk_entry_auth_input.place(x=118, y=226, width=160, height=30)
-
-    def hide_auth_input(self):
-        self.tk_label_auth_input_title.place_forget()
-        self.tk_entry_auth_input.place_forget()
-
-    def get_auth_input(self) -> str:
-        return self.tk_entry_auth_input.get()
-
-    def set_auth_input(self, code: str):
-        self.tk_entry_auth_input.delete(0, "end")
-        self.tk_entry_auth_input.insert(0, code)
-
-    # ---- 接收端 FullFilelist_DEF.csv 选择框 ----
-    def show_csv_selector(self):
-        self.tk_label_csv.place(x=20, y=268, width=140, height=24)
-        self.tk_entry_csv.place(x=165, y=266, width=355, height=26)
-        self.tk_button_browse_csv.place(x=525, y=266, width=85, height=26)
-
-    def hide_csv_selector(self):
-        self.tk_label_csv.place_forget()
-        self.tk_entry_csv.place_forget()
-        self.tk_button_browse_csv.place_forget()
-        self.csv_path_var.set("")
-
-    def get_csv_path(self) -> str:
-        return self.csv_path_var.get().strip()
-
-    def set_csv_path(self, path: str):
-        self.csv_path_var.set(path)
+        style.configure("TButton", font=("Microsoft YaHei UI", 9))
+        style.configure("TCheckbutton", font=default_font)
+        style.configure("TEntry", font=default_font)
+        style.configure("success.Horizontal.TProgressbar", background=C_GREEN)
+        style.configure("info.Horizontal.TProgressbar", background=C_BLUE)
 
 
 if __name__ == "__main__":

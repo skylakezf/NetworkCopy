@@ -3,6 +3,7 @@ from PyInstaller.utils.hooks import collect_data_files
 
 datas = [('certs', 'certs')]
 datas += collect_data_files('cryptography')
+datas += collect_data_files('ttkbootstrap')
 
 
 a = Analysis(
@@ -10,7 +11,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=['tkinter', 'tkinter.ttk', 'urllib.parse', 'json', 'csv', 'hashlib', 'concurrent.futures', 'http.server', 'struct', 're', 'threading', 'socket', 'subprocess', 'ctypes', 'ctypes.wintypes', 'urllib.request', 'urllib.error', 'cryptography', 'cryptography.hazmat.primitives.asymmetric.rsa', 'cryptography.hazmat.primitives.serialization', 'cryptography.hazmat.backends.openssl.backend', 'secrets', 'tls_utils'],
+    hiddenimports=['tkinter', 'tkinter.ttk', 'urllib.parse', 'json', 'csv', 'hashlib', 'concurrent.futures', 'http.server', 'struct', 're', 'threading', 'socket', 'subprocess', 'ctypes', 'ctypes.wintypes', 'urllib.request', 'urllib.error', 'cryptography', 'cryptography.hazmat.primitives.asymmetric.rsa', 'cryptography.hazmat.primitives.serialization', 'cryptography.hazmat.backends.openssl.backend', 'ttkbootstrap', 'ttkbootstrap.style', 'ttkbootstrap.themes', 'ttkbootstrap.constants', 'ttkbootstrap.window', 'ttkbootstrap.tooltip', 'PIL', 'PIL.Image', 'PIL.ImageTk', 'secrets', 'tls_utils'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -68,10 +68,19 @@ $HiddenImports = @(
     "cryptography.hazmat.primitives.asymmetric.rsa",
     "cryptography.hazmat.primitives.serialization",
     "cryptography.hazmat.backends.openssl.backend",
+    "ttkbootstrap",
+    "ttkbootstrap.style",
+    "ttkbootstrap.themes",
+    "ttkbootstrap.constants",
+    "ttkbootstrap.window",
+    "ttkbootstrap.tooltip",
+    "PIL",
+    "PIL.Image",
+    "PIL.ImageTk",
     "secrets", "tls_utils"
 )
 
-$CollectData = @("cryptography")
+$CollectData = @("cryptography", "ttkbootstrap")
 
 # 构建命令行参数列表，避免引号/分号被 pwsh 错误解析
 $PyArgs = @(

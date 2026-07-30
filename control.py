@@ -18,6 +18,17 @@ import tls_utils
 DHCP_ASSIGNED_IP = "169.254.100.2"  # DHCP 分配给源设备的 IP
 
 
+def _nic_priority_key(nic):
+    """NIC 排序键: USB > 169.254 网段 > 内置网卡"""
+    name = nic[0].lower()
+    ip = nic[1] if len(nic) > 1 else ""
+    if "usb" in name:
+        return 0
+    if ip.startswith("169.254"):
+        return 1
+    return 2
+
+
 def is_running_in_winpe() -> bool:
     """检测当前是否运行在 Windows PE (WinPE) 环境。
 
@@ -100,30 +111,31 @@ class Controller:
 
     def _setup_ui_defaults(self):
         """设置 UI 初始状态"""
-        self.ui.tk_button_mqfzl35t.config(state="disabled")
-        self.ui.tk_select_box_discover.config(values=("等待 DHCP 响应...",))
-        self.ui.tk_select_box_discover.set("等待 DHCP 响应...")
-        # DHCP 按钮默认隐藏, 仅目标设备显示
+        # 导航按钮初始状态
+        self.ui.set_button_prev("disabled")
+        self.ui.set_button_next("disabled")
+        # 隐藏所有步骤特定控件
         self.ui.hide_dhcp()
-        # 手动 IP 与目标验证码输入框默认隐藏, 选择目标设备后显示
-        self.ui.hide_manual_ip()
-        self.ui.hide_auth_input()
-        # 接收端 CSV 选择框默认隐藏, 选择目标设备后显示
-        self.ui.hide_csv_selector()
-        # 验证码显示区默认隐藏, 生成/输入后显示
         self.ui.hide_auth_code()
-        # 运行环境单选: 默认按检测结果预选 (WinPE / 正常系统), 用户可手动改
-        self.ui.winpe_var.set("winpe" if is_running_in_winpe() else "normal")
+        # 运行环境单选: 默认按检测结果预选
+        if hasattr(self.ui, 'winpe_var'):
+            self.ui.winpe_var.set("winpe" if is_running_in_winpe() else "normal")
 
     def _setup_events(self):
         """绑定 UI 控件事件"""
+        # 角色选择按钮
+        if hasattr(self.ui, 'tk_btn_source'):
+            self.ui.tk_btn_source.config(command=lambda: self._on_role_selected("source"))
+        if hasattr(self.ui, 'tk_btn_target'):
+            self.ui.tk_btn_target.config(command=lambda: self._on_role_selected("target"))
+        # 上一步/下一步导航
+        if hasattr(self.ui, 'tk_button_prev'):
+            self.ui.tk_button_prev.config(command=self._on_prev_step)
+        if hasattr(self.ui, 'tk_button_next'):
+            self.ui.tk_button_next.config(command=self._on_next_step)
         # 网卡选择
         self.ui.tk_select_box_mqfzkd6x.bind(
             "<<ComboboxSelected>>", self._on_nic_selected
-        )
-        # 设备类型选择
-        self.ui.tk_select_box_mqg0hm2h.bind(
-            "<<ComboboxSelected>>", self._on_device_type_selected
         )
         # 磁盘选择
         self.ui.tk_select_box_mqfzmzbe.bind(
@@ -141,8 +153,20 @@ class Controller:
         )
         # 开始按钮
         self.ui.tk_button_mqfzl35t.config(command=self._on_start_button)
-        # 开启 DHCP 按钮 (目标设备)
+        # 开启 DHCP 按钮 (标签为"寻找旧电脑")
         self.ui.tk_button_dhcp.config(command=self._on_dhcp_button)
+        # CSV 浏览
+        if hasattr(self.ui, 'tk_button_browse_csv'):
+            self.ui.tk_button_browse_csv.config(command=self._on_browse_csv)
+        # 发现设备列表
+        if hasattr(self.ui, 'tk_select_box_discover'):
+            self.ui.tk_select_box_discover.bind("<<ComboboxSelected>>", self._on_discover_selected)
+        # 运行环境
+        if hasattr(self.ui, 'winpe_var'):
+            self.ui.winpe_var.trace_add("write", lambda *_: self._populate_disks())
+        # 验证码输入 (大写自动转)
+        if hasattr(self.ui, 'tk_entry_code'):
+            self.ui.tk_entry_code.bind("<KeyRelease>", self._on_auth_code_changed)
 
     # ==================== 网卡扫描 ====================
 
@@ -154,6 +178,8 @@ class Controller:
         def _scan():
             try:
                 nics = scan_nics()
+                # NIC 优先级排序: USB > 169.254 > 内置网卡
+                nics = sorted(nics, key=_nic_priority_key)
                 self._nic_list = nics
                 display_list = [n[0] for n in nics]
                 self.ui.after(0, lambda: self._update_combobox(
@@ -168,6 +194,76 @@ class Controller:
 
     # ==================== 事件处理 ====================
 
+    def _on_role_selected(self, role: str):
+        """角色选择: 'source'(旧电脑/发送方) 或 'target'(新电脑/接收方)"""
+        self._device_type = "源设备" if role == "source" else "目标设备"
+        self._log(f"已选择角色: {'旧电脑 (发送方)' if role == 'source' else '新电脑 (接收方)'}")
+
+        # 步骤 1 → 步骤 2: 进入网卡选择
+        self.ui.tk_button_next.config(state="normal")
+        if role == "source":
+            self.ui.show_auth_code("----")
+            self.ui.hide_dhcp()
+        else:
+            self.ui.show_dhcp()
+
+        # 切换到网卡选择步骤
+        self.ui.go_step(1)
+        self.ui.tk_button_prev.config(state="normal")
+
+        # 开始按钮显示
+        self.ui.show_start_button()
+
+    def _on_prev_step(self):
+        """上一步"""
+        new_step = max(0, self.ui._step - 1)
+        self.ui.go_step(new_step)
+        if new_step == 0:
+            self.ui.tk_button_prev.config(state="disabled")
+
+    def _on_next_step(self):
+        """下一步"""
+        new_step = min(self.ui._total_steps - 1, self.ui._step + 1)
+        self.ui.go_step(new_step)
+        self.ui.tk_button_prev.config(state="normal")
+        if new_step >= self.ui._total_steps - 1:
+            self.ui.tk_button_next.config(state="disabled")
+
+    def _on_auth_code_changed(self, event=None):
+        """验证码输入: 自动转大写 + 限制 4 位"""
+        try:
+            current = self.ui.tk_entry_code.get()
+            upper = current.upper()
+            if upper != current:
+                self.ui.tk_entry_code.delete(0, "end")
+                self.ui.tk_entry_code.insert(0, upper[:4])
+            elif len(current) > 4:
+                self.ui.tk_entry_code.delete(4, "end")
+        except Exception:
+            pass
+
+    def _on_discover_selected(self, event=None):
+        """发现设备下拉框选择"""
+        selected = self.ui.tk_select_box_discover.get()
+        if selected and selected != "等待 DHCP 响应..." and "DHCP" not in selected:
+            # 提取 IP
+            if " | " in selected:
+                parts = selected.split(" | ")
+                self._source_ip = parts[1].strip() if len(parts) > 1 else ""
+            self._use_dhcp = True
+            self._log(f"已选择发现设备: {selected}")
+
+    def _on_browse_csv(self):
+        """浏览 CSV 文件"""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="选择 FullFilelist_DEF.csv",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+        )
+        if path:
+            self.ui.csv_path_var.set(path)
+            self._log(f"已选择 CSV: {path}")
+
     def _on_nic_selected(self, event=None):
         nic_display = self.ui.tk_select_box_mqfzkd6x.get()
         if nic_display in ("扫描中...", "未检测到网卡", ""):
@@ -180,16 +276,19 @@ class Controller:
             return
 
         # 设备类型已选 → 尝试设置 IP
-        dev_type = self.ui.tk_select_box_mqg0hm2h.get()
-        if dev_type in ("源设备", "目标设备"):
-            self._configure_ip(adapter_desc, dev_type)
+        if self._device_type in ("源设备", "目标设备"):
+            self._configure_ip(adapter_desc, self._device_type)
 
-        # 网卡选定后重新评估开始按钮状态
-        self._check_button_state()
+        # 网卡选定后: 扫描磁盘并进入下一步
+        self._populate_disks()
+
+        # 允许进入下一步 (磁盘选择)
+        self.ui.tk_button_next.config(state="normal")
 
     def _on_device_type_selected(self, event=None):
-        dev_type = self.ui.tk_select_box_mqg0hm2h.get()
-        self._device_type = dev_type
+        dev_type = self._device_type
+        if not dev_type:
+            return
         self._log(f"已选择设备类型: {dev_type}")
 
         if dev_type == "源设备":
@@ -285,7 +384,7 @@ class Controller:
                 return
 
             self._update_partition_map()
-            dev_type = self.ui.tk_select_box_mqg0hm2h.get()
+            dev_type = self._device_type
             if dev_type not in ("源设备", "目标设备"):
                 self._log("请先选择设备类型")
                 return
@@ -295,6 +394,9 @@ class Controller:
                 f"[诊断] 点击开始: 类型={dev_type}, "
                 f"模式={'手动IP(' + manual_ip + ')' if manual_ip else 'DHCP/扫描'}"
             )
+
+            # 切换到传输进度页面 (步骤 4)
+            self.ui.go_step(4)
 
             if dev_type == "源设备":
                 # 源设备必须指定要对外提供(拷贝)的盘符, 否则服务器虽启动但无任何数据可传,
@@ -333,6 +435,10 @@ class Controller:
                     disks,
                     f"检测到 {len(disks)} 个磁盘"
                 ))
+                # 自动选择: 只有一个磁盘时自动选中
+                if len(disks) == 1:
+                    self.ui.after(100, lambda: self.ui.tk_select_box_mqfzmzbe.set(disks[0]))
+                    self.ui.after(100, lambda: self._on_disk_selected())
             except Exception as e:
                 self.ui.after(0, lambda: self._log(f"磁盘扫描失败: {e}"))
 
@@ -412,7 +518,7 @@ class Controller:
         说明: 源设备只负责搭建 HTTP 服务器, 限制从简 —— 只要选好网卡与设备类型即可启用;
         真正的完整性校验 (分区映射 / DHCP / 手动 IP) 在点击时由 _on_start_button 进行。
         """
-        dev_type = self.ui.tk_select_box_mqg0hm2h.get()
+        dev_type = self._device_type
         nic_selected = self.ui.tk_select_box_mqfzkd6x.get() not in (
             "扫描中...", "未检测到网卡", "", "网卡1", "网卡2"
         )
@@ -438,9 +544,9 @@ class Controller:
             self.ui.after(0, lambda: self._log("源设备: 正在获取 IP..."))
             threading.Thread(target=self._setup_source_network, args=(adapter_desc,), daemon=True).start()
         else:
-            # 目标设备: 不自动启动 DHCP, 等待用户点击「开启DHCP」
+            # 目标设备: 不自动启动 DHCP, 等待用户点击「寻找旧电脑」
             self.ui.after(0, lambda: self._log(
-                "目标设备: 请先选择网卡并点击「开启DHCP」启动 DHCP 服务器，"
+                "目标设备: 请先选择网卡并点击「寻找旧电脑」启动 DHCP 服务器，"
                 "待源设备分配到 IP 后点击「开始接收」"
             ))
 
@@ -477,23 +583,26 @@ class Controller:
     # ==================== 手动 IP 辅助 ====================
 
     def _get_manual_ip(self):
-        """读取手动 IP 输入框: 4 段均有效返回 'x.x.x.x', 否则返回 None。
+        """读取手动 IP 输入框: 有效返回 'x.x.x.x', 否则返回 None。
 
         注: 该 IP 代表「源设备 IP」, 目标设备据此直连源设备 (无需 DHCP)。
         该输入框默认隐藏, 仅在需要时由 UI 显示。
         """
         try:
-            octets = [
-                self.ui.ip_octet1_var.get().strip(),
-                self.ui.ip_octet2_var.get().strip(),
-                self.ui.ip_octet3_var.get().strip(),
-                self.ui.ip_octet4_var.get().strip(),
-            ]
+            raw = getattr(self.ui, 'tk_entry_const', None)
+            if raw is None:
+                return None
+            ip_str = raw.get().strip()
+            if not ip_str:
+                return None
+            parts = ip_str.split(".")
+            if len(parts) != 4:
+                return None
+            if all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+                return ip_str
+            return None
         except Exception:
             return None
-        if all(o.isdigit() and o != "" and 0 <= int(o) <= 255 for o in octets):
-            return ".".join(octets)
-        return None
 
     def _apply_manual_ip(self, adapter_desc, ip):
         """源设备: 将本机网卡 IP 设为手动输入的 IP (供目标直连)。
@@ -551,7 +660,7 @@ class Controller:
                 f"目标手动 IP 已生效: {target_ip} (掩码 {SUBNET_MASK})"))
 
     def _on_dhcp_button(self):
-        """目标设备: 点击「开启DHCP」→ 后台启动 DHCP 服务器"""
+        """目标设备: 点击「寻找旧电脑」→ 后台启动 DHCP 服务器"""
         if self._transferring:
             self._log("传输正在进行中, 暂时无法操作")
             return
@@ -560,14 +669,14 @@ class Controller:
             return
         nic_display = self.ui.tk_select_box_mqfzkd6x.get()
         if nic_display in ("扫描中...", "未检测到可用网卡", "", "网卡1", "网卡2"):
-            self._log("请先选择网卡，再点击「开启DHCP」")
+            self._log("请先选择网卡，再点击「寻找旧电脑」")
             return
         adapter_desc = self._get_adapter_desc(nic_display)
         if not adapter_desc:
             self._log("无法识别所选网卡，请重新选择")
             return
         self.ui.tk_button_dhcp.config(state="disabled")
-        self.ui.tk_button_dhcp.configure(text="DHCP启动中...")
+        self.ui.tk_button_dhcp.configure(text="正在搜索...")
         threading.Thread(target=self._setup_target_dhcp, args=(adapter_desc,), daemon=True).start()
 
     def _setup_target_dhcp(self, adapter_desc):
@@ -612,7 +721,7 @@ class Controller:
             self._dhcp_server.start()
         except Exception as e:
             self.ui.after(0, lambda: self._log(f"DHCP 启动失败: {e}"))
-            self.ui.after(0, lambda: self.ui.tk_button_dhcp.configure(text="开启DHCP", state="normal"))
+            self.ui.after(0, lambda: self.ui.tk_button_dhcp.configure(text="寻找旧电脑", state="normal"))
             return
         self._use_dhcp = True
         self._source_ip = DHCP_ASSIGNED_IP  # 目标 DHCP 分配的源 IP
@@ -622,7 +731,7 @@ class Controller:
             f"DHCP 已启动, 源设备将获取 {DHCP_ASSIGNED_IP} (60s 超时)..."
         ))
         self.ui.after(60000, self._auto_select_target)
-        self.ui.after(0, lambda: self.ui.tk_button_dhcp.configure(text="DHCP运行中", state="normal"))
+        self.ui.after(0, lambda: self.ui.tk_button_dhcp.configure(text="重新搜索", state="normal"))
 
     def _update_discover_list(self, ip, mac, hostname=""):
         """更新发现设备下拉框"""
