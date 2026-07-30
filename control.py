@@ -295,8 +295,12 @@ class Controller:
         self.ui.tk_button_prev.config(state="normal")
 
         if new_step == 2:
-            # 进入步骤 2 (磁盘映射): 先禁用"下一步"，等用户选择磁盘确认后再启用
-            self.ui.set_button_next("disabled")
+            # 进入步骤 2 (磁盘映射): 若磁盘已自动选中则直接启用"下一步"
+            disk = self.ui.tk_select_box_mqfzmzbe.get()
+            if disk and disk not in ("未检测到磁盘", "", "请先选择设备类型", "扫描中..."):
+                self.ui.set_button_next("normal")
+            else:
+                self.ui.set_button_next("disabled")
         elif new_step == 3:
             # 步骤 3 (连接页面): 禁用"下一步", 用户应点击"开始传输"而非"下一步"
             self.ui.set_button_next("disabled")
@@ -662,27 +666,48 @@ class Controller:
             ))
 
     def _setup_source_network(self, adapter_desc):
-        """源设备: 从目标 DHCP 获取 IP —— 异步触发 renew + 轮询目标网卡, 避免长时间阻塞。
-
-        原实现直接 `ipconfig /renew` 同步等待: 该命令会逐个续租【所有】网卡, 其它没有
-        DHCP 服务的网卡会反复重试到超时, 导致命令长时间(数十秒)不返回, 用户感觉"等非常久"。
-        现改为: 后台异步触发 renew, 然后只轮询【目标网卡】拿到 169.254.100.x 立即返回
-        (通常 2~3 秒), 不再等待其它网卡。
+        """源设备: 从目标 DHCP 获取 IP —— 使用 IP Helper API 只对目标网卡操作,
+        避免 ipconfig /renew 逐个续租所有网卡导致长时间阻塞。
+        后台 release+renew, 主线程用 NotifyAddrChange 事件驱动等待 (零 CPU 轮询)。
         """
+        from nic_scanner import (get_adapter_index, release_dhcp_ip, renew_dhcp_ip,
+                                 wait_for_ip_change)
+
         try:
-            subprocess.run(["ipconfig", "/release"], capture_output=True, timeout=10,
-                           encoding="utf-8", errors="replace")
-            # 异步触发续租 (不阻塞), 输出丢弃
-            subprocess.Popen(["ipconfig", "/renew"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            # 轮询目标网卡, 拿到 DHCP 分配的 169.254.100.x 即返回
+            adapter_index = get_adapter_index(adapter_desc)
+            if adapter_index <= 0:
+                self.ui.after(0, lambda: self._log("错误: 找不到目标网卡索引"))
+                return
+
+            # 后台线程: 先释放旧租约, 再用 IpRenewAddress 从目标 DHCP 获取新 IP
+            self.ui.after(0, lambda: self._log(
+                f"释放目标网卡 DHCP 租约 (索引 {adapter_index})..."
+            ))
+            self.ui.after(0, lambda: self._log(
+                f"请求目标网卡 DHCP 续租 (索引 {adapter_index})..."
+            ))
+
+            def _do_dhcp():
+                release_dhcp_ip(adapter_index)
+                renew_dhcp_ip(adapter_index)
+            threading.Thread(target=_do_dhcp, daemon=True).start()
+
+            # 事件驱动等待 IP 变化 (NotifyAddrChange, 不消耗 CPU)
+            # release 会导致 IP → 0.0.0.0, renew 会导致 0.0.0.0 → 169.254.100.x
+            # 每次 IP 变化都会唤醒, 拿到目标 IP 即返回
             deadline = time.time() + 20
             ip = ""
             while time.time() < deadline:
+                remaining = deadline - time.time()
+                if not wait_for_ip_change(min(remaining, 5.0)):
+                    # 超时, 最后检查一次
+                    ip = get_local_ip(adapter_desc)
+                    break
                 ip = get_local_ip(adapter_desc)
                 if ip and ip.startswith("169.254.100."):
                     break
-                time.sleep(0.4)
+                # IP 变了但不是目标 IP (如 release 后的 0.0.0.0), 继续等下一次变化
+
             if ip and ip != "0.0.0.0":
                 self._source_ip = ip
                 self.ui.after(0, lambda: self._log(f"源设备 IP: {ip}"))
@@ -1207,10 +1232,11 @@ class Controller:
         self._transferring = False
         self._transfer_done = True
 
-        # 对于接收方: 启用"下一步"按钮, 引导进入步骤 5 校验页面
+        # 对于接收方: 启用「校验文件 >」按钮, 并自动跳转至步骤 5
         if self._device_type == "目标设备":
             self.ui.set_button_next("normal", text="校验文件 >")
-            self._log("点击右键「校验文件 >」进入文件完整性校验页面")
+            self.ui.go_step(5)
+            self._log("传输完成，已进入文件校验页面")
 
         # 重置进度条
         self._set_progress(0)
@@ -1244,8 +1270,9 @@ class Controller:
         else:
             self._log("未手动指定 CSV, 将自动识别最新 Appl 文件夹下的 FullFilelist_DEF.csv")
 
-        # 禁用校验按钮 (防止重复点击)
+        # 禁用校验按钮 (防止重复点击) + 禁用上一步 (防止中途返回)
         self.ui.tk_button_verify.config(state="disabled")
+        self.ui.set_button_prev("disabled")
         self._set_verify_status("正在校验..." )
 
         def _verify_log(msg):
@@ -1293,6 +1320,7 @@ class Controller:
                 self.ui.after(0, lambda: self._set_verify_result(f"校验异常: {e}", success=False))
             finally:
                 self.ui.after(0, lambda: self.ui.tk_button_verify.config(state="normal"))
+                self.ui.after(0, lambda: self.ui.set_button_prev("normal"))
 
         self._verify_thread = threading.Thread(target=_verify, daemon=True)
         self._verify_thread.start()

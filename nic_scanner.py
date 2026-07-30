@@ -244,6 +244,109 @@ def get_local_mac_addresses() -> list:
     return mac_list
 
 
+# ---- IP_ADAPTER_INDEX_MAP (for IpReleaseAddress / IpRenewAddress) ----
+class IP_ADAPTER_INDEX_MAP(ctypes.Structure):
+    _fields_ = [
+        ("Index", wintypes.DWORD),
+        ("Name", wintypes.WCHAR * 128),
+    ]
+
+
+def get_adapter_index(adapter_desc: str) -> int:
+    """获取指定网卡描述的 ifIndex, 用于单网卡 DHCP 操作"""
+    iphlpapi = ctypes.windll.iphlpapi
+    buf_size = wintypes.ULONG(0)
+    ret = iphlpapi.GetAdaptersInfo(None, ctypes.byref(buf_size))
+    if ret != ERROR_BUFFER_OVERFLOW:
+        return 0
+    buf = ctypes.create_string_buffer(buf_size.value)
+    ret = iphlpapi.GetAdaptersInfo(buf, ctypes.byref(buf_size))
+    if ret != ERROR_SUCCESS:
+        return 0
+
+    adapter = ctypes.cast(buf, ctypes.POINTER(IP_ADAPTER_INFO))
+    while adapter:
+        desc = adapter.contents.Description.decode("gbk", errors="replace").strip()
+        if adapter_desc in desc or desc in adapter_desc:
+            return adapter.contents.Index
+        adapter = adapter.contents.Next
+    return 0
+
+
+def release_dhcp_ip(adapter_index: int) -> bool:
+    """释放指定网卡的 DHCP IP (仅目标网卡, 不碰其他网卡)"""
+    if adapter_index <= 0:
+        return False
+    iphlpapi = ctypes.windll.iphlpapi
+    idx_map = IP_ADAPTER_INDEX_MAP()
+    idx_map.Index = adapter_index
+    ret = iphlpapi.IpReleaseAddress(ctypes.byref(idx_map))
+    return ret == ERROR_SUCCESS
+
+
+def renew_dhcp_ip(adapter_index: int) -> bool:
+    """续租指定网卡的 DHCP IP (仅目标网卡, 不碰其他网卡)"""
+    if adapter_index <= 0:
+        return False
+    iphlpapi = ctypes.windll.iphlpapi
+    idx_map = IP_ADAPTER_INDEX_MAP()
+    idx_map.Index = adapter_index
+    ret = iphlpapi.IpRenewAddress(ctypes.byref(idx_map))
+    return ret == ERROR_SUCCESS
+
+
+# ---- NotifyAddrChange (事件驱动 IP 变化等待) ----
+class _OVERLAPPED(ctypes.Structure):
+    _fields_ = [
+        ("Internal", ctypes.c_ulong),
+        ("InternalHigh", ctypes.c_ulong),
+        ("Offset", wintypes.DWORD),
+        ("OffsetHigh", wintypes.DWORD),
+        ("hEvent", wintypes.HANDLE),
+    ]
+
+
+def wait_for_ip_change(timeout_sec: float = 20.0) -> bool:
+    """使用 NotifyAddrChange + OVERLAPPED 等待任意网卡 IP 变化 (带超时)。
+    返回 True 表示 IP 发生了变化; False 表示超时。
+    相比轮询 get_local_ip(), 无需消耗 CPU, 变化后亚毫秒级响应。
+    """
+    kernel32 = ctypes.windll.kernel32
+    iphlpapi = ctypes.windll.iphlpapi
+
+    h_event = kernel32.CreateEventW(None, True, False, None)
+    if not h_event:
+        return False
+
+    ov = _OVERLAPPED()
+    ov.hEvent = h_event
+
+    handle = wintypes.DWORD(0)
+    ret = iphlpapi.NotifyAddrChange(ctypes.byref(handle), ctypes.byref(ov))
+
+    # NO_ERROR (0): 地址已变化, 立即返回
+    if ret == 0:
+        kernel32.CloseHandle(h_event)
+        return True
+
+    # ERROR_IO_PENDING (997): 挂起等待中
+    if ret != 997:
+        kernel32.CloseHandle(h_event)
+        return False
+
+    timeout_ms = wintypes.DWORD(int(timeout_sec * 1000))
+    wait_ret = kernel32.WaitForSingleObject(h_event, timeout_ms)
+
+    if wait_ret == 0:  # WAIT_OBJECT_0 — IP 已变化
+        kernel32.CloseHandle(h_event)
+        return True
+
+    # 超时或取消 — 取消挂起的通知
+    iphlpapi.CancelIPChangeNotify(ctypes.byref(ov))
+    kernel32.CloseHandle(h_event)
+    return False
+
+
 if __name__ == "__main__":
     # 测试
     nics = scan_nics()

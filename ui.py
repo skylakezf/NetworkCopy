@@ -259,11 +259,31 @@ class WinGUI(ttk.Window):
 
     def go_step(self, step: int):
         self._show_step(step)
-        # 只在步骤 3 (连接页面) 显示「开始传输」按钮
+        # 步骤 3: 根据设备类型显式显示对应子面板 (解决 pack_forget 后子面板丢失问题)
         if step == 3:
+            ctl_type = getattr(getattr(self, 'ctl', None), '_device_type', '')
+            if ctl_type == "目标设备" or self._device_type == "target":
+                self.show_tgt_connect()
+            elif ctl_type == "源设备" or self._device_type == "source":
+                self.show_src_connect()
             self.show_start_button()
         else:
             self.hide_start_button()
+        # 根据步骤设置「下一步」按钮默认状态
+        transfer_done = getattr(getattr(self, 'ctl', None), '_transfer_done', False)
+        is_target = getattr(getattr(self, 'ctl', None), '_device_type', '') == "目标设备"
+        if step >= self._total_steps - 1:
+            self.set_button_next("disabled")
+        elif step == 3:
+            self.set_button_next("disabled")
+        elif step == 4:
+            if transfer_done and is_target:
+                self.set_button_next("normal", text="校验文件 >")
+            else:
+                self.set_button_next("disabled")
+        else:
+            # step 0/1/2 保持现有逻辑不变, 由 controller 回调进一步控制
+            pass
         # 更新按钮状态
         if hasattr(self.ctl, '_check_button_state'):
             self.ctl._check_button_state()
@@ -420,15 +440,25 @@ class WinGUI(ttk.Window):
                                             fg=C_TEXT_MUTED, bg=C_WHITE)
         self.tk_label_auto_disk.pack(anchor=W, pady=(0, 14))
 
-        # 分隔线
-        _tk.Frame(inner, height=1, bg=C_SEP).pack(fill=X, pady=(0, 12))
+        # 分区盘符映射 (高级选项, 默认隐藏)
+        self.tk_show_partition_map = _tk.BooleanVar(value=False)
+        self.tk_cb_partition_map = ttk.Checkbutton(
+            inner,
+            text="分区盘符映射 (高级)",
+            variable=self.tk_show_partition_map,
+            command=self._toggle_partition_map,
+            bootstyle="primary-outline",
+        )
+        self.tk_cb_partition_map.pack(anchor=W, pady=(0, 8))
 
-        # 分区盘符映射
-        _tk.Label(inner, text="分区盘符映射（源 D / E / F > 当前系统盘符）",
+        # 可折叠的分区映射区域
+        self._partition_map_frame = _tk.Frame(inner, bg=C_WHITE)
+
+        _tk.Label(self._partition_map_frame, text="分区盘符映射（源 D / E / F > 当前系统盘符）",
                   font=("Microsoft YaHei UI", 10, "bold"),
-                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 10))
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(4, 10))
 
-        map_frame = _tk.Frame(inner, bg=C_WHITE)
+        map_frame = _tk.Frame(self._partition_map_frame, bg=C_WHITE)
         map_frame.pack(fill=X)
 
         for drive, attr in [("D", "tk_select_box_mqfzsdz4"),
@@ -443,6 +473,9 @@ class WinGUI(ttk.Window):
                               font=("Microsoft YaHei UI", 9))
             cb.pack(side=LEFT)
             setattr(self, attr, cb)
+
+        # 分隔线
+        _tk.Frame(self._partition_map_frame, height=1, bg=C_SEP).pack(fill=X, pady=(18, 0))
 
         # 运行环境
         env_frame = _tk.Frame(inner, bg=C_WHITE)
@@ -475,6 +508,13 @@ class WinGUI(ttk.Window):
                                          fg=C_TEXT_SEC, bg=C_WHITE,
                                          wraplength=700, justify=LEFT)
         self.tk_label_nic_ip.pack(anchor=W, pady=(0, 4))
+
+    def _toggle_partition_map(self):
+        """显示/隐藏分区盘符映射高级选项"""
+        if self.tk_show_partition_map.get():
+            self._partition_map_frame.pack(fill=X, after=self.tk_cb_partition_map, pady=(4, 0))
+        else:
+            self._partition_map_frame.pack_forget()
 
     # ==================== 步骤 3: 连接设置 ====================
 
@@ -640,15 +680,15 @@ class WinGUI(ttk.Window):
                   font=("Microsoft YaHei UI", 14, "bold"),
                   fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 4))
 
-        # 验证码醒目展示区 (发送端显示)
-        auth_banner = _tk.Frame(inner, bg=C_RED_BG, padx=14, pady=10)
-        auth_banner.pack(fill=X, pady=(0, 8))
+        # 验证码醒目展示区 (仅发送端显示, 默认隐藏)
+        self._auth_banner_frame = _tk.Frame(inner, bg=C_RED_BG, padx=14, pady=10)
+        # 不在此处 pack — 由 show_auth_code() 按需显示
 
-        _tk.Label(auth_banner, text="验证码",
+        _tk.Label(self._auth_banner_frame, text="验证码",
                   font=("Microsoft YaHei UI", 8, "bold"),
                   fg=C_RED, bg=C_RED_BG).pack(anchor=W)
 
-        code_row = _tk.Frame(auth_banner, bg=C_RED_BG)
+        code_row = _tk.Frame(self._auth_banner_frame, bg=C_RED_BG)
         code_row.pack(fill=X, pady=(2, 0))
 
         self.tk_label_transfer_auth_code = _tk.Label(
@@ -831,23 +871,29 @@ class WinGUI(ttk.Window):
             self.tk_button_dhcp.pack_forget()
 
     def show_auth_code(self, code: str):
+        """发送端: 显示验证码 (步骤3连接页 + 步骤4传输页红色横幅)"""
         if hasattr(self, 'tk_label_auth_code'):
             self.tk_label_auth_code.config(text=code)
         if hasattr(self, 'tk_label_src_status'):
             self.tk_label_src_status.config(
                 text=f"请在新设备上输入此验证码: {code}"
             )
-        # 也在传输页面顶部醒目展示
+        # 传输页面顶部红色验证码横幅 — 仅发送端显示
         if hasattr(self, 'tk_label_transfer_auth_code'):
             self.tk_label_transfer_auth_code.config(text=code)
+        if hasattr(self, '_auth_banner_frame'):
+            self._auth_banner_frame.pack(fill=X, pady=(0, 8))
 
     def hide_auth_code(self):
+        """隐藏验证码横幅 (接收端调用)"""
         if hasattr(self, 'tk_label_auth_code'):
             self.tk_label_auth_code.config(text="----")
         if hasattr(self, 'tk_label_src_status'):
             self.tk_label_src_status.config(text="验证码: ---- 等待目标设备连接...")
         if hasattr(self, 'tk_label_transfer_auth_code'):
             self.tk_label_transfer_auth_code.config(text="----")
+        if hasattr(self, '_auth_banner_frame'):
+            self._auth_banner_frame.pack_forget()
 
     def show_auth_input(self):
         pass
