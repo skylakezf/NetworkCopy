@@ -87,6 +87,7 @@ $PyArgs = @(
     "-m", "PyInstaller",
     "--onefile",
     "--windowed",
+    "--noupx",                    # 禁用 UPX — 防止 bootstrap.ttf 等二进制文件解压失败
     "--name", $AppName
 )
 foreach ($imp in $HiddenImports) {
@@ -116,10 +117,7 @@ foreach ($d in @($buildDir, $distDir)) {
         Write-Yellow "  已清理: $d"
     }
 }
-if (Test-Path -LiteralPath $specFile) {
-    Remove-Item -LiteralPath $specFile -Force -ErrorAction SilentlyContinue
-    Write-Yellow "  已清理: $specFile"
-}
+# spec 文件由 PyInstaller 自动重新生成 (含 --noupx 参数), 无需手动删除
 
 # ---- 执行构建 ----
 Write-Green ">> 开始 PyInstaller 打包..."

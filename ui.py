@@ -38,7 +38,7 @@ class WinGUI(ttk.Window):
         self._auth_vcmd = (self.register(self._auth_validate), "%P")
         self._build_layout()
         self._step = 0
-        self._total_steps = 5
+        self._total_steps = 6  # 0=角色 1=网卡 2=磁盘 3=连接 4=传输 5=校验
         self._device_type = None  # "source" or "target"
         self._role_display = "未选择"
 
@@ -90,12 +90,16 @@ class WinGUI(ttk.Window):
         # 底部状态栏
         self._build_status_bar()
 
+        # 初始化 CSV 路径变量 (必须在 _build_step5_verify 之前)
+        self.csv_path_var = _tk.StringVar()
+
         # 构建各步骤页面
         self._build_step0_role()
         self._build_step1_nic()
         self._build_step2_disk()
         self._build_step3_connect()
         self._build_step4_transfer()
+        self._build_step5_verify()
 
         # 初始显示步骤 0
         self._show_step(0)
@@ -115,9 +119,10 @@ class WinGUI(ttk.Window):
 
         self._step_items = []
         steps = [
-            ("1", "选择设备类型", "选择发送方或接收方"),
-            ("2", "选择磁盘与分区", "识别磁盘并配置盘符映射"),
-            ("3", "开始传输", "启动服务并传输文件"),
+            ("1", "选择设备类型", "旧设备 (发送方) 或新设备 (接收方)"),
+            ("2", "高级设置", "磁盘选择 · 分区映射 · IP 配置"),
+            ("3", "连接并开始传输", "启动服务并输入验证码"),
+            ("4", "传输 & 数据校验", "文件传输进度与完整性校验"),
         ]
         for num, title, desc in steps:
             item = self._build_step_item(side, num, title, desc)
@@ -157,15 +162,16 @@ class WinGUI(ttk.Window):
         }
 
     def _update_step_indicator(self, current: int):
-        map_ui_to_side = {0: 0, 1: 0, 2: 1, 3: 2, 4: 2}
+        map_ui_to_side = {0: 0, 1: 0, 2: 1, 3: 2, 4: 3, 5: 3}
         side_current = map_ui_to_side.get(current, 0)
 
         desc_map = {
-            0: ("选择发送方或接收方", "请选择[源设备]或[目标设备]"),
+            0: ("选择发送方或接收方", "请选择[旧设备(发送方)]或[新设备(接收方)]"),
             1: ("已选择直连网卡", "请选择设备类型"),
-            2: ("已选择磁盘", "请选择磁盘并配置盘符映射"),
-            3: ("准备连接", "配置连接参数"),
-            4: ("启动 HTTP 服务", "开始发送文件"),
+            2: ("高级设置 — 磁盘 / 分区 / IP", "确认磁盘和分区映射，查看网络配置"),
+            3: ("准备连接", "启动服务，输入验证码并开始传输"),
+            4: ("传输进度", "文件正在传输中..."),
+            5: ("数据校验", "校验已传输文件的完整性"),
         }
 
         for i, item in enumerate(self._step_items):
@@ -225,9 +231,9 @@ class WinGUI(ttk.Window):
         self.tk_button_prev.configure(text=text)
 
     def set_button_next(self, state: str, text: str = "下一步 >"):
+        # 仅禁用/启用, 不隐藏按钮 — 保持按钮始终可见 (灰色 = 禁用), 标准 UX
         if state == "disabled":
             self.tk_button_next.configure(state=DISABLED)
-            self.tk_button_next.pack_forget()
         else:
             self.tk_button_next.configure(state=NORMAL, text=text)
             if not self.tk_button_next.winfo_ismapped():
@@ -253,6 +259,14 @@ class WinGUI(ttk.Window):
 
     def go_step(self, step: int):
         self._show_step(step)
+        # 只在步骤 3 (连接页面) 显示「开始传输」按钮
+        if step == 3:
+            self.show_start_button()
+        else:
+            self.hide_start_button()
+        # 更新按钮状态
+        if hasattr(self.ctl, '_check_button_state'):
+            self.ctl._check_button_state()
 
     def _build_status_bar(self):
         status_frame = _tk.Frame(self, bg=C_SIDEBAR_BG)
@@ -333,9 +347,11 @@ class WinGUI(ttk.Window):
 
     def _on_select_role(self, role: str):
         self._device_type = role
-        self._role_display = "发送方" if role == "source" else "接收方"
+        self._role_display = "旧设备 (发送方)" if role == "source" else "新设备 (接收方)"
         if hasattr(self, 'tk_label_role'):
-            self.tk_label_role.configure(text=f"当前角色：{self._role_display}")
+            self.tk_label_role.configure(text=f"当前角色: {self._role_display}")
+        if hasattr(self, 'tk_label_nic_ip'):
+            self.tk_label_nic_ip.configure(text="等待网卡选择...")
         if hasattr(self, 'ctl') and hasattr(self.ctl, '_on_role_selected'):
             self.ctl._on_role_selected(role)
 
@@ -447,6 +463,19 @@ class WinGUI(ttk.Window):
                         variable=self.winpe_var, value="normal",
                         bootstyle="primary").pack(side=LEFT)
 
+        # ===== IP 配置 (高级设置) =====
+        _tk.Frame(inner, height=1, bg=C_SEP).pack(fill=X, pady=(16, 10))
+
+        _tk.Label(inner, text="IP 状态",
+                  font=("Microsoft YaHei UI", 10, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 6))
+
+        self.tk_label_nic_ip = _tk.Label(inner, text="等待网卡选择...",
+                                         font=("Microsoft YaHei UI", 9),
+                                         fg=C_TEXT_SEC, bg=C_WHITE,
+                                         wraplength=700, justify=LEFT)
+        self.tk_label_nic_ip.pack(anchor=W, pady=(0, 4))
+
     # ==================== 步骤 3: 连接设置 ====================
 
     def _build_step3_connect(self):
@@ -474,14 +503,14 @@ class WinGUI(ttk.Window):
                              highlightthickness=1)
         auth_box.pack(fill=X, pady=(0, 10))
 
-        _tk.Label(auth_box, text="验证码",
+        _tk.Label(auth_box, text="连接验证码",
                   font=("Microsoft YaHei UI", 9, "bold"),
                   fg=C_TEXT_SEC, bg=C_WHITE).pack(anchor=W, padx=14, pady=(10, 4))
 
         code_row = _tk.Frame(auth_box, bg=C_WHITE)
         code_row.pack(fill=X, padx=14, pady=(4, 10))
 
-        _tk.Label(code_row, text="当前验证码:",
+        _tk.Label(code_row, text="验证码:",
                   font=("Microsoft YaHei UI", 10),
                   fg=C_TEXT, bg=C_WHITE).pack(side=LEFT, padx=(0, 8))
 
@@ -492,6 +521,13 @@ class WinGUI(ttk.Window):
             padx=14, pady=4,
         )
         self.tk_label_auth_code.pack(side=LEFT)
+
+        # 醒目提醒
+        remind = _tk.Frame(auth_box, bg=C_WHITE)
+        remind.pack(fill=X, padx=14, pady=(0, 10))
+        _tk.Label(remind, text="=请退出所有应用程序关闭所有文档，确认后请点击右下角“开始传输”",
+                  font=("Microsoft YaHei UI", 9, "bold"),
+                  fg=C_RED, bg=C_WHITE).pack(anchor=W)
 
         # 状态信息
         self.tk_label_src_status = _tk.Label(self._src_connect,
@@ -530,11 +566,8 @@ class WinGUI(ttk.Window):
         self.tk_select_box_discover.set("等待 DHCP 响应...")
         self.tk_select_box_discover.pack(fill=X, pady=(0, 6))
 
-        # 高级: 手动 IP
+        # 高级: 手动 IP (初始隐藏, 勾选后才显示)
         self._advanced_frame = _tk.Frame(self._tgt_connect, bg=C_SIDEBAR_BG, padx=10, pady=8)
-        self._advanced_frame.pack(fill=X, pady=(6, 0))
-        for w in self._advanced_frame.winfo_children():
-            w.pack_forget()
 
         self.tk_var_advanced = _tk.BooleanVar(value=False)
         self.tk_check_advanced = ttk.Checkbutton(
@@ -551,45 +584,30 @@ class WinGUI(ttk.Window):
                                          font=("Microsoft YaHei UI", 8))
         self.tk_entry_const.pack(side=LEFT, padx=(0, 4))
 
-        # 验证码输入
-        code_label = _tk.Frame(self._tgt_connect, bg=C_WHITE)
-        code_label.pack(fill=X, pady=(12, 0))
-        _tk.Label(code_label, text="请输入旧电脑上显示的连接验证码:",
-                  font=("Microsoft YaHei UI", 9, "bold"),
-                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W)
+        # 验证码输入区 (整齐居中)
+        code_section = _tk.Frame(self._tgt_connect, bg=C_WHITE)
+        code_section.pack(fill=X, pady=(14, 4))
 
-        self.tk_entry_code = ttk.Entry(self._tgt_connect, font=("Consolas", 16, "bold"),
+        _tk.Label(code_section, text="请输入旧电脑上显示的连接验证码:",
+                  font=("Microsoft YaHei UI", 9, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=CENTER)
+
+        self.tk_entry_code = ttk.Entry(code_section, font=("Consolas", 16, "bold"),
                                        justify=CENTER, width=6,
                                        validate="key", validatecommand=self._auth_vcmd)
-        self.tk_entry_code.pack(pady=(4, 4))
+        self.tk_entry_code.pack(pady=(8, 0))
 
         self.tk_entry_code.bind("<KeyRelease>", self._on_auth_key)
 
-        # CSV 选择器
-        self.csv_path_var = _tk.StringVar()
-        self._csv_frame = _tk.Frame(self._tgt_connect, bg=C_WHITE)
-        self._csv_frame.pack(fill=X, pady=(10, 0))
-
-        _tk.Label(self._csv_frame, text="FullFilelist_DEF.csv (可选):",
-                  font=("Microsoft YaHei UI", 8), fg=C_TEXT_SEC,
-                  bg=C_WHITE).pack(side=LEFT, padx=(0, 4))
-        self.tk_entry_csv = ttk.Entry(self._csv_frame, textvariable=self.csv_path_var,
-                                       state="readonly", font=("Microsoft YaHei UI", 8),
-                                       width=30)
-        self.tk_entry_csv.pack(side=LEFT, padx=(0, 4))
-        self.tk_button_browse_csv = ttk.Button(self._csv_frame, text="浏览...",
-                                                takefocus=False, width=8,
-                                                bootstyle="secondary",
-                                                command=self._on_browse_csv)
-        self.tk_button_browse_csv.pack(side=LEFT)
-
     def _toggle_advanced_ip(self):
         if self.tk_var_advanced.get():
+            self._advanced_frame.pack(fill=X, pady=(6, 0))
             for w in self._advanced_frame.winfo_children():
                 w.pack(side=LEFT, padx=(0, 4))
         else:
             for w in self._advanced_frame.winfo_children():
                 w.pack_forget()
+            self._advanced_frame.pack_forget()
 
     def _on_auth_key(self, event=None):
         current = self.tk_entry_code.get()
@@ -621,6 +639,30 @@ class WinGUI(ttk.Window):
         _tk.Label(inner, text="传输中...",
                   font=("Microsoft YaHei UI", 14, "bold"),
                   fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 4))
+
+        # 验证码醒目展示区 (发送端显示)
+        auth_banner = _tk.Frame(inner, bg=C_RED_BG, padx=14, pady=10)
+        auth_banner.pack(fill=X, pady=(0, 8))
+
+        _tk.Label(auth_banner, text="验证码",
+                  font=("Microsoft YaHei UI", 8, "bold"),
+                  fg=C_RED, bg=C_RED_BG).pack(anchor=W)
+
+        code_row = _tk.Frame(auth_banner, bg=C_RED_BG)
+        code_row.pack(fill=X, pady=(2, 0))
+
+        self.tk_label_transfer_auth_code = _tk.Label(
+            code_row, text="----",
+            font=("Consolas", 28, "bold"),
+            fg=C_RED, bg=C_WHITE,
+            padx=14, pady=4,
+        )
+        self.tk_label_transfer_auth_code.pack(side=LEFT, padx=(0, 10))
+
+        _tk.Label(code_row,
+                  text="请在新设备上输入此验证码连接",
+                  font=("Microsoft YaHei UI", 10, "bold"),
+                  fg=C_RED, bg=C_RED_BG).pack(side=LEFT)
 
         self.tk_label_transfer_status = _tk.Label(inner, text="等待开始...",
                                                    font=("Microsoft YaHei UI", 8),
@@ -665,6 +707,86 @@ class WinGUI(ttk.Window):
         scroll.config(command=self.tk_text_mqg105ch.yview)
         self.tk_text_mqg105ch.configure(yscrollcommand=scroll.set)
 
+    # ==================== 步骤 5: 文件校验 ====================
+
+    def _build_step5_verify(self):
+        page = _tk.Frame(self._content_frame, bg=C_WHITE)
+        self._pages[5] = page
+
+        inner = _tk.Frame(page, bg=C_WHITE)
+        inner.pack(fill=BOTH, expand=True, padx=40, pady=20)
+
+        _tk.Label(inner, text="数据校验",
+                  font=("Microsoft YaHei UI", 14, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 4))
+
+        _tk.Label(inner, text="传输完成后, 校验文件完整性",
+                  font=("Microsoft YaHei UI", 9), fg=C_TEXT_SEC,
+                  bg=C_WHITE).pack(anchor=W, pady=(0, 14))
+
+        # ---- CSV 文件选择 ----
+        csv_section = _tk.Frame(inner, bg=C_SIDEBAR_BG, padx=14, pady=12)
+        csv_section.pack(fill=X, pady=(0, 10))
+
+        _tk.Label(csv_section, text="校验清单 (FullFilelist_DEF.csv)",
+                  font=("Microsoft YaHei UI", 9, "bold"),
+                  fg=C_TEXT, bg=C_SIDEBAR_BG).pack(anchor=W, pady=(0, 6))
+
+        csv_row = _tk.Frame(csv_section, bg=C_SIDEBAR_BG)
+        csv_row.pack(fill=X)
+
+        self.tk_entry_csv = ttk.Entry(csv_row, textvariable=self.csv_path_var,
+                                       state="readonly",
+                                       font=("Microsoft YaHei UI", 9), width=50)
+        self.tk_entry_csv.pack(side=LEFT, padx=(0, 8))
+
+        self.tk_button_browse_csv = ttk.Button(csv_row, text="浏览...", takefocus=False,
+                                                width=10, bootstyle="secondary",
+                                                command=self._on_browse_csv)
+        self.tk_button_browse_csv.pack(side=LEFT)
+
+        _tk.Label(csv_section, text="留空则自动识别最新 Appl 文件夹下的 CSV",
+                  font=("Microsoft YaHei UI", 7),
+                  fg=C_TEXT_MUTED, bg=C_SIDEBAR_BG).pack(anchor=W, pady=(6, 0))
+
+        # ---- 校验按钮 ----
+        self.tk_button_verify = ttk.Button(inner, text="开始校验", takefocus=False,
+                                            bootstyle="success", width=16)
+        self.tk_button_verify.pack(anchor=W, pady=(10, 12))
+
+        # ---- 校验进度 ----
+        self.tk_label_verify_progress = _tk.Label(inner, text="",
+                                                   font=("Microsoft YaHei UI", 9),
+                                                   fg=C_TEXT_SEC, bg=C_WHITE,
+                                                   wraplength=700, justify=LEFT)
+        self.tk_label_verify_progress.pack(anchor=W, pady=(0, 4))
+
+        self.tk_verify_progress_bar = ttk.Progressbar(inner, mode="determinate",
+                                                       maximum=100, value=0,
+                                                       bootstyle="info")
+        self.tk_verify_progress_bar.pack(fill=X, pady=(2, 10))
+
+        # ---- 校验日志 ----
+        log_header = _tk.Frame(inner, bg=C_WHITE)
+        log_header.pack(fill=X, pady=(4, 2))
+        _tk.Label(log_header, text="校验日志",
+                  font=("Microsoft YaHei UI", 9, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(side=LEFT)
+
+        self.tk_text_verify_log = _tk.Text(inner, wrap=WORD, font=("Consolas", 8),
+                                            bg=C_CONSOLE_BG, fg=C_CONSOLE_FG,
+                                            bd=1, relief=SOLID,
+                                            insertbackground=C_CONSOLE_FG,
+                                            selectbackground="#404040",
+                                            height=10)
+        self.tk_text_verify_log.pack(fill=BOTH, expand=True)
+
+        scroll = ttk.Scrollbar(self.tk_text_verify_log, orient=VERTICAL,
+                               bootstyle="dark-round")
+        scroll.config(command=self.tk_text_verify_log.yview)
+        self.tk_text_verify_log.configure(yscrollcommand=scroll.set)
+        self.tk_text_verify_log.configure(state=DISABLED)
+
     # ==================== 显示/隐藏方法 (兼容 control.py) ====================
 
     def show_discover(self):
@@ -679,6 +801,26 @@ class WinGUI(ttk.Window):
         if hasattr(self, 'tk_select_box_discover'):
             self.tk_select_box_discover.pack_forget()
 
+    def show_src_connect(self):
+        """显示发送方(旧设备)连接页面"""
+        if hasattr(self, '_tgt_connect'):
+            self._tgt_connect.pack_forget()
+        if hasattr(self, '_src_connect'):
+            self._src_connect.pack(fill=BOTH, expand=True)
+
+    def show_tgt_connect(self):
+        """显示接收方(新设备)连接页面"""
+        if hasattr(self, '_src_connect'):
+            self._src_connect.pack_forget()
+        if hasattr(self, '_tgt_connect'):
+            self._tgt_connect.pack(fill=BOTH, expand=True)
+
+    def hide_connect_panels(self):
+        """隐藏所有连接面板"""
+        for attr in ('_src_connect', '_tgt_connect'):
+            if hasattr(self, attr):
+                getattr(self, attr).pack_forget()
+
     def show_dhcp(self):
         if hasattr(self, 'tk_button_dhcp'):
             self.tk_button_dhcp.pack(anchor=W, pady=(0, 4),
@@ -692,13 +834,20 @@ class WinGUI(ttk.Window):
         if hasattr(self, 'tk_label_auth_code'):
             self.tk_label_auth_code.config(text=code)
         if hasattr(self, 'tk_label_src_status'):
-            self.tk_label_src_status.config(text=f"验证码: {code}  等待目标设备连接...")
+            self.tk_label_src_status.config(
+                text=f"请在新设备上输入此验证码: {code}"
+            )
+        # 也在传输页面顶部醒目展示
+        if hasattr(self, 'tk_label_transfer_auth_code'):
+            self.tk_label_transfer_auth_code.config(text=code)
 
     def hide_auth_code(self):
         if hasattr(self, 'tk_label_auth_code'):
             self.tk_label_auth_code.config(text="----")
         if hasattr(self, 'tk_label_src_status'):
             self.tk_label_src_status.config(text="验证码: ---- 等待目标设备连接...")
+        if hasattr(self, 'tk_label_transfer_auth_code'):
+            self.tk_label_transfer_auth_code.config(text="----")
 
     def show_auth_input(self):
         pass
@@ -756,7 +905,14 @@ class WinGUI(ttk.Window):
                 item["title"].configure(fg=C_BLUE)
 
     def set_status(self, text: str):
-        pass
+        """更新控制台/状态标签信息"""
+        if hasattr(self, 'tk_label_src_status'):
+            self.tk_label_src_status.config(text=text)
+
+    def set_nic_ip_info(self, info_text: str):
+        """更新步骤 2 高级设置中的 IP 状态信息"""
+        if hasattr(self, 'tk_label_nic_ip'):
+            self.tk_label_nic_ip.configure(text=info_text)
 
     def log(self, text: str):
         if hasattr(self, 'tk_text_mqg105ch'):
@@ -769,7 +925,7 @@ class WinGUI(ttk.Window):
         if hasattr(self, 'tk_text_mqg105ch'):
             self.tk_text_mqg105ch.configure(state=NORMAL)
             self.tk_text_mqg105ch.delete("1.0", END)
-            self.tk_text_mqg105ch.configure(state=NORMAL)
+            self.tk_text_mqg105ch.configure(state=DISABLED)
 
     # ==================== 验证函数 ====================
 

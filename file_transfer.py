@@ -99,7 +99,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
         if FileServerHandler.suppress_access_log:
             return
         if FileServerHandler.log_callback:
-            FileServerHandler.log_callback(f"[HTTP] {args[0]}")
+            FileServerHandler.log_callback(f"[HTTPS] {args[0]}")
 
     def _send_json(self, data, status=200):
         # 必须携带 Content-Length: HTTP/1.1 keep-alive 下客户端依赖它判断 body 结束,
@@ -127,7 +127,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
         if FileServerHandler.log_callback:
             display = file_info or os.path.basename(filepath)
             FileServerHandler.log_callback(
-                f"[HTTP] 正在发送: {display} ({_fmt_size(file_size)})"
+                f"[HTTPS] 正在发送: {display} ({_fmt_size(file_size)})"
             )
 
         with open(filepath, "rb") as f:

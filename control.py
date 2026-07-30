@@ -72,6 +72,7 @@ class Controller:
 
         # ---- 传输状态 ----
         self._transferring = False
+        self._transfer_done = False  # 传输是否已完成 (用于启用"校验文件"按钮)
 
         # ---- 校验线程 (独立于传输线程，可并行) ----
         self._verify_thread = None
@@ -117,17 +118,18 @@ class Controller:
         # 隐藏所有步骤特定控件
         self.ui.hide_dhcp()
         self.ui.hide_auth_code()
+        self.ui.hide_connect_panels()
         # 运行环境单选: 默认按检测结果预选
         if hasattr(self.ui, 'winpe_var'):
             self.ui.winpe_var.set("winpe" if is_running_in_winpe() else "normal")
 
     def _setup_events(self):
         """绑定 UI 控件事件"""
-        # 角色选择按钮
+        # 角色选择按钮 — 通过 ui._on_select_role 更新角色标签
         if hasattr(self.ui, 'tk_btn_source'):
-            self.ui.tk_btn_source.config(command=lambda: self._on_role_selected("source"))
+            self.ui.tk_btn_source.config(command=lambda: self.ui._on_select_role("source"))
         if hasattr(self.ui, 'tk_btn_target'):
-            self.ui.tk_btn_target.config(command=lambda: self._on_role_selected("target"))
+            self.ui.tk_btn_target.config(command=lambda: self.ui._on_select_role("target"))
         # 上一步/下一步导航
         if hasattr(self.ui, 'tk_button_prev'):
             self.ui.tk_button_prev.config(command=self._on_prev_step)
@@ -158,6 +160,9 @@ class Controller:
         # CSV 浏览
         if hasattr(self.ui, 'tk_button_browse_csv'):
             self.ui.tk_button_browse_csv.config(command=self._on_browse_csv)
+        # 校验按钮 (步骤 5)
+        if hasattr(self.ui, 'tk_button_verify'):
+            self.ui.tk_button_verify.config(command=self._on_verify_start)
         # 发现设备列表
         if hasattr(self.ui, 'tk_select_box_discover'):
             self.ui.tk_select_box_discover.bind("<<ComboboxSelected>>", self._on_discover_selected)
@@ -197,37 +202,120 @@ class Controller:
     def _on_role_selected(self, role: str):
         """角色选择: 'source'(旧电脑/发送方) 或 'target'(新电脑/接收方)"""
         self._device_type = "源设备" if role == "source" else "目标设备"
-        self._log(f"已选择角色: {'旧电脑 (发送方)' if role == 'source' else '新电脑 (接收方)'}")
+        role_display = "旧设备 (发送方)" if role == "source" else "新设备 (接收方)"
+        self._log(f"已选择角色: {role_display}")
 
-        # 步骤 1 → 步骤 2: 进入网卡选择
-        self.ui.tk_button_next.config(state="normal")
+        # 更新右上角角色标签
+        if hasattr(self.ui, 'tk_label_role'):
+            self.ui.tk_label_role.configure(text=f"当前角色: {role_display}")
+
+        # 步骤 0 → 步骤 1: 进入网卡选择 — 用 set_button_next 确保 pack 状态正确
+        self.ui.set_button_next("normal")
         if role == "source":
             self.ui.show_auth_code("----")
             self.ui.hide_dhcp()
+            self.ui.show_src_connect()
+            self.ui.hide_discover()
+            self.ui.hide_manual_ip()
         else:
             self.ui.show_dhcp()
+            self.ui.show_tgt_connect()
+            self.ui.show_discover()
+            self.ui.show_manual_ip()
 
         # 切换到网卡选择步骤
         self.ui.go_step(1)
         self.ui.tk_button_prev.config(state="normal")
 
-        # 开始按钮显示
-        self.ui.show_start_button()
+        # 更新 IP 配置信息
+        if role == "source":
+            self.ui.set_nic_ip_info(
+                "发送方 (旧设备) — 将自动从接收方 DHCP 获取 IP 地址\n"
+                "    预期 IP: 169.254.100.2"
+            )
+        else:
+            self.ui.set_nic_ip_info(
+                "接收方 (新设备) — 请进入下一步连接页面后点击「寻找旧设备」启动 DHCP 服务器\n"
+                "    本机 IP: 169.254.100.1 | 源设备 IP: 169.254.100.2"
+            )
+
+        # 不在此时显示开始按钮，等用户到达步骤 3 再显示
 
     def _on_prev_step(self):
         """上一步"""
         new_step = max(0, self.ui._step - 1)
         self.ui.go_step(new_step)
+
         if new_step == 0:
+            # 退回角色选择页: 禁用下一步
             self.ui.tk_button_prev.config(state="disabled")
+            self.ui.set_button_next("disabled")
+        else:
+            self.ui.tk_button_prev.config(state="normal")
+
+            # 同步"下一步"按钮状态
+            if new_step == 1:
+                # 网卡选择页: 若网卡已选则启用
+                nic_selected = self.ui.tk_select_box_mqfzkd6x.get() not in (
+                    "扫描中...", "未检测到网卡", "", "网卡1", "网卡2"
+                )
+                if nic_selected:
+                    self.ui.set_button_next("normal")
+                else:
+                    self.ui.set_button_next("disabled")
+            elif new_step == 2:
+                # 磁盘映射页: 需要用户确认磁盘选择后才能继续
+                disk = self.ui.tk_select_box_mqfzmzbe.get()
+                if disk and disk not in ("未检测到磁盘", "", "请先选择设备类型", "扫描中..."):
+                    self.ui.set_button_next("normal")
+                else:
+                    self.ui.set_button_next("disabled")
+            elif new_step == 3:
+                # 连接页面: 禁用"下一步", 使用"开始传输"
+                self.ui.set_button_next("disabled")
+            elif new_step == 4:
+                # 传输页面: 若传输已完成(接收方), 启用"校验文件 >"
+                if self._transfer_done and self._device_type == "目标设备":
+                    self.ui.set_button_next("normal", text="校验文件 >")
+                else:
+                    self.ui.set_button_next("disabled")
+            elif new_step == 5:
+                # 校验页面: 禁用"下一步"
+                self.ui.set_button_next("disabled")
+            else:
+                self.ui.set_button_next("normal")
+
+            # 同步"开始传输"按钮状态
+            self._check_button_state()
 
     def _on_next_step(self):
         """下一步"""
         new_step = min(self.ui._total_steps - 1, self.ui._step + 1)
         self.ui.go_step(new_step)
         self.ui.tk_button_prev.config(state="normal")
-        if new_step >= self.ui._total_steps - 1:
-            self.ui.tk_button_next.config(state="disabled")
+
+        if new_step == 2:
+            # 进入步骤 2 (磁盘映射): 先禁用"下一步"，等用户选择磁盘确认后再启用
+            self.ui.set_button_next("disabled")
+        elif new_step == 3:
+            # 步骤 3 (连接页面): 禁用"下一步", 用户应点击"开始传输"而非"下一步"
+            self.ui.set_button_next("disabled")
+        elif new_step == 5:
+            # 步骤 5 (校验页面): 禁用"下一步", 这是最后一页
+            self.ui.set_button_next("disabled")
+        elif new_step == 4:
+            # 步骤 4 (传输页面): 传输完成前禁用"下一步"
+            if self._transfer_done:
+                self.ui.set_button_next("normal", text="校验文件 >")
+            else:
+                self.ui.set_button_next("disabled")
+        elif new_step >= self.ui._total_steps - 1:
+            self.ui.set_button_next("disabled")
+        else:
+            self.ui.set_button_next("normal")
+
+        # 同步"开始传输"按钮状态
+        self._check_button_state()
 
     def _on_auth_code_changed(self, event=None):
         """验证码输入: 自动转大写 + 限制 4 位"""
@@ -282,8 +370,21 @@ class Controller:
         # 网卡选定后: 扫描磁盘并进入下一步
         self._populate_disks()
 
-        # 允许进入下一步 (磁盘选择)
-        self.ui.tk_button_next.config(state="normal")
+        # 允许进入下一步 (磁盘选择) — 用 set_button_next 确保 pack 状态正确
+        self.ui.set_button_next("normal")
+
+        # 更新 IP 状态显示
+        if self._device_type == "源设备":
+            self.ui.set_nic_ip_info(
+                f"发送方 (旧设备) — 已选定网卡: {nic_display}\n"
+                "    将自动从接收方 DHCP 获取 IP: 169.254.100.2"
+            )
+        else:
+            self.ui.set_nic_ip_info(
+                f"接收方 (新设备) — 已选定网卡: {nic_display}\n"
+                "    请进入连接页面后点击「寻找旧设备」启动 DHCP\n"
+                "    本机 IP: 169.254.100.1 | 源设备 IP: 169.254.100.2"
+            )
 
     def _on_device_type_selected(self, event=None):
         dev_type = self._device_type
@@ -330,6 +431,9 @@ class Controller:
         if disk in ("未检测到磁盘", "", "请先选择设备类型", "扫描中..."):
             return
         self._log(f"已选择磁盘: {disk}")
+
+        # 磁盘已选择: 允许用户确认后进入下一步 — 用 set_button_next 确保 pack 状态正确
+        self.ui.set_button_next("normal")
 
         # 立即填充盘符 (不依赖分区检测结果)
         self._populate_drive_letters()
@@ -395,9 +499,8 @@ class Controller:
                 f"模式={'手动IP(' + manual_ip + ')' if manual_ip else 'DHCP/扫描'}"
             )
 
-            # 切换到传输进度页面 (步骤 4)
-            self.ui.go_step(4)
-
+            # 先做参数校验, 通过后再切换到传输进度页面 (步骤 4)
+            # 避免校验失败时用户已停在传输页却无反应
             if dev_type == "源设备":
                 # 源设备必须指定要对外提供(拷贝)的盘符, 否则服务器虽启动但无任何数据可传,
                 # 表现为"服务已开启却无法传输文件"。因此这里改为强制校验。
@@ -405,7 +508,6 @@ class Controller:
                     self._log("错误: 源设备尚未配置任何盘符映射 (D/E/F), "
                               "服务器将无任何数据可拷贝。请先在下拉框选择要提供的盘符。")
                     return
-                self._start_source_server(manual_ip=manual_ip)
             else:
                 # 目标设备需要完成分区映射才能下载
                 ntfs_count: int = self._ntfs_partition_count
@@ -415,6 +517,13 @@ class Controller:
                     self._log(f"请先完成 {'/'.join(required_keys)} 盘符映射"
                               f"(当前: {len(mapped)} 个)")
                     return
+
+            # 校验通过, 切换到传输进度页面 (步骤 4)
+            self.ui.go_step(4)
+
+            if dev_type == "源设备":
+                self._start_source_server(manual_ip=manual_ip)
+            else:
                 self._start_target_download(manual_ip=manual_ip)
         except Exception:
             import traceback
@@ -513,16 +622,18 @@ class Controller:
         self._log(f"分区映射: {self._partition_map}")
 
     def _check_button_state(self):
-        """根据网卡与设备类型启用/禁用开始按钮。
+        """根据网卡、设备类型、当前步骤及传输状态启用/禁用「开始传输」按钮。
 
-        说明: 源设备只负责搭建 HTTP 服务器, 限制从简 —— 只要选好网卡与设备类型即可启用;
-        真正的完整性校验 (分区映射 / DHCP / 手动 IP) 在点击时由 _on_start_button 进行。
+        仅在步骤 3 (连接页面) 才显示并启用开始传输按钮，
+        且传输进行中不重新启用, 防止用户在步骤 2 自动填充后误点跳过连接步骤。
         """
         dev_type = self._device_type
         nic_selected = self.ui.tk_select_box_mqfzkd6x.get() not in (
             "扫描中...", "未检测到网卡", "", "网卡1", "网卡2"
         )
-        if nic_selected and dev_type in ("源设备", "目标设备"):
+        current_step = getattr(self.ui, '_step', 0)
+        if (nic_selected and dev_type in ("源设备", "目标设备")
+                and current_step >= 3 and not self._transferring):
             self.ui.tk_button_mqfzl35t.config(state="normal")
         else:
             self.ui.tk_button_mqfzl35t.config(state="disabled")
@@ -870,6 +981,7 @@ class Controller:
         self.ui.show_auth_code(self._auth_code)
 
         self._transferring = True
+        self._transfer_done = False
         self.ui.tk_button_mqfzl35t.config(text="传输中...", state="disabled")
 
     def _rename_gtmc_user_profiles(self):
@@ -954,9 +1066,8 @@ class Controller:
             self._log("未输入验证码, 已取消接收")
             return
         self._auth_code = code.strip().upper()
-        # 回填主界面输入框并显示, 便于与源设备核对
+        # 回填主界面输入框, 便于核对 (接收方不显示红色验证码横幅)
         self.ui.set_auth_input(self._auth_code)
-        self.ui.show_auth_code(self._auth_code)
 
         # 如果旧校验还在跑，通知它停止
         if self._verify_thread and self._verify_thread.is_alive():
@@ -966,6 +1077,7 @@ class Controller:
         self._stop_verify = False
 
         self._transferring = True
+        self._transfer_done = False
         self._reset_progress("正在连接源设备...")
         self.ui.tk_button_mqfzl35t.config(text="连接中...", state="disabled")
 
@@ -1074,6 +1186,7 @@ class Controller:
     def _on_transfer_failed(self):
         """传输失败，恢复按钮"""
         self._transferring = False
+        self._transfer_done = False
         self._use_dhcp = False
         if hasattr(self, "_dhcp_server") and self._dhcp_server:
             self._dhcp_server.stop()
@@ -1081,35 +1194,40 @@ class Controller:
         self._reset_progress("传输失败")
         self.ui.tk_select_box_discover.config(values=("等待 DHCP 响应...",))
         self.ui.tk_button_mqfzl35t.config(text="开始接收", state="normal")
-        self.ui.tk_button_dhcp.configure(text="开启DHCP", state="normal")
+        self.ui.tk_button_dhcp.configure(text="寻找旧电脑", state="normal")
 
     def _on_download_complete(self, success, files, bytes_done, errors):
-        """下载完成回调 — 立即启动后台校验线程，同时恢复按钮"""
+        """下载完成回调"""
         if success:
-            self._log("\n传输成功！启动后台校验...")
+            self._log("\n传输成功！")
         else:
             self._log(f"\n传输完成 (有 {len(errors) if errors else 0} 个错误)")
-            self._log("启动后台校验已传输的文件...")
 
-        # 传输线程结束，恢复按钮
+        # 传输线程结束
         self._transferring = False
-        self.ui.tk_button_mqfzl35t.config(text="开始接收", state="normal")
+        self._transfer_done = True
 
-        # 重置进度条，为校验做准备
+        # 对于接收方: 启用"下一步"按钮, 引导进入步骤 5 校验页面
+        if self._device_type == "目标设备":
+            self.ui.set_button_next("normal", text="校验文件 >")
+            self._log("点击右键「校验文件 >」进入文件完整性校验页面")
+
+        # 重置进度条
         self._set_progress(0)
-        self._set_status("正在校验文件...")
-
-        # 立即启动校验线程（独立于传输线程，边恢复边校验）
-        self._start_verification()
+        self._set_status("传输完成 — 可进入校验页面")
 
     # ==================== 校验 ====================
 
+    def _on_verify_start(self):
+        """步骤 5 校验页面: 点击「开始校验」按钮"""
+        self._start_verification()
+
     def _start_verification(self):
-        """启动 CSV 后台校验线程 (下载完成后自动调用, 12线程并行)"""
+        """启动 CSV 后台校验线程 (12线程并行)"""
         f_drive = self._partition_map.get("F", "")
         if not f_drive:
             self._log("F 盘未映射，跳过校验")
-            self._reset_progress("校验跳过 (F盘未映射)")
+            self._set_verify_status("F 盘未映射，无法校验")
             return
 
         partition_map = dict(self._partition_map)  # 快照当前映射
@@ -1126,11 +1244,21 @@ class Controller:
         else:
             self._log("未手动指定 CSV, 将自动识别最新 Appl 文件夹下的 FullFilelist_DEF.csv")
 
+        # 禁用校验按钮 (防止重复点击)
+        self.ui.tk_button_verify.config(state="disabled")
+        self._set_verify_status("正在校验..." )
+
+        def _verify_log(msg):
+            """校验线程日志: 同步写入传输日志 + 校验日志"""
+            self._log(msg)
+            self.ui.after(0, lambda: self._append_verify_log(msg))
+
         def _verify():
             try:
                 def _verify_progress(done, total):
-                    self.ui.after(0, lambda: self._set_status(
-                        f"正在校验... {done}/{total} 文件"
+                    pct = int(done / total * 100) if total > 0 else 0
+                    self.ui.after(0, lambda: self._set_verify_progress(
+                        pct, f"正在校验... {done}/{total} 文件"
                     ))
                     if total > 0:
                         self.ui.after(0, lambda: self._set_progress(done, total))
@@ -1138,7 +1266,7 @@ class Controller:
                 ok, passed, failed, skipped, total = run_verification(
                     f_drive_pe=f_drive,
                     partition_map=partition_map,
-                    log_callback=self._log,
+                    log_callback=_verify_log,
                     stop_check=lambda: self._stop_verify,
                     progress_callback=_verify_progress,
                     server_ip=server_ip,
@@ -1148,26 +1276,61 @@ class Controller:
                     csv_path=csv_path,
                 )
                 if self._stop_verify:
-                    self.ui.after(0, lambda: self._log("校验已取消 (新一轮传输开始)"))
-                    self.ui.after(0, lambda: self._reset_progress("校验已取消"))
+                    self.ui.after(0, lambda: _verify_log("校验已取消"))
+                    self.ui.after(0, lambda: self._set_verify_result("校验已取消"))
                     return
                 if ok:
-                    self.ui.after(0, lambda: self._log(
-                        f"\n{'='*50}\n"
-                        f"  校验完成！\n"
-                        f"  通过: {passed}  失败: {failed}  跳过: {skipped}  总计: {total}\n"
-                        f"{'='*50}"
+                    result_text = f"校验完成!  通过: {passed}  失败: {failed}  跳过: {skipped}  总计: {total}"
+                    self.ui.after(0, lambda: _verify_log(
+                        f"\n{'='*50}\n  {result_text}\n{'='*50}"
                     ))
-                    self.ui.after(0, lambda: self._reset_progress("校验完成"))
+                    self.ui.after(0, lambda: self._set_verify_result(result_text, success=True))
                 else:
-                    self.ui.after(0, lambda: self._log("校验失败，请检查日志"))
-                    self.ui.after(0, lambda: self._reset_progress("校验失败"))
+                    self.ui.after(0, lambda: _verify_log("校验失败，请检查日志"))
+                    self.ui.after(0, lambda: self._set_verify_result("校验失败，请检查日志", success=False))
             except Exception as e:
-                self.ui.after(0, lambda: self._log(f"校验异常: {e}"))
-                self.ui.after(0, lambda: self._reset_progress("校验异常"))
+                self.ui.after(0, lambda: _verify_log(f"校验异常: {e}"))
+                self.ui.after(0, lambda: self._set_verify_result(f"校验异常: {e}", success=False))
+            finally:
+                self.ui.after(0, lambda: self.ui.tk_button_verify.config(state="normal"))
 
         self._verify_thread = threading.Thread(target=_verify, daemon=True)
         self._verify_thread.start()
+
+    def _append_verify_log(self, msg: str):
+        """向步骤 5 校验日志区域追加一行"""
+        try:
+            tw = self.ui.tk_text_verify_log
+            tw.configure(state="normal")
+            tw.insert("end", msg + "\n")
+            tw.see("end")
+            tw.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _set_verify_status(self, text: str):
+        """更新步骤 5 校验进度标签"""
+        try:
+            self.ui.tk_label_verify_progress.configure(text=text)
+        except Exception:
+            pass
+
+    def _set_verify_progress(self, pct: int, status: str):
+        """更新步骤 5 校验进度条 + 标签"""
+        try:
+            self.ui.tk_verify_progress_bar.config(value=pct)
+            self.ui.tk_label_verify_progress.configure(text=status)
+        except Exception:
+            pass
+
+    def _set_verify_result(self, text: str, success: bool = True):
+        """更新步骤 5 校验结果标签"""
+        try:
+            fg = "#16a34a" if success else "#dc2626"
+            self.ui.tk_label_verify_result.configure(text=text, fg=fg)
+            self.ui.tk_verify_progress_bar.config(value=100 if success else 0)
+        except Exception:
+            pass
 
     def _detect_gtmc_new_name(self) -> str:
         """
@@ -1223,9 +1386,13 @@ class Controller:
     # ==================== 进度条 & 状态 ====================
 
     def _set_status(self, text: str):
-        """更新状态标签"""
+        """更新状态标签 (底部状态栏 + 传输页面状态)"""
         try:
             self.ui.tk_label_status.config(text=text)
+        except Exception:
+            pass
+        try:
+            self.ui.tk_label_transfer_status.config(text=text)
         except Exception:
             pass
 
