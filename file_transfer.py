@@ -99,7 +99,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
         if FileServerHandler.suppress_access_log:
             return
         if FileServerHandler.log_callback:
-            FileServerHandler.log_callback(f"[HTTP] {args[0]}")
+            FileServerHandler.log_callback(f"[HTTPS] {args[0]}")
 
     def _send_json(self, data, status=200):
         # 必须携带 Content-Length: HTTP/1.1 keep-alive 下客户端依赖它判断 body 结束,
@@ -127,7 +127,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
         if FileServerHandler.log_callback:
             display = file_info or os.path.basename(filepath)
             FileServerHandler.log_callback(
-                f"[HTTP] 正在发送: {display} ({_fmt_size(file_size)})"
+                f"[HTTPS] 正在发送: {display} ({_fmt_size(file_size)})"
             )
 
         with open(filepath, "rb") as f:
@@ -197,6 +197,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
             return
 
         files = []
+        dirs_info = []
         total_size = 0
         try:
             for root, dirs, filenames in os.walk(base):
@@ -212,6 +213,17 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 rel_root = os.path.relpath(root, base)
                 if "AppData" in rel_root.replace("\\", "/").split("/"):
                     continue
+
+                # 收集目录的原始修改时间（跳过根目录自身）
+                if rel_root != ".":
+                    try:
+                        d_mtime = os.stat(root).st_mtime
+                    except OSError:
+                        d_mtime = 0
+                    dirs_info.append({
+                        "path": rel_root.replace("\\", "/"),
+                        "mtime": d_mtime,
+                    })
 
                 for fname in filenames:
                     # 跳过系统文件 (仅根目录)
@@ -239,6 +251,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 "file_count": len(files),
                 "total_size": total_size,
                 "files": files,
+                "dirs": dirs_info,
             })
         except Exception as e:
             self._send_json({"error": str(e)}, 500)
@@ -1183,6 +1196,7 @@ def _download_files_inner(
 
     # 第一阶段: 收集所有分区的文件列表
     all_download_tasks = []  # [(normal_partition, rel_path, fsize, target_path), ...]
+    partition_dir_mtimes = {}  # {partition: {rel_path: mtime}}
 
     for normal_partition in ("D", "E", "F"):
         target_drive = local_partition_map.get(normal_partition, "").rstrip("\\") + "\\"
@@ -1214,6 +1228,10 @@ def _download_files_inner(
 
         files = list_data.get("files", [])
         partition_total = list_data.get("total_size", 0)
+        dirs_data = list_data.get("dirs", [])
+        partition_dir_mtimes[normal_partition] = {
+            d["path"]: d["mtime"] for d in dirs_data
+        }
 
         # 2 分区模式: D 盘只下载 User 文件夹
         if partition_count == 2 and normal_partition == "D":
@@ -1418,6 +1436,9 @@ def _download_files_inner(
             if target_dir not in _created_dirs and target_dir not in _skipped_dirs:
                 _created_dirs.add(target_dir)
 
+        dir_mtimes = partition_dir_mtimes.get(normal_partition, {})
+        target_drive = local_partition_map.get(normal_partition, "").rstrip("\\") + "\\"
+
         for d in sorted(_created_dirs):
             # 预检1: 路径已存在为文件 (而非目录) → 无法创建同名目录
             if os.path.isfile(d):
@@ -1427,17 +1448,27 @@ def _download_files_inner(
             # 预检2: 路径已存在为目录 → 检查是否可写
             if os.path.isdir(d):
                 if os.access(d, os.W_OK):
-                    continue  # 目录已存在且可写，无需创建
+                    pass  # 目录已存在且可写，跳过创建但仍还原时间戳
                 else:
                     log(f"  [跳过] 目录已存在但无写入权限: {d}")
                     _skipped_dirs.add(d)
                     continue
-            # 预检3: 路径不存在 → 尝试创建目录
+            else:
+                # 预检3: 路径不存在 → 尝试创建目录
+                try:
+                    os.makedirs(d, exist_ok=True)
+                except (PermissionError, FileExistsError, OSError) as e:
+                    log(f"  [跳过] 无法创建目录: {d} ({e})")
+                    _skipped_dirs.add(d)
+                    continue
+            # 还原目录原始修改时间
             try:
-                os.makedirs(d, exist_ok=True)
-            except (PermissionError, FileExistsError, OSError) as e:
-                log(f"  [跳过] 无法创建目录: {d} ({e})")
-                _skipped_dirs.add(d)
+                rel_dir = os.path.relpath(d, target_drive).replace("\\", "/")
+                d_mtime = dir_mtimes.get(rel_dir, 0)
+                if d_mtime:
+                    os.utime(d, (d_mtime, d_mtime))
+            except OSError:
+                pass
 
         for d in _skipped_dirs:
             _created_dirs.discard(d)
