@@ -207,6 +207,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
         将正常盘符 + 相对路径 转换为 PE 下的绝对路径
         normal_partition: "D", "E", "F"
         relative_path: "folder/sub/file.txt"
+        返回带 \\?\ 前缀的扩展路径，确保长路径 (>260 字符) 可被 os.stat/os.path.isfile/open 正常访问
         """
         pe_drive = FileServerHandler.partition_map.get(normal_partition)
         if not pe_drive:
@@ -215,8 +216,14 @@ class FileServerHandler(BaseHTTPRequestHandler):
         if relative_path:
             # 安全检查：防止路径穿越
             safe_path = os.path.normpath(relative_path).lstrip("\\/")
-            return os.path.join(base, safe_path)
-        return base
+            full = os.path.join(base, safe_path)
+        else:
+            full = base
+        # 使用 \\?\ 扩展路径前缀, 支持超过 260 字符的长路径
+        # (os.walk/os.scandir 内部自动处理长路径, 但 os.path.isfile/os.stat/open 不会)
+        if not full.startswith("\\\\?\\"):
+            full = "\\\\?\\" + full
+        return full
 
     def do_GET(self):
         try:
@@ -323,8 +330,12 @@ class FileServerHandler(BaseHTTPRequestHandler):
                         fsize = st.st_size
                         f_mtime = st.st_mtime  # 保留原始修改时间，传输后还原
                     except OSError:
-                        fsize = 0
-                        f_mtime = 0
+                        # stat 失败则文件不可读, 不加入列表 (否则客户端请求后会因无法读取而跳过)
+                        if FileServerHandler.log_callback:
+                            rel_fail = os.path.relpath(full, base).replace("\\", "/")
+                            FileServerHandler.log_callback(
+                                f"[诊断] 扫描跳过(stat失败): {rel_fail}")
+                        continue
                     rel = os.path.relpath(full, base)
                     files.append({
                         "path": rel.replace("\\", "/"),
@@ -1052,10 +1063,15 @@ def _download_batch(
                 log(f"  [_] 批次中未知文件: {rel_path}，跳过")
                 continue
 
-            # 服务端主动跳过 (空占位 data_len=0)
+            # 服务端返回空数据: 需区分「文件本身 0 字节」和「服务端无法读取」
             if data_len == 0:
-                log(f"  [!] 服务端跳过: {rel_path} (无法读取)")
-                continue
+                if exp_size == 0:
+                    # 文件本身是 0 字节的空文件, 正常创建空文件
+                    log(f"  [_] 空文件(0字节): {rel_path}")
+                else:
+                    # 期望大小 > 0 但服务端返回了空数据 → 服务端无法读取
+                    log(f"  [!] 服务端跳过: {rel_path} (无法读取, 期望{exp_size}字节)")
+                    continue
 
             # 写入 .tmp 文件
             tmp_path = target_path + ".tmp"
@@ -1066,7 +1082,7 @@ def _download_batch(
                 log(f"  [!] 跳过(写入失败): {rel_path} - {e}")
                 continue
 
-            # 大小校验
+            # 大小校验 (仅对非空文件, 空文件 data_len==0 时会跳过此检查)
             actual_size = os.path.getsize(tmp_path)
             if actual_size != exp_size:
                 log(f"  [!] 跳过(大小不匹配): {rel_path} (期望{exp_size}, 实际{actual_size})")
