@@ -43,7 +43,7 @@ class WinGUI(ttk.Window):
         self._role_display = "未选择"
 
     def __win(self):
-        self.title("磁盘拷贝工具 By ZhiyuChen")
+        self.title("数据迁移工具")
         width = 1280
         height = 700
         screenwidth = self.winfo_screenwidth()

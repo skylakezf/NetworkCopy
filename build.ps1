@@ -77,7 +77,9 @@ $HiddenImports = @(
     "PIL",
     "PIL.Image",
     "PIL.ImageTk",
-    "secrets", "tls_utils"
+    "secrets", "tls_utils",
+    "file_transfer", "nic_scanner", "disk_scanner",
+    "verifier", "ip_config", "dhcp_server"
 )
 
 $CollectData = @("cryptography", "ttkbootstrap")
@@ -117,7 +119,11 @@ foreach ($d in @($buildDir, $distDir)) {
         Write-Yellow "  已清理: $d"
     }
 }
-# spec 文件由 PyInstaller 自动重新生成 (含 --noupx 参数), 无需手动删除
+# spec 文件也必须删除, 否则 PyInstaller 会使用旧 spec 并忽略所有 --hidden-import 参数
+if (Test-Path -LiteralPath $specFile) {
+    Remove-Item -LiteralPath $specFile -Force -ErrorAction SilentlyContinue
+    Write-Yellow "  已清理: $specFile"
+}
 
 # ---- 执行构建 ----
 Write-Green ">> 开始 PyInstaller 打包..."
