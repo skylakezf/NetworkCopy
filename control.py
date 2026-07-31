@@ -78,6 +78,9 @@ class Controller:
         self._verify_thread = None
         self._stop_verify = False  # 新传输开始时通知旧校验停止
 
+        # ---- 传输取消 ----
+        self._stop_transfer = False  # 窗口关闭时通知传输线程停止
+
         # ---- 网络/鉴权状态 (避免未选网卡直接点按钮时 AttributeError) ----
         self._use_dhcp = False
         self._source_ip = ""
@@ -1183,16 +1186,44 @@ class Controller:
             self.ui.after(0, lambda: self._log(f"连接源设备: {source_ip}:{TRANSFER_PORT}"))
             self.ui.after(0, lambda: self.ui.tk_button_mqfzl35t.config(text="接收中..."))
 
+            # 速度追踪: [_last_bytes, _last_time] 可变列表用于跨闭包共享
+            _speed_tracker = [0, time.time()]
+
+            def _fmt_speed(byte_rate: float) -> str:
+                """字节/秒 → 人类可读速度字符串"""
+                if byte_rate < 1024:
+                    return f"{byte_rate:.0f} B/s"
+                elif byte_rate < 1024 * 1024:
+                    return f"{byte_rate / 1024:.1f} KB/s"
+                else:
+                    return f"{byte_rate / (1024 * 1024):.1f} MB/s"
+
             def _progress(files_done, total_files, bytes_done, total_bytes):
-                self.ui.after(0, lambda: self._set_status(
-                    f"正在传输... {files_done}/{total_files} 文件"
-                ))
+                now = time.time()
+                elapsed = now - _speed_tracker[1]
+                if elapsed >= 1.0 and bytes_done > _speed_tracker[0]:
+                    rate = (bytes_done - _speed_tracker[0]) / elapsed
+                    _speed_tracker[0] = bytes_done
+                    _speed_tracker[1] = now
+                    speed_str = _fmt_speed(rate)
+                else:
+                    speed_str = ""
+                status = f"正在传输... {files_done}/{total_files} 文件"
+                if speed_str:
+                    status += f"  ({speed_str})"
+                self.ui.after(0, lambda s=status: self._set_status(s))
                 # 总进度条: 优先按字节占比 (大文件传输时文件数不变但字节在涨,
                 # 仅按文件数会导致进度条长时间不动); 无总字节信息时退回按文件数
                 if total_bytes > 0:
                     self.ui.after(0, lambda: self._set_progress(bytes_done, total_bytes))
                 elif total_files > 0:
                     self.ui.after(0, lambda: self._set_progress(files_done, total_files))
+
+            def _check_stop():
+                """供 file_transfer.download_files 轮询, 窗口关闭时返回 'cancel'"""
+                if self._stop_transfer:
+                    return "cancel"
+                return None
 
             success, files, bytes_done, errors = download_files(
                 server_ip=source_ip,
@@ -1203,6 +1234,7 @@ class Controller:
                 partition_count=self._ntfs_partition_count,
                 auth_code=self._auth_code,
                 conflict_callback=self._resolve_conflicts,
+                stop_check=_check_stop,
             )
             self.ui.after(0, lambda: self._on_download_complete(success, files, bytes_done, errors))
 
@@ -1614,6 +1646,9 @@ class Controller:
         - 系统休眠策略恢复 (不再阻止锁屏/休眠)
         """
         self._log("[清理] 正在关闭所有后台进程...")
+
+        # 0. 通知传输线程停止 (最高优先级)
+        self._stop_transfer = True
 
         # 1. 停止校验线程
         if self._verify_thread and self._verify_thread.is_alive():

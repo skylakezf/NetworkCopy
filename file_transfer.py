@@ -49,10 +49,62 @@ TRANSFER_PORT = 9999
 CLIENT_SSL_CTX = tls_utils.make_client_ssl_context()
 
 # 需要跳过的文件夹
-SKIP_DIRS = {"AppData", "System Volume Information", "WeChat Files"}
+SKIP_DIRS = {
+    "AppData", "System Volume Information", "WeChat Files",
+    "Application Data",  # NTFS 符号链接/交接点, 递归会导致死循环
+}
 SKIP_PREFIXES = ("$",)  # $RECYCLE.BIN 等
+SKIP_FILE_SUFFIXES = (".tmp",)  # 跳过临时文件
+SKIP_FILE_PREFIXES = ("~$",)  # 跳过 Office 自动保存文件
 # 需要跳过的系统文件 (根目录级别)
 SKIP_FILES = {"pagefile.sys", "hiberfil.sys", "swapfile.sys", "DumpStack.log.tmp"}
+
+# 源端检测到的当前用户 (运行在 PE 下时 USERNAME 为 SYSTEM, 需从 C:\Users 推断)
+def _detect_source_user() -> str:
+    """在源设备上检测实际登录用户(非 PE SYSTEM 用户)。
+    策略: USERNAME 环境变量 -> C:/Users 非系统用户 -> expanduser('~')"""
+    username = os.environ.get("USERNAME", "")
+    if username and username.lower() not in (
+        "system", "administrator", "defaultuser0", "defaultuser",
+    ):
+        return username
+
+    # PE 回退: 从源盘 C:\Users 找最近活动的真实用户
+    users_root = r"C:\Users"
+    if os.path.isdir(users_root):
+        system_names = {
+            "Default", "Public", "All Users", "Default User",
+            "desktop.ini", "administrator",
+        }
+        best_user = ""
+        best_mtime = 0
+        for entry in os.listdir(users_root):
+            if entry in system_names:
+                continue
+            full = os.path.join(users_root, entry)
+            if not os.path.isdir(full):
+                continue
+            # 以 NTUSER.DAT 最近修改时间为准
+            ntuser = os.path.join(full, "NTUSER.DAT")
+            try:
+                nt_mtime = os.path.getmtime(ntuser)
+                if nt_mtime > best_mtime:
+                    best_mtime = nt_mtime
+                    best_user = entry
+            except OSError:
+                pass
+        if best_user:
+            return best_user
+
+    # 最后兜底: 尝试 expanduser('~')
+    try:
+        home = os.path.expanduser("~")
+        name = os.path.basename(home)
+        if name and name.lower() not in ("systemprofile", "system32", "windows"):
+            return name
+    except Exception:
+        pass
+    return ""
 
 
 # ===================== 文件服务器 (源设备) =====================
@@ -83,15 +135,16 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _parse_query(path: str):
-        """从请求路径解析 (path, params_dict)"""
+        """从请求路径解析 (path, params_dict)。
+        使用标准库 parse_qs 替代手写解析，正确处理 Unicode 与边缘编码场景。"""
         p = path.split("?")[0]
         params = {}
         if "?" in path:
             qs = path.split("?", 1)[1]
-            for pair in qs.split("&"):
-                if "=" in pair:
-                    k, v = pair.split("=", 1)
-                    params[k] = urllib.parse.unquote(v)
+            parsed = urllib.parse.parse_qs(qs, keep_blank_values=True)
+            for k, vlist in parsed.items():
+                if vlist:
+                    params[k] = vlist[0]
         return p, params
 
     def log_message(self, format, *args):
@@ -114,7 +167,14 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
     def _send_file(self, filepath, file_info=""):
         if not os.path.isfile(filepath):
-            self._send_json({"error": "文件不存在"}, 404)
+            if FileServerHandler.log_callback:
+                FileServerHandler.log_callback(
+                    f"[诊断] _send_file 文件不存在: {filepath}")
+            self._send_json({
+                "error": "文件不存在",
+                "path": filepath,
+                "info": file_info,
+            }, 404)
             return
 
         file_size = os.path.getsize(filepath)
@@ -199,19 +259,40 @@ class FileServerHandler(BaseHTTPRequestHandler):
         files = []
         dirs_info = []
         total_size = 0
+        current_user = _detect_source_user()
         try:
             for root, dirs, filenames in os.walk(base):
-                # 过滤: 跳过 AppData / $前缀文件夹 / System Volume Information
-                dirs[:] = [
-                    d for d in dirs
-                    if not (
-                        d in SKIP_DIRS
-                        or d.startswith(SKIP_PREFIXES)
-                    )
-                ]
-                # 额外: 跳过路径中包含 AppData 的文件 (AppData 下的内容)
                 rel_root = os.path.relpath(root, base)
-                if "AppData" in rel_root.replace("\\", "/").split("/"):
+                rel_parts = rel_root.replace("\\", "/").split("/")
+
+                # 过滤: 跳过 skip 目录 / $前缀 / 其他用户的子目录
+                def _keep_dir(d):
+                    if d in SKIP_DIRS or d.startswith(SKIP_PREFIXES):
+                        return False
+                    # 根目录跳过程序安装目录
+                    if rel_parts == ["."]:
+                        if d.lower() in (
+                            "program files", "program files (x86)",
+                            "programdata",
+                        ):
+                            return False
+                    # 在 User/Users 第一层: 只保留当前用户的子目录
+                    if rel_parts == ["."]:
+                        if d.lower() in ("users", "user") and current_user:
+                            pass  # 进入 Users/User 后按子名过滤
+                    elif (
+                        len(rel_parts) == 1
+                        and rel_parts[0].lower() in ("users", "user")
+                        and current_user
+                        and d.lower() != current_user.lower()
+                    ):
+                        return False
+                    return True
+
+                dirs[:] = [d for d in dirs if _keep_dir(d)]
+
+                # 额外: 跳过路径中包含 AppData 的文件 (AppData 下的内容)
+                if "AppData" in rel_parts:
                     continue
 
                 # 收集目录的原始修改时间（跳过根目录自身）
@@ -226,6 +307,12 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     })
 
                 for fname in filenames:
+                    # 跳过临时文件 (.tmp 等)
+                    if fname.lower().endswith(SKIP_FILE_SUFFIXES):
+                        continue
+                    # 跳过 Office 自动保存文件 (~$ 前缀)
+                    if fname.startswith(SKIP_FILE_PREFIXES):
+                        continue
                     # 跳过系统文件 (仅根目录)
                     if os.path.normpath(root) == os.path.normpath(base):
                         if fname in SKIP_FILES:
@@ -252,6 +339,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 "total_size": total_size,
                 "files": files,
                 "dirs": dirs_info,
+                "current_user": current_user,
             })
         except Exception as e:
             self._send_json({"error": str(e)}, 500)
@@ -320,13 +408,20 @@ class FileServerHandler(BaseHTTPRequestHandler):
         total_body_size = 4  # 开头 4 字节存文件数量
         for rel_path in paths:
             full_path = self._resolve_path(partition, rel_path)
-            if not full_path or not os.path.isfile(full_path):
-                continue
-            try:
-                with open(full_path, "rb") as f:
-                    data = f.read()
-            except OSError:
-                continue
+            data = b""
+            if full_path and os.path.isfile(full_path):
+                try:
+                    with open(full_path, "rb") as f:
+                        data = f.read()
+                except OSError as e:
+                    data = b""  # 读取失败，发送空占位
+                    if FileServerHandler.log_callback:
+                        FileServerHandler.log_callback(
+                            f"[诊断] 批次文件读取失败: {rel_path} → {full_path} ({e})")
+            elif FileServerHandler.log_callback:
+                FileServerHandler.log_callback(
+                    f"[诊断] 批次文件不存在/路径无效: {rel_path} → {full_path}")
+            # 无论成功与否都加入响应: 非空 data 正常下发, 空 data 代表服务端跳过
             path_bytes = rel_path.encode("utf-8")
             file_entries.append((path_bytes, data))
             total_body_size += 4 + len(path_bytes) + 8 + len(data)
@@ -710,9 +805,7 @@ def _download_single_file(
 
         if resp.status != 200:
             body = resp.read().decode("utf-8-sig", errors="replace")
-            log(f"  [X] 下载失败 HTTP {resp.status}: {rel_path} - {body}")
-            with stats_lock:
-                errors.append(f"分区 {normal_partition}: {rel_path} HTTP {resp.status}")
+            log(f"  [!] 跳过(HTTP {resp.status}): {rel_path} - {body}")
             return
 
         # 大文件: 记录开始传输
@@ -736,9 +829,7 @@ def _download_single_file(
         # 验证大小
         actual_size = os.path.getsize(tmp_path)
         if actual_size != fsize:
-            log(f"  [!] 大小不匹配: {rel_path} (期望{fsize}, 实际{actual_size})")
-            with stats_lock:
-                errors.append(f"分区 {normal_partition}: {rel_path} 大小不匹配")
+            log(f"  [!] 大小不匹配(跳过): {rel_path} (期望{fsize}, 实际{actual_size})")
             try:
                 os.remove(tmp_path)
             except OSError:
@@ -751,9 +842,7 @@ def _download_single_file(
                 os.remove(target_path)
             os.rename(tmp_path, target_path)
         except OSError as e:
-            log(f"  [!] 重命名失败: {rel_path} - {e}")
-            with stats_lock:
-                errors.append(f"分区 {normal_partition}: {rel_path} 重命名失败")
+            log(f"  [!] 重命名失败(跳过): {rel_path} - {e}")
             return
 
         # 还原原始修改时间 (HTTP 传输默认会变为传输时间)
@@ -774,16 +863,12 @@ def _download_single_file(
             BrokenPipeError) as e:
         _invalidate_thread_connection(host, port)
         _handle_tmp_failure(log, tmp_path, rel_path)
-        log(f"  [X] 下载失败(连接): {rel_path} - {e}")
-        with stats_lock:
-            errors.append(f"分区 {normal_partition}: {rel_path} 下载失败 - {e}")
+        log(f"  [!] 跳过(连接): {rel_path} - {e}")
         raise  # 重新抛出连接错误, 供上层重试逻辑处理
 
     except Exception as e:
         _handle_tmp_failure(log, tmp_path, rel_path)
-        log(f"  [X] 下载失败: {rel_path} - {e}")
-        with stats_lock:
-            errors.append(f"分区 {normal_partition}: {rel_path} 下载失败 - {e}")
+        log(f"  [!] 跳过(下载): {rel_path} - {e}")
 
 
 def _download_single_file_with_retry(
@@ -829,7 +914,7 @@ def _download_single_file_with_retry(
             break
 
     if last_error and log_callback:
-        log_callback(f"  [X] 下载失败(已重试{max_retries}次): {rel_path} - {last_error}")
+        log_callback(f"  [!] 跳过(已重试{max_retries}次): {rel_path} - {last_error}")
 
 
 def _handle_tmp_failure(log, tmp_path: str, rel_path: str):
@@ -914,21 +999,13 @@ def _download_batch(
 
         if resp.status != 200:
             body_text = resp.read().decode("utf-8-sig", errors="replace")
-            log(f"  [X] 批次下载失败 HTTP {resp.status}: {body_text}")
-            with stats_lock:
-                for rel_path, fsize, target_path, _mt in remaining_tasks:
-                    errors.append(
-                        f"分区 {normal_partition}: {rel_path} 批次HTTP {resp.status}"
-                    )
+            log(f"  [!] 批次跳过(HTTP {resp.status}): {body_text}")
             return
 
         # 解析二进制响应
         raw = resp.read()
         if len(raw) < 4:
-            log(f"  [X] 批次响应过短: {len(raw)} 字节")
-            with stats_lock:
-                for rel_path, fsize, target_path, _mt in remaining_tasks:
-                    errors.append(f"分区 {normal_partition}: {rel_path} 批次响应异常")
+            log(f"  [!] 批次跳过(响应过短): {len(raw)} 字节")
             return
 
         pos = 0
@@ -975,23 +1052,24 @@ def _download_batch(
                 log(f"  [_] 批次中未知文件: {rel_path}，跳过")
                 continue
 
+            # 服务端主动跳过 (空占位 data_len=0)
+            if data_len == 0:
+                log(f"  [!] 服务端跳过: {rel_path} (无法读取)")
+                continue
+
             # 写入 .tmp 文件
             tmp_path = target_path + ".tmp"
             try:
                 with open(tmp_path, "wb") as f:
                     f.write(file_data)
             except OSError as e:
-                log(f"  [X] 写入失败: {rel_path} - {e}")
-                with stats_lock:
-                    errors.append(f"分区 {normal_partition}: {rel_path} 写入失败")
+                log(f"  [!] 跳过(写入失败): {rel_path} - {e}")
                 continue
 
             # 大小校验
             actual_size = os.path.getsize(tmp_path)
             if actual_size != exp_size:
-                log(f"  [!] 批次文件大小不匹配: {rel_path} (期望{exp_size}, 实际{actual_size})")
-                with stats_lock:
-                    errors.append(f"分区 {normal_partition}: {rel_path} 大小不匹配")
+                log(f"  [!] 跳过(大小不匹配): {rel_path} (期望{exp_size}, 实际{actual_size})")
                 try:
                     os.remove(tmp_path)
                 except OSError:
@@ -1004,9 +1082,7 @@ def _download_batch(
                     os.remove(target_path)
                 os.rename(tmp_path, target_path)
             except OSError as e:
-                log(f"  [!] 重命名失败: {rel_path} - {e}")
-                with stats_lock:
-                    errors.append(f"分区 {normal_partition}: {rel_path} 重命名失败")
+                log(f"  [!] 重命名失败(跳过): {rel_path} - {e}")
                 continue
 
             # 还原原始修改时间
@@ -1021,31 +1097,23 @@ def _download_batch(
                 completed_bytes_list[0] += actual_size
             received_files += 1
 
-        # 检查是否有本批次请求了但未返回的文件
+        # 检查是否有本批次请求了但未返回的文件 (安全兜底, 正常不应触发)
         for bp, bsize, btp, _bt in remaining_tasks:
             if bp in returned_paths:
                 continue
             if os.path.isfile(btp):
                 continue  # 文件可能在之前已存在
-            log(f"  [X] 批次缺失: {bp} (服务端未返回)")
-            with stats_lock:
-                errors.append(f"分区 {normal_partition}: {bp} 批次缺失")
+            log(f"  [!] 批次缺失: {bp} (服务端未返回)")
 
     except (ConnectionError, TimeoutError, OSError,
             ConnectionAbortedError, ConnectionResetError,
             BrokenPipeError) as e:
         _invalidate_thread_connection(host, port)
-        log(f"  [X] 批次下载失败(连接): {e}")
-        with stats_lock:
-            for rel_path, fsize, target_path, _mt in remaining_tasks:
-                errors.append(f"分区 {normal_partition}: {rel_path} 批次连接失败")
+        log(f"  [!] 批次跳过(连接): {e}")
         raise  # 重新抛出连接错误, 供上层重试逻辑处理
 
     except Exception as e:
-        log(f"  [X] 批次下载失败: {e}")
-        with stats_lock:
-            for rel_path, fsize, target_path, _mt in remaining_tasks:
-                errors.append(f"分区 {normal_partition}: {rel_path} 批次异常")
+        log(f"  [!] 批次跳过(异常): {e}")
 
 
 def _download_batch_with_retry(
@@ -1164,6 +1232,19 @@ def _download_files_inner(
         if progress_callback:
             progress_callback(completed_files[0], total_files, completed_bytes[0], total_bytes)
 
+    def _apply_dir_mtime(full_dir, drive_root, mtimes):
+        """尝试将目录的修改时间还原为源端原始时间"""
+        try:
+            rel_dir = os.path.relpath(full_dir, drive_root).replace("\\", "/")
+            d_mtime = mtimes.get(rel_dir, 0)
+            if d_mtime:
+                os.utime(full_dir, (d_mtime, d_mtime))
+            else:
+                # 目录在源端 mtimes 映射中不存在 (可能为 0 或未被收集)
+                pass
+        except OSError as e:
+            log(f"  [!] 目录时间戳还原失败: {full_dir} - {e}")
+
     # 先 ping 确认服务器在线
     log(f"正在连接源设备 {base_url} (HTTPS)...")
     log(f"[诊断] 目标地址 base_url={base_url}, 验证码已携带={'是' if pwd else '否'}")
@@ -1232,17 +1313,25 @@ def _download_files_inner(
         partition_dir_mtimes[normal_partition] = {
             d["path"]: d["mtime"] for d in dirs_data
         }
+        source_user = list_data.get("current_user", "")
 
-        # 2 分区模式: D 盘只下载 User 文件夹
+        # 2 分区模式: D 盘只下载当前用户的 User 文件夹,
+        # 并保留 D 盘根目录下不属于 User/ 的其他数据 (如 GTMC_User_Profiles 等)
         if partition_count == 2 and normal_partition == "D":
+            user_prefix = f"User/{source_user}/" if source_user else "User/"
             filtered = []
             filtered_size = 0
             for f_info in files:
                 rel = f_info["path"]
-                if rel.replace("\\", "/").startswith("User/"):
+                norm = rel.replace("\\", "/")
+                # 保留当前用户目录 + 不在 User/ 下的其他根目录内容
+                if norm.startswith(user_prefix) or not norm.startswith("User/"):
                     filtered.append(f_info)
                     filtered_size += f_info["size"]
-            log(f"{normal_partition} 盘: {len(filtered)} 个文件 (仅 User), 共 {_fmt_size(filtered_size)}")
+            if source_user:
+                log(f"{normal_partition} 盘: {len(filtered)} 个文件 (仅 User/{source_user}), 共 {_fmt_size(filtered_size)}")
+            else:
+                log(f"{normal_partition} 盘: {len(filtered)} 个文件 (仅 User), 共 {_fmt_size(filtered_size)}")
             files = filtered
             partition_total = filtered_size
         else:
@@ -1462,16 +1551,25 @@ def _download_files_inner(
                     _skipped_dirs.add(d)
                     continue
             # 还原目录原始修改时间
-            try:
-                rel_dir = os.path.relpath(d, target_drive).replace("\\", "/")
-                d_mtime = dir_mtimes.get(rel_dir, 0)
-                if d_mtime:
-                    os.utime(d, (d_mtime, d_mtime))
-            except OSError:
-                pass
+            _apply_dir_mtime(d, target_drive, dir_mtimes)
 
         for d in _skipped_dirs:
             _created_dirs.discard(d)
+
+        # 第二遍: 还原所有源端存在、目标端也已存在的目录的 mtime
+        # (包含 os.makedirs 隐式创建的中间父目录、以及不含文件的纯目录)
+        for dir_path, d_mtime in dir_mtimes.items():
+            full_dir = os.path.normpath(
+                os.path.join(target_drive, dir_path.replace("/", "\\"))
+            )
+            if full_dir in _created_dirs:
+                continue  # 已在上面处理过
+            if not os.path.isdir(full_dir):
+                continue  # 目标端不存在，不创建空目录
+            if not os.access(full_dir, os.W_OK):
+                log(f"  [!] 目录无写入权限，跳过时间戳还原: {full_dir}")
+                continue
+            _apply_dir_mtime(full_dir, target_drive, dir_mtimes)
 
         # 分区内: 按大小分组 (小文件批次 / 大文件单独)
         partition_batches = []   # [batch_tasks, ...]
