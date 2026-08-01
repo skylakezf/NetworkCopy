@@ -1,6 +1,9 @@
 @echo off
 setlocal enabledelayedexpansion
 
+:: æ£€æµ‹ NetworkCopy è°ƒç”¨, è·³è¿‡äº¤äº’å¼å¼¹çª—
+if not "%NETWORKCOPY_HEADLESS%"=="" set "HEADLESS=1"
+
 if not defined APPL_ROOT set "APPL_ROOT=F:\Appl"
 set "base=%APPL_ROOT%"
 if not exist "%base%" mkdir "%base%"
@@ -11,122 +14,130 @@ for /f "tokens=1-3 delims=/- " %%a in ("%date%") do (
 set "out=%base%\%folder%"
 if not exist "%out%" mkdir "%out%"
 
-echo ======== ÅäÖÃµ¼³ö¿ªÊ¼ ========
-echo Êä³öÄ¿Â¼: %out%
+echo ======== é…ç½®å¯¼å‡ºå¼€å§‹ ========
+echo è¾“å‡ºç›®å½•: %out%
 echo.
 
-rem === Warning Dialog ===
-
-powershell -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('³ÌĞòÔËĞĞÆÚ¼äÇë²»Òª²Ù×÷µçÄÔ¡£', 'ÌáÊ¾', 'OK', 'information')"
+rem === Warning Dialog (headless æ¨¡å¼è·³è¿‡) ===
+if not defined HEADLESS powershell -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('ç¨‹åºè¿è¡ŒæœŸé—´è¯·ä¸è¦æ“ä½œç”µè„‘ã€‚', 'æç¤º', 'OK', 'information')"
 
 rem === Check regedit access ===
-echo ¼ì²é×¢²á±í·ÃÎÊÈ¨ÏŞ...
+echo æ£€æŸ¥æ³¨å†Œè¡¨è®¿é—®æƒé™...
 reg query "HKEY_CURRENT_USER" >nul 2>&1
 if %errorlevel% neq 0 (
-    powershell -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('ÎŞ·¨·ÃÎÊ×¢²á±í£¬Îª´ËÕË»§Ìí¼Ó¹ÜÀíÔ±È¨ÏŞºó²ÅÄÜ¼ÌĞø¡£', 'È¨ÏŞ²»×ã', 'OK', 'Error')"
-    exit /b 1
+    if defined HEADLESS (
+        echo é”™è¯¯: æ— æ³•è®¿é—®æ³¨å†Œè¡¨, è¯·ä»¥ç®¡ç†å‘˜æƒé™è¿è¡Œ
+        exit /b 1
+    ) else (
+        powershell -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('æ— æ³•è®¿é—®æ³¨å†Œè¡¨ï¼Œä¸ºæ­¤è´¦æˆ·æ·»åŠ ç®¡ç†å‘˜æƒé™åæ‰èƒ½ç»§ç»­ã€‚', 'æƒé™ä¸è¶³', 'OK', 'Error')"
+        exit /b 1
+    )
 )
 
 rem === Outlook Rules ===
-echo [1/9] µ¼³ö Outlook ¹æÔò...
+echo [1/9] å¯¼å‡º Outlook è§„åˆ™...
 reg export "HKEY_CURRENT_USER\Software\Microsoft\Office\14.0\Outlook\Rules" "%out%\Outlook_Rules.reg" /y
 
 rem === Outlook Profile ===
-echo [2/9] µ¼³ö Outlook ÅäÖÃÎÄ¼ş...
+echo [2/9] å¯¼å‡º Outlook é…ç½®æ–‡ä»¶...
 reg export "HKEY_CURRENT_USER\Software\Microsoft\Windows NT\CurrentVersion\Windows Messaging Subsystem\Profiles" "%out%\Outlook_Profiles.reg" /y
 
 rem === Outlook AutoArchive ===
-echo [3/9] µ¼³ö Outlook ×Ô¶¯´æµµÉèÖÃ...
+echo [3/9] å¯¼å‡º Outlook è‡ªåŠ¨å­˜æ¡£è®¾ç½®...
 reg export "HKEY_CURRENT_USER\Software\Microsoft\Office\14.0\Outlook\Preferences" "%out%\Outlook_AutoArchive.reg" /y
 
 rem === Chrome Data ===
-echo [4/9] µ¼³ö Chrome ÊéÇ©
+echo [4/9] å¯¼å‡º Chrome ä¹¦ç­¾
 set "chrome=%LOCALAPPDATA%\Google\Chrome\User Data\Default"
 if exist "%chrome%\Bookmarks" copy "%chrome%\Bookmarks" "%out%\Chrome_Bookmarks.json" /y
 if exist "%chrome%\Login Data" copy "%chrome%\Login Data" "%out%\Chrome_LoginData.sqlite" /y
 
 rem === Edge Data ===
-echo [5/9] µ¼³ö Edge ÊéÇ©
+echo [5/9] å¯¼å‡º Edge ä¹¦ç­¾
 set "edge=%LOCALAPPDATA%\Microsoft\Edge\User Data\Default"
 if exist "%edge%\Bookmarks" copy "%edge%\Bookmarks" "%out%\Edge_Bookmarks.json" /y
 if exist "%edge%\Login Data" copy "%edge%\Login Data" "%out%\Edge_LoginData.sqlite" /y
 
 rem === Installed Printers ===
-echo [6/9] µ¼³ö´òÓ¡»úÁĞ±í...
+echo [6/9] å¯¼å‡ºæ‰“å°æœºåˆ—è¡¨...
 wmic printer get Name,DriverName /format:csv > "%out%\Printers.csv"
 
 rem === Installed Input Methods ===
-echo [7/9] µ¼³öÊäÈë·¨ÉèÖÃ...
+echo [7/9] å¯¼å‡ºè¾“å…¥æ³•è®¾ç½®...
 reg export "HKEY_CURRENT_USER\Keyboard Layout\Preload" "%out%\InputMethod.reg" /y
 
 rem === Network Adapters IP ===
-echo [8/9] µ¼³öÍøÂçÊÊÅäÆ÷ IP ÅäÖÃ...
+echo [8/9] å¯¼å‡ºç½‘ç»œé€‚é…å™¨ IP é…ç½®...
 netsh interface ip show config > "%out%\Net_IP.txt"
 
 rem === Installed Programs ===
-echo [9/9] µ¼³öÒÑ°²×°³ÌĞòÁĞ±í...
+echo [9/9] å¯¼å‡ºå·²å®‰è£…ç¨‹åºåˆ—è¡¨...
 powershell -ExecutionPolicy Bypass -File "%~dp0Export-Programs.ps1" "%out%"
 
 @REM rem === Compare Programs ===
 @REM "%~dp0python-3.12.4-embed-amd64\python-3.12.4-embed-amd64\python.exe" "%~dp0Compare-Programs.py"
-rem === Display Desktop ===
-echo.
-echo ÏÔÊ¾×ÀÃæ...
-> "%temp%\showdesktop.vbs" echo Set objShell = CreateObject("Shell.Application")
->> "%temp%\showdesktop.vbs" echo objShell.MinimizeAll
-cscript //nologo "%temp%\showdesktop.vbs"
-timeout /t 2 /nobreak >nul
-del /f /q "%temp%\showdesktop.vbs" 2>nul
+rem === Display Desktop (headless æ¨¡å¼è·³è¿‡, é¿å…æœ€å°åŒ–ä¸»ç¨‹åºçª—å£) ===
+if not defined HEADLESS (
+    echo.
+    echo æ˜¾ç¤ºæ¡Œé¢...
+    > "%temp%\showdesktop.vbs" echo Set objShell = CreateObject("Shell.Application")
+    >> "%temp%\showdesktop.vbs" echo objShell.MinimizeAll
+    cscript //nologo "%temp%\showdesktop.vbs"
+    timeout /t 2 /nobreak >nul
+    del /f /q "%temp%\showdesktop.vbs" 2>nul
+)
 
 rem === Get Screen Resolution (DPI-aware) ===
-echo »ñÈ¡ÆÁÄ»·Ö±æÂÊ...
+echo è·å–å±å¹•åˆ†è¾¨ç‡...
 powershell -ExecutionPolicy Bypass -File "%~dp0Get-ScreenDPI.ps1" -OutputPath "%out%" -ResolutionOnly
 
 rem === Capture Desktop Screenshot (DPI-aware) ===
-echo ½ØÈ¡×ÀÃæ½ØÍ¼...
+echo æˆªå–æ¡Œé¢æˆªå›¾...
 powershell -ExecutionPolicy Bypass -File "%~dp0Get-ScreenDPI.ps1" -OutputPath "%out%" -FileName "screenshot.png"
 
 rem === Run Ivanti Endpoint Security ===
-echo ÔËĞĞ Ivanti Endpoint Security...
+echo è¿è¡Œ Ivanti Endpoint Security...
 if exist "C:\Program Files (x86)\LANDesk\LDClient\HIPS\EPSUI.exe" (
     start "Ivanti Endpoint Security" "C:\Program Files (x86)\LANDesk\LDClient\HIPS\EPSUI.exe"
     timeout /t 5 /nobreak >nul
 
-    echo ½ØÈ¡ U ÅÌÈ¨ÏŞ½ØÍ¼...
+    echo æˆªå– U ç›˜æƒé™æˆªå›¾...
     powershell -ExecutionPolicy Bypass -File "%~dp0Get-ScreenDPI.ps1" -OutputPath "%out%" -FileName "permissions.png"
 
 ) else (
-    echo ¾¯¸æ: Ivanti Endpoint Security Î´ÕÒµ½
+    echo è­¦å‘Š: Ivanti Endpoint Security æœªæ‰¾åˆ°
 )
 
 rem === Capture Outlook PST Data Files & Programs and Features ===
-echo ÔËĞĞ PST ¼°³ÌĞòÁĞ±í½ØÍ¼...
+echo è¿è¡Œ PST åŠç¨‹åºåˆ—è¡¨æˆªå›¾...
 powershell -ExecutionPolicy Bypass -File "%~dp0PST_GET_IMAGE.ps1" -OutputPath "%out%"
-echo Ô¤¹ÀÇ¨ÒÆºóµÄ´ÅÅÌÕ¼ÓÃ¿Õ¼ä
+echo é¢„ä¼°è¿ç§»åçš„ç£ç›˜å ç”¨ç©ºé—´
 powershell -ExecutionPolicy Bypass -File "%~dp0Calc-AllocationUnitMigration.ps1" -Estimate
 
-@REM rem === Zip output folder ===
-@REM echo ´ò°üÊä³öÎÄ¼ş...
-powershell -Command "Compress-Archive -Path '%out%\*' -DestinationPath '%base%\%COMPUTERNAME%_%folder%.zip' -Force"
-if %errorlevel% equ 0 (
-    @REM echo Ñ¹Ëõ°üÒÑÉú³É: %base%\%COMPUTERNAME%_%folder%.zip
+@REM rem === Zip output folder (headless æ¨¡å¼è·³è¿‡å‹ç¼©å’Œä¸Šä¼ ) ===
+if not defined HEADLESS (
+    @REM echo æ‰“åŒ…è¾“å‡ºæ–‡ä»¶...
+    powershell -Command "Compress-Archive -Path '%out%\*' -DestinationPath '%base%\%COMPUTERNAME%_%folder%.zip' -Force"
+    if %errorlevel% equ 0 (
+        @REM echo å‹ç¼©åŒ…å·²ç”Ÿæˆ: %base%\%COMPUTERNAME%_%folder%.zip
 
-    rem === Upload zip to Profile Server ===
-    @REM echo ÉÏ´«Ñ¹Ëõ°üµ½ Profile ·şÎñÆ÷...
-    curl -s -X POST "http://ipcheck.gtmcl.com:3000/api/upload" -F "file=@%base%\%COMPUTERNAME%_%folder%.zip"
-    if %errorlevel% equ 0 (echo successful) else (echo fail)
-) else (
-    @REM echo ¾¯¸æ: Ñ¹Ëõ´ò°üÊ§°Ü£¬µ«ËùÓĞÎÄ¼şÒÑ±£´æÖÁ %out%
+        rem === Upload zip to Profile Server ===
+        @REM echo ä¸Šä¼ å‹ç¼©åŒ…åˆ° Profile æœåŠ¡å™¨...
+        curl -s -X POST "http://ipcheck.gtmcl.com:3000/api/upload" -F "file=@%base%\%COMPUTERNAME%_%folder%.zip"
+        if %errorlevel% equ 0 (echo successful) else (echo fail)
+    ) else (
+        @REM echo è­¦å‘Š: å‹ç¼©æ‰“åŒ…å¤±è´¥ï¼Œä½†æ‰€æœ‰æ–‡ä»¶å·²ä¿å­˜è‡³ %out%
+    )
 )
 rem === Write systemconfig.ini ===
-echo Ğ´ÈëÏµÍ³ÅäÖÃÎÄ¼ş...
+echo å†™å…¥ç³»ç»Ÿé…ç½®æ–‡ä»¶...
 (
     echo [ExportInfo]
     echo LastExportPath=%out%
     echo LastExportTime=%date% %time%
 ) > "F:\systemconfig.ini"
 
-echo ======== ÅäÖÃµ¼³öÍê³É ========
-powershell -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('ÅäÖÃµ¼³öÒÑÍê³É¡£', 'Íê³É', 'OK', 'Information')"
+echo ======== é…ç½®å¯¼å‡ºå®Œæˆ ========
+if not defined HEADLESS powershell -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('é…ç½®å¯¼å‡ºå·²å®Œæˆã€‚', 'å®Œæˆ', 'OK', 'Information')"
 
 endlocal

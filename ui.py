@@ -38,7 +38,7 @@ class WinGUI(ttk.Window):
         self._auth_vcmd = (self.register(self._auth_validate), "%P")
         self._build_layout()
         self._step = 0
-        self._total_steps = 6  # 0=角色 1=网卡 2=磁盘 3=连接 4=传输 5=校验
+        self._total_steps = 7  # 0=角色 1=网卡 2=磁盘 3=连接 4=传输 5=导入配置 6=校验
         self._device_type = None  # "source" or "target"
         self._role_display = "未选择"
 
@@ -99,7 +99,8 @@ class WinGUI(ttk.Window):
         self._build_step2_disk()
         self._build_step3_connect()
         self._build_step4_transfer()
-        self._build_step5_verify()
+        self._build_step5_config_import()
+        self._build_step6_verify()
 
         # 初始显示步骤 0
         self._show_step(0)
@@ -122,7 +123,7 @@ class WinGUI(ttk.Window):
             ("1", "选择设备类型", "旧设备 (发送方) 或新设备 (接收方)"),
             ("2", "高级设置", "磁盘选择 · 分区映射 · IP 配置"),
             ("3", "连接并开始传输", "启动服务并输入验证码"),
-            ("4", "传输 & 数据校验", "文件传输进度与完整性校验"),
+            ("4", "传输 & 数据校验", "文件传输 · 配置导入 · 完整性校验"),
         ]
         for num, title, desc in steps:
             item = self._build_step_item(side, num, title, desc)
@@ -162,7 +163,7 @@ class WinGUI(ttk.Window):
         }
 
     def _update_step_indicator(self, current: int):
-        map_ui_to_side = {0: 0, 1: 0, 2: 1, 3: 2, 4: 3, 5: 3}
+        map_ui_to_side = {0: 0, 1: 0, 2: 1, 3: 2, 4: 3, 5: 3, 6: 3}
         side_current = map_ui_to_side.get(current, 0)
 
         desc_map = {
@@ -171,7 +172,8 @@ class WinGUI(ttk.Window):
             2: ("高级设置 — 磁盘 / 分区 / IP", "确认磁盘和分区映射，查看网络配置"),
             3: ("准备连接", "启动服务，输入验证码并开始传输"),
             4: ("传输进度", "文件正在传输中..."),
-            5: ("数据校验", "校验已传输文件的完整性"),
+            5: ("导入系统配置", "将旧设备的配置导入新设备"),
+            6: ("数据校验", "校验已传输文件的完整性"),
         }
 
         for i, item in enumerate(self._step_items):
@@ -272,15 +274,20 @@ class WinGUI(ttk.Window):
         # 根据步骤设置「下一步」按钮默认状态
         transfer_done = getattr(getattr(self, 'ctl', None), '_transfer_done', False)
         is_target = getattr(getattr(self, 'ctl', None), '_device_type', '') == "目标设备"
-        if step >= self._total_steps - 1:
+        if step >= self._total_steps - 1:  # step 6 (校验) 是最后一步
             self.set_button_next("disabled")
         elif step == 3:
             self.set_button_next("disabled")
         elif step == 4:
-            if transfer_done and is_target:
-                self.set_button_next("normal", text="校验文件 >")
+            if transfer_done:
+                if is_target:
+                    self.set_button_next("normal", text="导入配置 >")  # → step 5
+                else:
+                    self.set_button_next("normal", text="校验文件 >")  # → step 6 (跳过导入)
             else:
                 self.set_button_next("disabled")
+        elif step == 5:
+            self.set_button_next("normal", text="校验文件 >")
         else:
             # step 0/1/2 保持现有逻辑不变, 由 controller 回调进一步控制
             pass
@@ -406,6 +413,41 @@ class WinGUI(ttk.Window):
                                              fg=C_TEXT_SEC, bg=C_WHITE,
                                              wraplength=700, justify=LEFT)
         self.tk_label_nic_detail.pack(fill=X, pady=(0, 12))
+
+        # 导出配置区域 (按钮 + 日志, 仅发送端可见)
+        self._export_frame = _tk.Frame(inner, bg=C_WHITE)
+
+        self.tk_button_export_config = ttk.Button(self._export_frame, text="导出系统配置",
+                                                   takefocus=False,
+                                                   bootstyle="info-outline", width=18)
+        self.tk_button_export_config.pack(fill=X, pady=(0, 10))
+
+        _tk.Frame(self._export_frame, height=1, bg=C_SEP).pack(fill=X, pady=(12, 6))
+
+        log_hdr_exp = _tk.Frame(self._export_frame, bg=C_WHITE)
+        log_hdr_exp.pack(fill=X, pady=(0, 2))
+        _tk.Label(log_hdr_exp, text="导出日志",
+                  font=("Microsoft YaHei UI", 9, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(side=LEFT)
+
+        self.tk_text_export_log = _tk.Text(self._export_frame, wrap=WORD,
+                                            font=("Consolas", 8),
+                                            bg=C_CONSOLE_BG, fg=C_CONSOLE_FG,
+                                            bd=1, relief=SOLID,
+                                            insertbackground=C_CONSOLE_FG,
+                                            selectbackground="#404040",
+                                            height=8)
+        self.tk_text_export_log.pack(fill=BOTH, expand=True)
+
+        scroll_exp = ttk.Scrollbar(self.tk_text_export_log, orient=VERTICAL,
+                                   bootstyle="dark-round")
+        scroll_exp.config(command=self.tk_text_export_log.yview)
+        self.tk_text_export_log.configure(yscrollcommand=scroll_exp.set)
+        self.tk_text_export_log.configure(state=DISABLED)
+
+        # 默认隐藏
+        self._export_frame.pack(fill=BOTH, expand=True)
+        self._export_frame.pack_forget()
 
         # 兼容旧控件 (隐藏)
         self.tk_select_box_mqg0hm2h = ttk.Combobox(page, state="readonly")
@@ -747,11 +789,98 @@ class WinGUI(ttk.Window):
         scroll.config(command=self.tk_text_mqg105ch.yview)
         self.tk_text_mqg105ch.configure(yscrollcommand=scroll.set)
 
-    # ==================== 步骤 5: 文件校验 ====================
+    # ==================== 步骤 5: 导入系统配置 ====================
 
-    def _build_step5_verify(self):
+    def _build_step5_config_import(self):
         page = _tk.Frame(self._content_frame, bg=C_WHITE)
         self._pages[5] = page
+
+        inner = _tk.Frame(page, bg=C_WHITE)
+        inner.pack(fill=BOTH, expand=True, padx=40, pady=20)
+
+        _tk.Label(inner, text="导入系统配置",
+                  font=("Microsoft YaHei UI", 14, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 4))
+
+        _tk.Label(inner, text="从旧设备导出的系统配置（收藏夹、Outlook 规则、输入法等）导入到新设备",
+                  font=("Microsoft YaHei UI", 9), fg=C_TEXT_SEC,
+                  wraplength=700, justify=LEFT, bg=C_WHITE).pack(anchor=W, pady=(0, 14))
+
+        # ---- 配置文件夹选择 ----
+        folder_section = _tk.Frame(inner, bg=C_SIDEBAR_BG, padx=14, pady=12)
+        folder_section.pack(fill=X, pady=(0, 10))
+
+        _tk.Label(folder_section, text="选择配置文件夹",
+                  font=("Microsoft YaHei UI", 9, "bold"),
+                  fg=C_TEXT, bg=C_SIDEBAR_BG).pack(anchor=W, pady=(0, 6))
+
+        folder_row = _tk.Frame(folder_section, bg=C_SIDEBAR_BG)
+        folder_row.pack(fill=X)
+
+        self.tk_combo_config_folder = ttk.Combobox(folder_row, state="readonly",
+                                                     font=("Microsoft YaHei UI", 9), width=50)
+        self.tk_combo_config_folder.pack(side=LEFT, padx=(0, 8))
+
+        self.tk_button_browse_config = ttk.Button(folder_row, text="浏览...", takefocus=False,
+                                                   width=10, bootstyle="secondary")
+        self.tk_button_browse_config.pack(side=LEFT)
+
+        self.tk_label_config_status = _tk.Label(folder_section, text="",
+                                                font=("Microsoft YaHei UI", 8),
+                                                fg=C_TEXT_SEC, bg=C_SIDEBAR_BG,
+                                                wraplength=680, justify=LEFT)
+        self.tk_label_config_status.pack(anchor=W, pady=(6, 0))
+
+        # ---- 操作按钮 ----
+        btn_row = _tk.Frame(inner, bg=C_WHITE)
+        btn_row.pack(fill=X, pady=(10, 12))
+
+        self.tk_button_import_config = ttk.Button(btn_row, text="导入配置", takefocus=False,
+                                                   bootstyle="success", width=16)
+        self.tk_button_import_config.pack(side=LEFT, padx=(0, 10))
+
+        self.tk_button_skip_import = ttk.Button(btn_row, text="跳过", takefocus=False,
+                                                 bootstyle="secondary-outline", width=10)
+        self.tk_button_skip_import.pack(side=LEFT)
+
+        self.tk_label_import_progress = _tk.Label(inner, text="",
+                                                   font=("Microsoft YaHei UI", 9),
+                                                   fg=C_TEXT_SEC, bg=C_WHITE,
+                                                   wraplength=700, justify=LEFT)
+        self.tk_label_import_progress.pack(anchor=W, pady=(0, 4))
+
+        self.tk_import_progress_bar = ttk.Progressbar(inner, mode="indeterminate",
+                                                       bootstyle="info")
+        # 初始隐藏
+        self.tk_import_progress_bar.pack(fill=X, pady=(2, 10))
+        self.tk_import_progress_bar.pack_forget()
+
+        # ---- 日志区域 ----
+        log_header = _tk.Frame(inner, bg=C_WHITE)
+        log_header.pack(fill=X, pady=(4, 2))
+        _tk.Label(log_header, text="导入日志",
+                  font=("Microsoft YaHei UI", 9, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(side=LEFT)
+
+        self.tk_text_import_log = _tk.Text(inner, wrap=WORD, font=("Consolas", 8),
+                                            bg=C_CONSOLE_BG, fg=C_CONSOLE_FG,
+                                            bd=1, relief=SOLID,
+                                            insertbackground=C_CONSOLE_FG,
+                                            selectbackground="#404040",
+                                            height=10)
+        self.tk_text_import_log.pack(fill=BOTH, expand=True)
+
+        scroll = ttk.Scrollbar(self.tk_text_import_log, orient=VERTICAL,
+                               bootstyle="dark-round")
+        scroll.config(command=self.tk_text_import_log.yview)
+        self.tk_text_import_log.configure(yscrollcommand=scroll.set)
+        self.tk_text_import_log.configure(state=DISABLED)
+
+    # ==================== 步骤 6: 文件校验 ====================
+
+    def _build_step6_verify(self):
+        page = _tk.Frame(self._content_frame, bg=C_WHITE)
+        self._pages[6] = page
 
         inner = _tk.Frame(page, bg=C_WHITE)
         inner.pack(fill=BOTH, expand=True, padx=40, pady=20)

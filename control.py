@@ -15,6 +15,7 @@ from file_transfer import FileServer, download_files, scan_source_device, TRANSF
 from verifier import run_verification
 from ip_config import SOURCE_IP, SUBNET_MASK  # 169.254.100.1 (目标设备自身 IP)
 import tls_utils
+import config_transfer
 DHCP_ASSIGNED_IP = "169.254.100.2"  # DHCP 分配给源设备的 IP
 
 
@@ -63,6 +64,9 @@ class Controller:
 
         # ---- 分区映射 {"D": "I:", "E": "J:", "F": "K:"} ----
         self._partition_map = {}
+
+        # ---- 配置导入 ----
+        self._config_folders = []
 
         # ---- 目标磁盘 NTFS 分区数 (2/3/4) ----
         self._ntfs_partition_count = 0
@@ -166,6 +170,16 @@ class Controller:
         # 校验按钮 (步骤 5)
         if hasattr(self.ui, 'tk_button_verify'):
             self.ui.tk_button_verify.config(command=self._on_verify_start)
+        # 导出系统配置按钮 (步骤 1, 发送端)
+        if hasattr(self.ui, 'tk_button_export_config'):
+            self.ui.tk_button_export_config.config(command=self._on_export_config)
+        # 导入配置页面按钮 (步骤 5)
+        if hasattr(self.ui, 'tk_button_import_config'):
+            self.ui.tk_button_import_config.config(command=self._on_import_config)
+        if hasattr(self.ui, 'tk_button_skip_import'):
+            self.ui.tk_button_skip_import.config(command=self._on_skip_import)
+        if hasattr(self.ui, 'tk_button_browse_config'):
+            self.ui.tk_button_browse_config.config(command=self._on_browse_config_folder)
         # 发现设备列表
         if hasattr(self.ui, 'tk_select_box_discover'):
             self.ui.tk_select_box_discover.bind("<<ComboboxSelected>>", self._on_discover_selected)
@@ -220,11 +234,17 @@ class Controller:
             self.ui.show_src_connect()
             self.ui.hide_discover()
             self.ui.hide_manual_ip()
+            # 显示导出配置区域
+            if hasattr(self.ui, '_export_frame'):
+                self.ui._export_frame.pack(fill=tk.BOTH, expand=True)
         else:
             self.ui.show_dhcp()
             self.ui.show_tgt_connect()
             self.ui.show_discover()
             self.ui.show_manual_ip()
+            # 隐藏导出配置区域
+            if hasattr(self.ui, '_export_frame'):
+                self.ui._export_frame.pack_forget()
 
         # 切换到网卡选择步骤
         self.ui.go_step(1)
@@ -246,7 +266,12 @@ class Controller:
 
     def _on_prev_step(self):
         """上一步"""
-        new_step = max(0, self.ui._step - 1)
+        current = self.ui._step
+        # 发送方从步骤 6 返回时跳过步骤 5 (导入配置仅接收方使用)
+        if current == 6 and self._device_type == "源设备":
+            new_step = 4
+        else:
+            new_step = max(0, current - 1)
         self.ui.go_step(new_step)
 
         if new_step == 0:
@@ -277,12 +302,19 @@ class Controller:
                 # 连接页面: 禁用"下一步", 使用"开始传输"
                 self.ui.set_button_next("disabled")
             elif new_step == 4:
-                # 传输页面: 若传输已完成(接收方), 启用"校验文件 >"
-                if self._transfer_done and self._device_type == "目标设备":
-                    self.ui.set_button_next("normal", text="校验文件 >")
+                # 传输页面: 若传输已完成(接收方), 启用"导入配置 >"
+                if self._transfer_done:
+                    if self._device_type == "目标设备":
+                        self.ui.set_button_next("normal", text="导入配置 >")
+                    else:
+                        self.ui.set_button_next("normal", text="校验文件 >")
                 else:
                     self.ui.set_button_next("disabled")
             elif new_step == 5:
+                # 导入配置页面: 启用"校验文件 >"
+                self.ui.set_button_next("normal", text="校验文件 >")
+                self._populate_config_folders()
+            elif new_step == 6:
                 # 校验页面: 禁用"下一步"
                 self.ui.set_button_next("disabled")
             else:
@@ -293,7 +325,12 @@ class Controller:
 
     def _on_next_step(self):
         """下一步"""
-        new_step = min(self.ui._total_steps - 1, self.ui._step + 1)
+        current = self.ui._step
+        # 发送方从步骤 4 跳过步骤 5 (导入配置仅接收方使用)
+        if current == 4 and self._device_type == "源设备":
+            new_step = 6
+        else:
+            new_step = min(self.ui._total_steps - 1, current + 1)
         self.ui.go_step(new_step)
         self.ui.tk_button_prev.config(state="normal")
 
@@ -308,12 +345,19 @@ class Controller:
             # 步骤 3 (连接页面): 禁用"下一步", 用户应点击"开始传输"而非"下一步"
             self.ui.set_button_next("disabled")
         elif new_step == 5:
-            # 步骤 5 (校验页面): 禁用"下一步", 这是最后一页
+            # 步骤 5 (导入配置页面): 启用"校验文件 >", 指向步骤 6
+            self.ui.set_button_next("normal", text="校验文件 >")
+            self._populate_config_folders()
+        elif new_step == 6:
+            # 步骤 6 (校验页面): 禁用"下一步", 这是最后一页
             self.ui.set_button_next("disabled")
         elif new_step == 4:
             # 步骤 4 (传输页面): 传输完成前禁用"下一步"
             if self._transfer_done:
-                self.ui.set_button_next("normal", text="校验文件 >")
+                if self._device_type == "目标设备":
+                    self.ui.set_button_next("normal", text="导入配置 >")
+                else:
+                    self.ui.set_button_next("normal", text="校验文件 >")
             else:
                 self.ui.set_button_next("disabled")
         elif new_step >= self.ui._total_steps - 1:
@@ -1264,15 +1308,225 @@ class Controller:
         self._transferring = False
         self._transfer_done = True
 
-        # 对于接收方: 启用「校验文件 >」按钮, 并自动跳转至步骤 5
+        # 对于接收方: 自动跳转至步骤 5 (导入配置页面)
         if self._device_type == "目标设备":
-            self.ui.set_button_next("normal", text="校验文件 >")
+            self.ui.set_button_next("normal", text="导入配置 >")
             self.ui.go_step(5)
-            self._log("传输完成，已进入文件校验页面")
+            self._log("传输完成，请导入系统配置")
+            # 自动填充配置文件夹列表
+            self._populate_config_folders()
 
         # 重置进度条
         self._set_progress(0)
         self._set_status("传输完成 — 可进入校验页面")
+
+    # ==================== 配置导入导出 ====================
+
+    def _on_export_config(self):
+        """步骤 1: 导出系统配置按钮 (发送端)"""
+        button = self.ui.tk_button_export_config
+        button.config(state="disabled", text="导出中...")
+        self._set_status("正在导出系统配置...")
+
+        # 清空并启用导出日志区域
+        self._clear_export_log()
+        self._log_export("开始导出系统配置...")
+        self._log_export(f"目标: F:\\Appl\\{self._today_str()}\\")
+        self._log_export("")
+
+        def _export():
+            try:
+                success, export_path = config_transfer.export_config(
+                    log_callback=lambda msg: self.ui.after(0, lambda: self._log_export(msg))
+                )
+                self.ui.after(0, lambda: self._on_export_done(success, export_path))
+            except Exception as e:
+                self.ui.after(0, lambda: self._on_export_error(str(e)))
+
+        threading.Thread(target=_export, daemon=True).start()
+
+    def _on_export_done(self, success, export_path):
+        button = self.ui.tk_button_export_config
+        if success:
+            button.config(text="导出完成✓", bootstyle="success", state="normal")
+            self._set_status(f"系统配置已导出到: {export_path}")
+            self._log(f"\n✓ 配置导出完成!")
+            self._log(f"  路径: {export_path}")
+            self._log(f"  文件传输时, F 盘数据将包含此配置文件夹")
+            self._log_export("")
+            self._log_export("✓ 配置导出完成!")
+            self._log_export(f"  路径: {export_path}")
+        else:
+            button.config(text="导出失败(可重试)", bootstyle="danger", state="normal")
+            self._set_status("配置导出失败，部分项目未能导出")
+            self._log_export("")
+            self._log_export("✗ 配置导出部分失败，请查看上方日志")
+
+    def _on_export_error(self, error_msg):
+        button = self.ui.tk_button_export_config
+        button.config(text="导出失败(可重试)", bootstyle="danger", state="normal")
+        self._log(f"导出配置出错: {error_msg}")
+        self._set_status("配置导出出错")
+        self._log_export(f"")
+        self._log_export(f"✗ 导出配置出错: {error_msg}")
+
+    @staticmethod
+    def _today_str():
+        import datetime
+        return datetime.datetime.now().strftime("%Y-%m-%d")
+
+    def _populate_config_folders(self):
+        """步骤 5: 扫描并填充配置文件夹下拉列表"""
+        try:
+            folders = config_transfer.find_config_folders()
+            if folders:
+                values = [display for display, _ in folders]
+                self.ui.tk_combo_config_folder["values"] = values
+                self.ui.tk_combo_config_folder.current(0)
+                self.ui.tk_label_config_status.config(
+                    text=f"检测到 {len(folders)} 个配置备份。默认选中推荐文件夹。"
+                )
+                self._log(f"检测到 {len(folders)} 个配置备份文件夹")
+            else:
+                self.ui.tk_combo_config_folder["values"] = ["未检测到配置备份"]
+                self.ui.tk_combo_config_folder.current(0)
+                self.ui.tk_label_config_status.config(
+                    text="未在 F:\\Appl\\ 下检测到配置备份文件夹。"
+                         "请确保源设备已导出配置且 F 盘数据已成功传输。"
+                )
+                self._log("未检测到配置备份文件夹")
+                # 存储文件夹列表以便后续查找
+            self._config_folders = folders
+        except Exception as e:
+            self._log(f"扫描配置文件夹出错: {e}")
+
+    def _on_browse_config_folder(self):
+        """步骤 5: 手动浏览配置文件夹"""
+        from tkinter import filedialog
+        folder = filedialog.askdirectory(title="选择配置备份文件夹")
+        if folder:
+            display = os.path.basename(folder)
+            current_values = list(self.ui.tk_combo_config_folder["values"])
+            if folder not in [v for _, v in (self._config_folders or [])]:
+                self._config_folders.insert(0, (display, folder))
+                if "未检测到配置备份" in current_values:
+                    current_values = []
+                current_values.insert(0, display)
+                self.ui.tk_combo_config_folder["values"] = current_values
+            self.ui.tk_combo_config_folder.current(0)
+            self.ui.tk_label_config_status.config(text=f"已选择: {folder}")
+
+    def _on_import_config(self):
+        """步骤 5: 点击「导入配置」按钮"""
+        selected_idx = self.ui.tk_combo_config_folder.current()
+        if selected_idx < 0 or not self._config_folders:
+            self._log("请先选择一个配置备份文件夹")
+            return
+
+        selected_display = self.ui.tk_combo_config_folder.get()
+        config_folder = None
+        for display, path in self._config_folders:
+            if display == selected_display:
+                config_folder = path
+                break
+
+        if not config_folder or not os.path.isdir(config_folder):
+            self._log(f"配置文件夹无效: {config_folder}")
+            return
+
+        # 禁用按钮防重复点击
+        self.ui.tk_button_import_config.config(state="disabled", text="导入中...")
+        self.ui.tk_button_skip_import.config(state="disabled")
+        self.ui.tk_button_browse_config.config(state="disabled")
+        self.ui.tk_combo_config_folder.config(state="disabled")
+        self.ui.tk_import_progress_bar.pack(fill=tk.X, pady=(2, 10))
+        self.ui.tk_import_progress_bar.start()
+
+        self._log(f"开始导入配置: {config_folder}")
+        self._log("")
+
+        def _import():
+            try:
+                success = config_transfer.import_config(
+                    config_folder,
+                    log_callback=lambda msg: self.ui.after(0, lambda: self._log_import(msg))
+                )
+                self.ui.after(0, lambda: self._on_import_done(success))
+            except Exception as e:
+                self.ui.after(0, lambda: self._on_import_error(str(e)))
+
+        threading.Thread(target=_import, daemon=True).start()
+
+    def _on_import_done(self, success):
+        self.ui.tk_import_progress_bar.stop()
+        self.ui.tk_import_progress_bar.pack_forget()
+        self.ui.tk_button_skip_import.config(state="normal")
+
+        if success:
+            self._log("\n✓ 配置导入完成!")
+            self.ui.tk_button_import_config.config(text="导入完成✓", bootstyle="success", state="disabled")
+            self.ui.tk_label_import_progress.config(text="配置导入成功! 点击「校验文件 >」进入下一步")
+            self._set_status("配置导入完成")
+        else:
+            self._log("\n⚠ 部分配置导入失败, 请查看日志")
+            self.ui.tk_button_import_config.config(text="重试导入", bootstyle="warning", state="normal")
+            self.ui.tk_label_import_progress.config(text="部分配置导入失败，请点击重试")
+            self._set_status("配置导入部分失败")
+
+        self.ui.tk_combo_config_folder.config(state="readonly")
+        self.ui.tk_button_browse_config.config(state="normal")
+
+    def _on_import_error(self, error_msg):
+        self.ui.tk_import_progress_bar.stop()
+        self.ui.tk_import_progress_bar.pack_forget()
+        self._log(f"导入配置出错: {error_msg}")
+        self.ui.tk_button_import_config.config(text="重试导入", bootstyle="danger", state="normal")
+        self.ui.tk_button_skip_import.config(state="normal")
+        self.ui.tk_combo_config_folder.config(state="readonly")
+        self.ui.tk_button_browse_config.config(state="normal")
+        self._set_status("配置导入出错")
+
+    def _on_skip_import(self):
+        """步骤 5: 点击「跳过」按钮, 直接进入校验页面"""
+        self._log("已跳过配置导入")
+        self.ui.go_step(6)
+        self.ui.tk_button_prev.config(state="normal")
+        self.ui.set_button_next("disabled")
+
+    def _log_import(self, msg):
+        """写入导入日志区域"""
+        log_widget = getattr(self.ui, 'tk_text_import_log', None)
+        if log_widget:
+            try:
+                log_widget.config(state="normal")
+                log_widget.insert("end", msg + "\n")
+                log_widget.see("end")
+                log_widget.config(state="disabled")
+            except Exception:
+                pass
+
+    def _log_export(self, msg):
+        """写入导出日志区域 (步骤1页面内嵌)"""
+        log_widget = getattr(self.ui, 'tk_text_export_log', None)
+        if log_widget:
+            try:
+                log_widget.config(state="normal")
+                log_widget.insert("end", msg + "\n")
+                log_widget.see("end")
+                log_widget.config(state="disabled")
+            except Exception:
+                pass
+
+    def _clear_export_log(self):
+        """清空导出日志区域"""
+        log_widget = getattr(self.ui, 'tk_text_export_log', None)
+        if log_widget:
+            try:
+                log_widget.config(state="normal")
+                log_widget.delete("1.0", "end")
+                log_widget.config(state="disabled")
+            except Exception:
+                pass
 
     # ==================== 校验 ====================
 
