@@ -79,7 +79,8 @@ $HiddenImports = @(
     "PIL.ImageTk",
     "secrets", "tls_utils",
     "file_transfer", "nic_scanner", "disk_scanner",
-    "verifier", "ip_config", "dhcp_server", "config_transfer"
+    "verifier", "ip_config", "dhcp_server", "config_transfer",
+    "systemconfig", "systemconfig.calc_allocation_migration"
 )
 
 $CollectData = @("cryptography", "ttkbootstrap")

@@ -9,7 +9,7 @@ import os
 from typing import Literal
 from tkinter import simpledialog
 import tkinter as tk
-from nic_scanner import scan_nics, get_nic_display_list, get_local_ip
+from nic_scanner import scan_nics, get_nic_display_list, get_local_ip, get_wired_adapters
 from disk_scanner import get_disk_list, get_drive_letter_list, get_disk_number, get_partition_count, get_partition_details
 from file_transfer import FileServer, download_files, scan_source_device, TRANSFER_PORT, _allow_sleep
 from verifier import run_verification
@@ -58,6 +58,9 @@ class Controller:
     def __init__(self):
         # ---- 网卡 ----
         self._nic_list = []
+        self._auto_nic = None      # 自动选择的有线网卡 (display_name, desc, adapter_name, speed_str, index, ip)
+        self._manual_nic = False   # 用户是否手动从高级选项更改过网卡
+        self._disks_scanned = False  # 磁盘扫描是否已完成
 
         # ---- 设备类型 ----
         self._device_type = None
@@ -180,6 +183,11 @@ class Controller:
             self.ui.tk_button_skip_import.config(command=self._on_skip_import)
         if hasattr(self.ui, 'tk_button_browse_config'):
             self.ui.tk_button_browse_config.config(command=self._on_browse_config_folder)
+        # 步骤 4 配置检测按钮 (接收端传输完成后)
+        if hasattr(self.ui, 'tk_button_use_config'):
+            self.ui.tk_button_use_config.config(command=self._on_use_detected_config)
+        if hasattr(self.ui, 'tk_button_skip_config'):
+            self.ui.tk_button_skip_config.config(command=self._on_skip_detected_config)
         # 发现设备列表
         if hasattr(self.ui, 'tk_select_box_discover'):
             self.ui.tk_select_box_discover.bind("<<ComboboxSelected>>", self._on_discover_selected)
@@ -193,7 +201,7 @@ class Controller:
     # ==================== 网卡扫描 ====================
 
     def _populate_nics(self):
-        """扫描网卡并填充下拉列表"""
+        """扫描网卡并填充下拉列表，自动选择最佳有线网卡"""
         self._log("正在扫描网卡...")
         self.ui.tk_select_box_mqfzkd6x["values"] = ["扫描中..."]
 
@@ -209,10 +217,66 @@ class Controller:
                     display_list if display_list else ["未检测到网卡"],
                     f"检测到 {len(display_list)} 个网卡" if display_list else "未检测到可用网卡"
                 ))
+                # 自动选择最佳有线网卡
+                self._auto_select_wired_nic()
             except Exception as e:
                 self.ui.after(0, lambda: self._log(f"网卡扫描失败: {e}"))
 
         threading.Thread(target=_scan, daemon=True).start()
+
+    # ==================== 自动网卡选择 ====================
+
+    def _auto_select_wired_nic(self):
+        """自动选择最佳有线网卡 (Type == 6)，并更新 UI 显示。
+        优先级: 已有 169.254.x.x 地址 > 有其他 IP > 无 IP。
+        仅在用户未手动选择时自动覆盖下拉框。"""
+        wired = get_wired_adapters()
+        if wired:
+            # 优先级: 169.254.x.x > 有 IP > 无 IP
+            wired_sorted = sorted(wired, key=lambda w: (
+                0 if w[5].startswith("169.254") else (1 if w[5] else 2)
+            ))
+            self._auto_nic = wired_sorted[0]  # (display_name, desc, adapter_name, speed_str, index, ip)
+            nic = self._auto_nic
+            vip = nic[5] or "无"
+            vspeed = nic[3] or ""
+            self._log(f"自动选择有线网卡: {nic[0]} (IP: {vip})")
+            # 同步下拉框（仅当用户未手动更改时）
+            if not self._manual_nic:
+                self.ui.after(0, lambda: self.ui.tk_select_box_mqfzkd6x.set(nic[0]))
+                self.ui.after(0, lambda: self.ui.tk_label_nic_detail.configure(
+                    text=f"描述: {nic[1]}  适配器: {nic[2]}"))
+            # 更新步骤 1 的自动检测网卡信息
+            self.ui.after(0, lambda: self.ui.update_auto_nic_display(
+                nic[0], nic[5], vspeed, len(wired)))
+            # 若当前在步骤 1，启用「下一步」按钮（自动选择也算已选网卡）
+            self.ui.after(0, lambda: self.ui.set_button_next("normal")
+                          if getattr(self.ui, '_step', 0) == 1 else None)
+        else:
+            self._auto_nic = None
+            self._log("警告: 未检测到有线网卡，请检查网线连接（可在高级选项中手动选择）")
+            self.ui.after(0, lambda: self.ui.update_auto_nic_display("", "", "", 0))
+
+    def _get_wired_nic_ips(self) -> list:
+        """获取所有有线网卡的当前 IP 地址列表（非空）"""
+        wired = get_wired_adapters()
+        return [w[5] for w in wired if w[5]]
+
+    def _get_adapter_desc_from_auto(self) -> str:
+        """从自动选择的网卡获取适配器描述"""
+        if self._auto_nic:
+            return self._auto_nic[1]
+        return ""
+
+    def _eval_step2_next(self):
+        """评估步骤 2 的「下一步」按钮状态（磁盘扫描完成后的回调）"""
+        if self.ui._step != 2:
+            return
+        disk = self.ui.tk_select_box_mqfzmzbe.get()
+        if disk and disk not in ("未检测到磁盘", "", "请先选择设备类型", "扫描中..."):
+            self.ui.set_button_next("normal")
+        else:
+            self.ui.set_button_next("disabled")
 
     # ==================== 事件处理 ====================
 
@@ -234,15 +298,19 @@ class Controller:
             self.ui.show_src_connect()
             self.ui.hide_discover()
             self.ui.hide_manual_ip()
-            # 显示导出配置区域
+            # 显示导出配置区域，隐藏接收端信息
             if hasattr(self.ui, '_export_frame'):
                 self.ui._export_frame.pack(fill=tk.BOTH, expand=True)
+            if hasattr(self.ui, '_target_info_frame'):
+                self.ui._target_info_frame.pack_forget()
         else:
             self.ui.show_dhcp()
             self.ui.show_tgt_connect()
             self.ui.show_discover()
             self.ui.show_manual_ip()
-            # 隐藏导出配置区域
+            # 显示接收端信息，隐藏导出配置区域
+            if hasattr(self.ui, '_target_info_frame'):
+                self.ui._target_info_frame.pack(fill=tk.BOTH, expand=True)
             if hasattr(self.ui, '_export_frame'):
                 self.ui._export_frame.pack_forget()
 
@@ -250,17 +318,7 @@ class Controller:
         self.ui.go_step(1)
         self.ui.tk_button_prev.config(state="normal")
 
-        # 更新 IP 配置信息
-        if role == "source":
-            self.ui.set_nic_ip_info(
-                "发送方 (旧设备) — 将自动从接收方 DHCP 获取 IP 地址\n"
-                "    预期 IP: 169.254.100.2"
-            )
-        else:
-            self.ui.set_nic_ip_info(
-                "接收方 (新设备) — 请进入下一步连接页面后点击「寻找旧设备」启动 DHCP 服务器\n"
-                "    本机 IP: 169.254.100.1 | 源设备 IP: 169.254.100.2"
-            )
+        # IP 配置信息已在高级选项面板中展示，无需额外更新
 
         # 不在此时显示开始按钮，等用户到达步骤 3 再显示
 
@@ -292,12 +350,21 @@ class Controller:
                 else:
                     self.ui.set_button_next("disabled")
             elif new_step == 2:
-                # 磁盘映射页: 需要用户确认磁盘选择后才能继续
+                # 磁盘映射页: 尝试自动选择 → 若仍无效则触发扫描
                 disk = self.ui.tk_select_box_mqfzmzbe.get()
                 if disk and disk not in ("未检测到磁盘", "", "请先选择设备类型", "扫描中..."):
                     self.ui.set_button_next("normal")
                 else:
-                    self.ui.set_button_next("disabled")
+                    # 尝试从已缓存的结果中自动选择
+                    self._try_auto_select_disk()
+                    # 再次检查: 若仍无效，触发磁盘扫描
+                    disk = self.ui.tk_select_box_mqfzmzbe.get()
+                    if disk and disk not in ("未检测到磁盘", "", "请先选择设备类型", "扫描中..."):
+                        self.ui.set_button_next("normal")
+                    elif disk in ("请先选择设备类型", "扫描中...", ""):
+                        self._populate_disks(callback=self._eval_step2_next)
+                    else:
+                        self.ui.set_button_next("disabled")
             elif new_step == 3:
                 # 连接页面: 禁用"下一步", 使用"开始传输"
                 self.ui.set_button_next("disabled")
@@ -325,7 +392,20 @@ class Controller:
 
     def _on_next_step(self):
         """下一步"""
+        # 防护: 如果按钮被禁用, 不允许前进 (防止逻辑绕过 UI 状态)
+        try:
+            if str(self.ui.tk_button_next.cget("state")) == "disabled":
+                return
+        except Exception:
+            pass
         current = self.ui._step
+
+        # 特殊: 步骤 4 接收端已检测到配置文件 → "下一步" = 使用此配置
+        if current == 4 and self._device_type == "目标设备":
+            if hasattr(self, '_detected_config_path') and self._detected_config_path:
+                self._on_use_detected_config()
+                return
+
         # 发送方从步骤 4 跳过步骤 5 (导入配置仅接收方使用)
         if current == 4 and self._device_type == "源设备":
             new_step = 6
@@ -335,14 +415,22 @@ class Controller:
         self.ui.tk_button_prev.config(state="normal")
 
         if new_step == 2:
-            # 进入步骤 2 (磁盘映射): 若磁盘已自动选中则直接启用"下一步"
+            # 进入步骤 2 (磁盘映射):
+            #   1) 先尝试从缓存结果中自动选择
+            #   2) 若仍无效, 触发磁盘扫描
+            self._try_auto_select_disk()
             disk = self.ui.tk_select_box_mqfzmzbe.get()
             if disk and disk not in ("未检测到磁盘", "", "请先选择设备类型", "扫描中..."):
                 self.ui.set_button_next("normal")
             else:
                 self.ui.set_button_next("disabled")
+            # 若无有效磁盘, 触发扫描
+            if disk in ("请先选择设备类型", "扫描中...", ""):
+                self._populate_disks(callback=self._eval_step2_next)
         elif new_step == 3:
-            # 步骤 3 (连接页面): 禁用"下一步", 用户应点击"开始传输"而非"下一步"
+            # 步骤 3 (连接页面): 触发磁盘选定以完成分区检测和盘符填充
+            self._on_disk_selected()
+            # 禁用"下一步", 用户应点击"开始传输"而非"下一步"
             self.ui.set_button_next("disabled")
         elif new_step == 5:
             # 步骤 5 (导入配置页面): 启用"校验文件 >", 指向步骤 6
@@ -404,27 +492,34 @@ class Controller:
             self._log(f"已选择 CSV: {path}")
 
     def _on_nic_selected(self, event=None):
+        """用户从高级选项下拉框手动选择网卡"""
         nic_display = self.ui.tk_select_box_mqfzkd6x.get()
         if nic_display in ("扫描中...", "未检测到网卡", ""):
             return
 
-        self._log(f"已选择网卡: {nic_display}")
+        self._manual_nic = True  # 标记用户手动更改
+        self._log(f"已手动选择网卡: {nic_display}")
 
         adapter_desc = self._get_adapter_desc(nic_display)
         if not adapter_desc:
+            # 即使无法匹配真实网卡(如非 Windows 环境), 只要网卡名有效就启用下一步
+            if self.ui._step == 1:
+                self.ui.set_button_next("normal")
             return
 
         # 设备类型已选 → 尝试设置 IP
         if self._device_type in ("源设备", "目标设备"):
             self._configure_ip(adapter_desc, self._device_type)
 
-        # 网卡选定后: 扫描磁盘并进入下一步
-        self._populate_disks()
+        # 不在此处提前扫描磁盘 (会导致进入步骤 2 时无法自动选择)
+        # 磁盘扫描统一在进入步骤 2 时触发
 
         # 允许进入下一步 (磁盘选择) — 用 set_button_next 确保 pack 状态正确
-        self.ui.set_button_next("normal")
+        # 仅在步骤 1 时启用, 防止 after 延迟回调在其他步骤中误启用按钮
+        if self.ui._step == 1:
+            self.ui.set_button_next("normal")
 
-        # 更新 IP 状态显示
+        # 更新 IP 状态显示 + 高级选项内网卡详情
         if self._device_type == "源设备":
             self.ui.set_nic_ip_info(
                 f"发送方 (旧设备) — 已选定网卡: {nic_display}\n"
@@ -436,6 +531,15 @@ class Controller:
                 "    请进入连接页面后点击「寻找旧设备」启动 DHCP\n"
                 "    本机 IP: 169.254.100.1 | 源设备 IP: 169.254.100.2"
             )
+        # 更新高级选项中的网卡详情
+        adapter_name = ""
+        for nic in self._nic_list:
+            if nic[0] == nic_display:
+                adapter_name = nic[2]
+                break
+        self.ui.tk_label_nic_detail.configure(
+            text=f"描述: {adapter_desc}  适配器: {adapter_name}"
+        )
 
     def _on_device_type_selected(self, event=None):
         dev_type = self._device_type
@@ -484,7 +588,9 @@ class Controller:
         self._log(f"已选择磁盘: {disk}")
 
         # 磁盘已选择: 允许用户确认后进入下一步 — 用 set_button_next 确保 pack 状态正确
-        self.ui.set_button_next("normal")
+        # 仅在步骤 2 时启用下一步, 防止 after 延迟回调在其他步骤中误启用按钮
+        if self.ui._step == 2:
+            self.ui.set_button_next("normal")
 
         # 立即填充盘符 (不依赖分区检测结果)
         self._populate_drive_letters()
@@ -582,25 +688,66 @@ class Controller:
 
     # ==================== 磁盘/分区 ====================
 
-    def _populate_disks(self):
-        """扫描物理磁盘"""
+    def _try_auto_select_disk(self) -> bool:
+        """若当前仅有 1 个有效磁盘且未选中任何磁盘，自动选中并触发 _on_disk_selected。
+        返回 True 表示执行了自动选择。"""
+        values = self.ui.tk_select_box_mqfzmzbe["values"]
+        if not values or values == ("扫描中...",):
+            return False
+        current = self.ui.tk_select_box_mqfzmzbe.get()
+        if current and current not in ("未检测到磁盘", "", "请先选择设备类型", "扫描中..."):
+            return False  # 已有有效选择
+        valid_disks = [v for v in values if v not in ("未检测到磁盘", "请先选择设备类型", "扫描中...")]
+        if len(valid_disks) == 1:
+            self.ui.tk_select_box_mqfzmzbe.set(valid_disks[0])
+            self._log(f"自动选择磁盘: {valid_disks[0]}")
+            if self.ui._step == 2:
+                self._on_disk_selected()
+            return True
+        return False
+
+    def _populate_disks(self, callback=None):
+        """扫描物理磁盘。扫描完成后若仅 1 个磁盘则自动选中。
+        callback 在扫描完成后 (含自动选择后) 在 UI 线程回调。
+        防止重复扫描: 若已扫描过或正在扫描中，直接返回。"""
+        if self._disks_scanned:
+            self._try_auto_select_disk()
+            if callback:
+                self.ui.after(0, callback)
+            return
+        cur = self.ui.tk_select_box_mqfzmzbe.get()
+        if cur == "扫描中...":
+            return  # 正在扫描中
         self._log("正在扫描磁盘...")
         self.ui.tk_select_box_mqfzmzbe["values"] = ("扫描中...",)
 
         def _scan():
             try:
                 disks = get_disk_list()
+                self._disks_scanned = True
                 self.ui.after(0, lambda: self._update_combobox(
                     self.ui.tk_select_box_mqfzmzbe,
                     disks,
                     f"检测到 {len(disks)} 个磁盘"
                 ))
-                # 自动选择: 只有一个磁盘时自动选中
+                # 自动选择: 仅 1 个磁盘时自动选中并触发分区检测
                 if len(disks) == 1:
-                    self.ui.after(100, lambda: self.ui.tk_select_box_mqfzmzbe.set(disks[0]))
-                    self.ui.after(100, lambda: self._on_disk_selected())
+                    self.ui.after(0, lambda: (
+                        self.ui.tk_select_box_mqfzmzbe.set(disks[0])
+                        if self.ui._step == 2 else None
+                    ))
+                    self.ui.after(50, lambda: (
+                        self._on_disk_selected()
+                        if self.ui._step == 2 else None
+                    ))
+                # 扫描完成回调
+                if callback:
+                    self.ui.after(100, callback)
             except Exception as e:
+                self._disks_scanned = False  # 失败允许重试
                 self.ui.after(0, lambda: self._log(f"磁盘扫描失败: {e}"))
+                if callback:
+                    self.ui.after(100, callback)
 
         threading.Thread(target=_scan, daemon=True).start()
 
@@ -702,58 +849,61 @@ class Controller:
         self._source_ip = ""
 
         if "源" in str(device_type):
-            # 源设备: 释放并重新获取 IP (从目标 DHCP 获取)
-            self.ui.after(0, lambda: self._log("源设备: 正在获取 IP..."))
-            threading.Thread(target=self._setup_source_network, args=(adapter_desc,), daemon=True).start()
+            # 源设备: 在所有有线网卡上释放并重新获取 IP (从目标 DHCP 获取)
+            self.ui.after(0, lambda: self._log("源设备: 正在在所有有线网卡上获取 IP..."))
+            threading.Thread(target=self._setup_source_network, daemon=True).start()
         else:
             # 目标设备: 不自动启动 DHCP, 等待用户点击「寻找旧电脑」
             self.ui.after(0, lambda: self._log(
-                "目标设备: 请先选择网卡并点击「寻找旧电脑」启动 DHCP 服务器，"
+                "目标设备: 请进入连接页面后点击「寻找旧电脑」启动 DHCP 服务器，"
                 "待源设备分配到 IP 后点击「开始接收」"
             ))
 
-    def _setup_source_network(self, adapter_desc):
-        """源设备: 从目标 DHCP 获取 IP —— 使用 IP Helper API 只对目标网卡操作,
-        避免 ipconfig /renew 逐个续租所有网卡导致长时间阻塞。
-        后台 release+renew, 主线程用 NotifyAddrChange 事件驱动等待 (零 CPU 轮询)。
+    def _setup_source_network(self):
+        """源设备: 在所有有线网卡上释放+续租 DHCP，从目标 DHCP 获取 IP。
+        后台 release+renew 所有有线网卡, 主线程用 NotifyAddrChange 事件驱动等待。
         """
-        from nic_scanner import (get_adapter_index, release_dhcp_ip, renew_dhcp_ip,
-                                 wait_for_ip_change)
+        from nic_scanner import (release_dhcp_ip, renew_dhcp_ip, wait_for_ip_change)
 
         try:
-            adapter_index = get_adapter_index(adapter_desc)
-            if adapter_index <= 0:
-                self.ui.after(0, lambda: self._log("错误: 找不到目标网卡索引"))
+            wired_nics = get_wired_adapters()
+            if not wired_nics:
+                self.ui.after(0, lambda: self._log("错误: 未找到有线网卡"))
                 return
 
-            # 后台线程: 先释放旧租约, 再用 IpRenewAddress 从目标 DHCP 获取新 IP
-            self.ui.after(0, lambda: self._log(
-                f"释放目标网卡 DHCP 租约 (索引 {adapter_index})..."
-            ))
-            self.ui.after(0, lambda: self._log(
-                f"请求目标网卡 DHCP 续租 (索引 {adapter_index})..."
-            ))
+            # 后台线程: 释放所有有线网卡旧租约, 再逐个续租
+            self.ui.after(0, lambda: self._log("释放所有有线网卡 DHCP 租约..."))
+            self.ui.after(0, lambda: self._log("请求所有有线网卡 DHCP 续租..."))
 
             def _do_dhcp():
-                release_dhcp_ip(adapter_index)
-                renew_dhcp_ip(adapter_index)
+                for nic in wired_nics:
+                    idx = nic[4]  # index
+                    if idx > 0:
+                        release_dhcp_ip(idx)
+                        renew_dhcp_ip(idx)
+
             threading.Thread(target=_do_dhcp, daemon=True).start()
 
-            # 事件驱动等待 IP 变化 (NotifyAddrChange, 不消耗 CPU)
-            # release 会导致 IP → 0.0.0.0, renew 会导致 0.0.0.0 → 169.254.100.x
-            # 每次 IP 变化都会唤醒, 拿到目标 IP 即返回
+            # 事件驱动等待 IP 变化, 检查任一有线网卡是否获取到目标 IP
             deadline = time.time() + 20
             ip = ""
             while time.time() < deadline:
                 remaining = deadline - time.time()
                 if not wait_for_ip_change(min(remaining, 5.0)):
-                    # 超时, 最后检查一次
-                    ip = get_local_ip(adapter_desc)
+                    # 超时, 最后检查所有有线网卡
+                    for nic in wired_nics:
+                        ip = get_local_ip(nic[1])  # nic[1] = description
+                        if ip and ip.startswith("169.254.100."):
+                            break
+                    else:
+                        ip = ""  # 无网卡获得目标 IP
                     break
-                ip = get_local_ip(adapter_desc)
+                for nic in wired_nics:
+                    ip = get_local_ip(nic[1])
+                    if ip and ip.startswith("169.254.100."):
+                        break
                 if ip and ip.startswith("169.254.100."):
                     break
-                # IP 变了但不是目标 IP (如 release 后的 0.0.0.0), 继续等下一次变化
 
             if ip and ip != "0.0.0.0":
                 self._source_ip = ip
@@ -852,12 +1002,19 @@ class Controller:
             return
         nic_display = self.ui.tk_select_box_mqfzkd6x.get()
         if nic_display in ("扫描中...", "未检测到可用网卡", "", "网卡1", "网卡2"):
-            self._log("请先选择网卡，再点击「寻找旧电脑」")
-            return
-        adapter_desc = self._get_adapter_desc(nic_display)
-        if not adapter_desc:
-            self._log("无法识别所选网卡，请重新选择")
-            return
+            # 尝试回退到自动选择的有线网卡
+            adapter_desc = self._get_adapter_desc_from_auto()
+            if not adapter_desc:
+                self._log("请先选择网卡，再点击「寻找旧电脑」")
+                return
+        else:
+            adapter_desc = self._get_adapter_desc(nic_display)
+            if not adapter_desc:
+                # 再尝试自动网卡
+                adapter_desc = self._get_adapter_desc_from_auto()
+                if not adapter_desc:
+                    self._log("无法识别所选网卡，请重新选择")
+                    return
         self.ui.tk_button_dhcp.config(state="disabled")
         self.ui.tk_button_dhcp.configure(text="正在搜索...")
         threading.Thread(target=self._setup_target_dhcp, args=(adapter_desc,), daemon=True).start()
@@ -878,8 +1035,12 @@ class Controller:
             values=("等待源设备连接...",)
         ))
 
-        # 诊断: 打印本机当前地址, 确认是否已获得 APIPA (169.254.x.x)
-        _cur_ip = get_local_ip(adapter_desc)
+        # 获取所有有线网卡 IP 用于 DHCP 广播 (OFFER/ACK 从所有有线网卡发出)
+        wired_ips = self._get_wired_nic_ips()
+        _cur_ip = wired_ips[0] if wired_ips else get_local_ip(adapter_desc) if adapter_desc else ""
+        if wired_ips:
+            self.ui.after(0, lambda: self._log(
+                f"有线网卡 IP 列表: {wired_ips}, DHCP 广播将从所有有线网卡发出"))
         if _cur_ip:
             self.ui.after(0, lambda: self._log(
                 f"DHCP 模式: 接收端不设置自身 IP, 当前本机地址 {_cur_ip} (掩码 {SUBNET_MASK})。"
@@ -895,7 +1056,7 @@ class Controller:
         self._log(f"本地 MAC 排除列表: {local_macs}")
 
         try:
-            self._dhcp_server = MiniDHCPServer(exclude_macs=local_macs, out_ip=_cur_ip or "")
+            self._dhcp_server = MiniDHCPServer(exclude_macs=local_macs, out_ips=wired_ips)
 
             def _on_client(ip, mac, hostname):
                 self._update_discover_list(ip, mac, hostname)
@@ -938,6 +1099,9 @@ class Controller:
 
     def _auto_select_target(self):
         """60 秒后检查：如果只有 1 个客户端，自动选定"""
+        # 如果用户已经离开网络发现页面（步骤 3），不再修改下拉框
+        if getattr(self.ui, '_step', -1) != 3:
+            return
         if not self._dhcp_server or not self._use_dhcp:
             return
 
@@ -1151,6 +1315,7 @@ class Controller:
         self._transferring = True
         self._transfer_done = False
         self._reset_progress("正在连接源设备...")
+        self.ui.hide_transfer_error()  # 清除上次失败的错误提示
         self.ui.tk_button_mqfzl35t.config(text="连接中...", state="disabled")
 
         def _connect_and_download():
@@ -1289,6 +1454,7 @@ class Controller:
         self._transferring = False
         self._transfer_done = False
         self._use_dhcp = False
+        self.ui.hide_transfer_error()
         if hasattr(self, "_dhcp_server") and self._dhcp_server:
             self._dhcp_server.stop()
             self._dhcp_server = None
@@ -1299,45 +1465,145 @@ class Controller:
 
     def _on_download_complete(self, success, files, bytes_done, errors):
         """下载完成回调"""
+        self._transferring = False
+
+        # 传输未启动就失败 (files==0: 验证码错误、网络不通等)
+        if not success and files == 0:
+            self._log("\n传输未启动: 验证码错误或无法连接到发送端")
+            self._reset_progress("传输失败")
+            self.ui.hide_config_detect()
+            self.ui.set_button_next("disabled")
+            # 上一步按钮可用: 引导用户回到验证码输入页修正验证码
+            if self._device_type == "目标设备":
+                self.ui.set_button_prev("normal", text="< 返回修改验证码")
+                # 显示醒目红色错误提示
+                self.ui.show_transfer_error(
+                    "验证码错误 — 请输入正确的验证码后重新连接"
+                )
+            else:
+                self.ui.set_button_prev("normal")
+                self.ui.show_transfer_error(
+                    "连接失败 — 无法连接到接收端，请检查网络后重试"
+                )
+            # 重置传输按钮，允许重试
+            self.ui.tk_button_mqfzl35t.config(text="重试接收", state="normal")
+            if hasattr(self, "_dhcp_server") and self._dhcp_server:
+                self._dhcp_server.stop()
+                self._dhcp_server = None
+            if hasattr(self, "_tgt_server") and self._tgt_server:
+                self._tgt_server.stop()
+                self._tgt_server = None
+            return
+
         if success:
             self._log("\n传输成功！")
         else:
             self._log(f"\n传输完成 (有 {len(errors) if errors else 0} 个错误)")
 
-        # 传输线程结束
-        self._transferring = False
         self._transfer_done = True
+        self.ui.hide_transfer_error()
+        # 传输完成: 隐藏"开始传输"按钮, 清理 UI
+        self.ui.hide_start_button()
 
-        # 对于接收方: 自动跳转至步骤 5 (导入配置页面)
+        # 对于接收方: 检测 F:\\systemconfig.ini, 有则提示用户确认
         if self._device_type == "目标设备":
-            self.ui.set_button_next("normal", text="导入配置 >")
-            self.ui.go_step(5)
-            self._log("传输完成，请导入系统配置")
-            # 自动填充配置文件夹列表
-            self._populate_config_folders()
+            config_path, time_str = config_transfer.get_config_from_ini()
+            if config_path:
+                self._detected_config_path = config_path
+                self.ui.show_config_detect(config_path, time_str)
+                # "下一步"按钮: 点击即使用检测到的配置, 无需单独点"使用此配置"
+                self.ui.set_button_next("normal", text="导入配置 >")
+                # 强制刷新 UI 确保按钮和检测区域立即可见
+                self.ui.update_idletasks()
+                self._log("在 F 盘发现系统配置文件，请在传输日志上方确认是否使用")
+            else:
+                # 无配置文件: 直接跳转步骤 5
+                self.ui.hide_config_detect()
+                self.ui.go_step(5)
+                self._populate_config_folders()
+                self._log("传输完成，请导入系统配置")
 
         # 重置进度条
         self._set_progress(0)
         self._set_status("传输完成 — 可进入校验页面")
+
+    def _on_use_detected_config(self):
+        """接收端步骤 4: 用户确认使用检测到的配置文件"""
+        if not hasattr(self, '_detected_config_path'):
+            return
+        self.ui.hide_config_detect()
+        self._log(f"将使用检测到的配置: {self._detected_config_path}")
+        # 先填充配置文件夹列表, 再选中检测到的路径
+        self._populate_config_folders()
+        self._select_config_folder(self._detected_config_path)
+        self.ui.go_step(5)
+
+    def _on_skip_detected_config(self):
+        """接收端步骤 4: 用户跳过检测到的配置文件"""
+        self.ui.hide_config_detect()
+        self._log("已跳过自动检测的配置文件")
+        self._populate_config_folders()
+        self.ui.go_step(5)
+
+    def _select_config_folder(self, target_path: str):
+        """在步骤 5 的配置文件夹下拉框中选中指定路径"""
+        try:
+            values = list(self.ui.tk_combo_config_folder["values"])
+            for i, v in enumerate(values):
+                if v == "未检测到配置备份":
+                    continue
+                # v 是 display_name, 需从 _config_folders 反查
+                if hasattr(self, '_config_folders') and self._config_folders:
+                    for display, path in self._config_folders:
+                        if path == target_path:
+                            if display in values:
+                                idx = values.index(display)
+                                self.ui.tk_combo_config_folder.current(idx)
+                                self.ui.tk_label_config_status.config(
+                                    text=f"已选中: {display} (自动检测)"
+                                )
+                                return
+            # 未在列表中找到: 手动插入
+            folder_name = os.path.basename(target_path)
+            if hasattr(self, '_config_folders'):
+                self._config_folders.insert(0, (folder_name, target_path))
+            if "未检测到配置备份" in values:
+                values = [folder_name]
+            else:
+                values.insert(0, folder_name)
+            self.ui.tk_combo_config_folder["values"] = values
+            self.ui.tk_combo_config_folder.current(0)
+            self.ui.tk_label_config_status.config(
+                text=f"已选中: {folder_name} (自动检测)"
+            )
+        except Exception as e:
+            self._log(f"选中配置文件夹时出错: {e}")
 
     # ==================== 配置导入导出 ====================
 
     def _on_export_config(self):
         """步骤 1: 导出系统配置按钮 (发送端)"""
         button = self.ui.tk_button_export_config
-        button.config(state="disabled", text="导出中...")
+        button.config(state="disabled", text="导出中")
         self._set_status("正在导出系统配置...")
 
-        # 清空并启用导出日志区域
+        # 清空并启用导出日志区域，重置状态表格
         self._clear_export_log()
+        if hasattr(self.ui, '_init_export_table'):
+            self.ui._init_export_table()
         self._log_export("开始导出系统配置...")
         self._log_export(f"目标: F:\\Appl\\{self._today_str()}\\")
         self._log_export("")
 
+        def _status_cb(name, status):
+            """线程安全地更新导出状态表格"""
+            self.ui.after(0, lambda n=name, s=status: self.ui._update_export_item_status(n, s))
+
         def _export():
             try:
                 success, export_path = config_transfer.export_config(
-                    log_callback=lambda msg: self.ui.after(0, lambda: self._log_export(msg))
+                    log_callback=lambda msg: self.ui.after(0, lambda: self._log_export(msg)),
+                    status_callback=_status_cb,
                 )
                 self.ui.after(0, lambda: self._on_export_done(success, export_path))
             except Exception as e:
@@ -1347,20 +1613,86 @@ class Controller:
 
     def _on_export_done(self, success, export_path):
         button = self.ui.tk_button_export_config
-        if success:
-            button.config(text="导出完成✓", bootstyle="success", state="normal")
-            self._set_status(f"系统配置已导出到: {export_path}")
-            self._log(f"\n✓ 配置导出完成!")
+        # 只要导出目录有效(非空字符串), 就尝试压缩上传;
+        # 部分导出项失败不影响已导出的数据上传
+        if export_path:
+            button.config(text="正在压缩", bootstyle="info", state="disabled")
+            if success:
+                self._set_status(f"系统配置已导出到: {export_path}")
+            else:
+                self._set_status(f"部分配置导出失败，仍将压缩并上传 {export_path}")
+            self._log(f"\n配置导出完成!")
             self._log(f"  路径: {export_path}")
+            if not success:
+                self._log(f"  注意: 部分导出项目失败，但已导出的配置仍会压缩上传")
             self._log(f"  文件传输时, F 盘数据将包含此配置文件夹")
             self._log_export("")
-            self._log_export("✓ 配置导出完成!")
+            self._log_export("配置导出完成!")
             self._log_export(f"  路径: {export_path}")
+            if not success:
+                self._log_export("  注意: 部分项目失败，已导出配置仍将压缩上传")
+            # 在后台线程中压缩并上传 (无论成功与否都上传)
+            self._start_compress_upload(export_path)
         else:
             button.config(text="导出失败(可重试)", bootstyle="danger", state="normal")
-            self._set_status("配置导出失败，部分项目未能导出")
+            self._set_status("配置导出失败，未生成导出目录")
             self._log_export("")
-            self._log_export("✗ 配置导出部分失败，请查看上方日志")
+            self._log_export("配置导出失败，请查看上方日志")
+
+    def _start_compress_upload(self, export_path):
+        """在后台线程中压缩导出文件夹并上传到 Profile 服务器。"""
+        import config_transfer
+
+        # 线程安全的日志写入 (通过 after 回到主线程操作 Tkinter)
+        def _log_safe(msg):
+            self.ui.after(0, lambda m=msg: self._log_export(m))
+
+        def _run():
+            try:
+                _log_safe("")
+                _log_safe("=" * 50)
+                _log_safe("开始压缩并上传系统配置...")
+                compress_ok, zip_path, upload_ok = \
+                    config_transfer.compress_and_upload_config(
+                        export_path, log_callback=_log_safe
+                    )
+                # 在主线程中更新按钮状态
+                self.ui.after(0, lambda: self._on_upload_done(compress_ok, upload_ok, zip_path))
+            except Exception as e:
+                self.ui.after(0, lambda: self._on_upload_error(str(e)))
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
+    def _on_upload_done(self, compress_ok, upload_ok, zip_path):
+        button = self.ui.tk_button_export_config
+        self._log_export("=" * 50)
+        if upload_ok:
+            button.config(text="导出完成", bootstyle="success", state="normal")
+            self._set_status("系统配置已导出并上传成功")
+            self._log_export("导出并上传完成!")
+            self._log(f"\n系统配置已上传到 Profile 服务器")
+            self._log(f"  ZIP: {zip_path}")
+        elif compress_ok:
+            button.config(text="导出完成", bootstyle="warning", state="normal")
+            self._set_status("配置已压缩，但上传失败(ZIP 已本地保留)")
+            self._log_export(f"上传失败, ZIP 已本地保留: {zip_path}")
+            self._log(f"\n压缩完成但上传失败, ZIP 已本地保留")
+            self._log(f"  ZIP: {zip_path}")
+        else:
+            button.config(text="导出完成(压缩失败)", bootstyle="danger", state="normal")
+            self._set_status("配置导出完成，但压缩失败")
+            self._log_export("压缩失败，详见上方日志")
+            self._log(f"\n压缩失败，未生成 ZIP 文件")
+
+    def _on_upload_error(self, error_msg):
+        """压缩或上传过程中发生未预期异常"""
+        button = self.ui.tk_button_export_config
+        button.config(text="导出完成(异常)", bootstyle="danger", state="normal")
+        self._set_status("压缩/上传异常，可重试")
+        self._log(f"\n压缩/上传过程异常: {error_msg}")
+        self._log_export(f"压缩/上传异常: {error_msg}")
+        self._log_export("请检查网络连接或手动上传 ZIP 文件")
 
     def _on_export_error(self, error_msg):
         button = self.ui.tk_button_export_config
@@ -1368,7 +1700,7 @@ class Controller:
         self._log(f"导出配置出错: {error_msg}")
         self._set_status("配置导出出错")
         self._log_export(f"")
-        self._log_export(f"✗ 导出配置出错: {error_msg}")
+        self._log_export(f"导出配置出错: {error_msg}")
 
     @staticmethod
     def _today_str():
@@ -1463,12 +1795,12 @@ class Controller:
         self.ui.tk_button_skip_import.config(state="normal")
 
         if success:
-            self._log("\n✓ 配置导入完成!")
-            self.ui.tk_button_import_config.config(text="导入完成✓", bootstyle="success", state="disabled")
+            self._log("\n配置导入完成!")
+            self.ui.tk_button_import_config.config(text="导入完成", bootstyle="success", state="disabled")
             self.ui.tk_label_import_progress.config(text="配置导入成功! 点击「校验文件 >」进入下一步")
             self._set_status("配置导入完成")
         else:
-            self._log("\n⚠ 部分配置导入失败, 请查看日志")
+            self._log("\n部分配置导入失败, 请查看日志")
             self.ui.tk_button_import_config.config(text="重试导入", bootstyle="warning", state="normal")
             self.ui.tk_label_import_progress.config(text="部分配置导入失败，请点击重试")
             self._set_status("配置导入部分失败")
@@ -1506,27 +1838,14 @@ class Controller:
                 pass
 
     def _log_export(self, msg):
-        """写入导出日志区域 (步骤1页面内嵌)"""
-        log_widget = getattr(self.ui, 'tk_text_export_log', None)
-        if log_widget:
-            try:
-                log_widget.config(state="normal")
-                log_widget.insert("end", msg + "\n")
-                log_widget.see("end")
-                log_widget.config(state="disabled")
-            except Exception:
-                pass
+        """写入导出日志 (通过 UI 层的弹窗/缓冲区管理)"""
+        if hasattr(self.ui, '_write_export_log'):
+            self.ui._write_export_log(msg)
 
     def _clear_export_log(self):
-        """清空导出日志区域"""
-        log_widget = getattr(self.ui, 'tk_text_export_log', None)
-        if log_widget:
-            try:
-                log_widget.config(state="normal")
-                log_widget.delete("1.0", "end")
-                log_widget.config(state="disabled")
-            except Exception:
-                pass
+        """清空导出日志 (通过 UI 层的弹窗/缓冲区管理)"""
+        if hasattr(self.ui, '_clear_export_log'):
+            self.ui._clear_export_log()
 
     # ==================== 校验 ====================
 
@@ -1788,8 +2107,8 @@ class Controller:
                 # 说明文字
                 tk.Label(
                     dialog,
-                    text=f"以下 {len(conflicts)} 个文件在目标端已存在，但大小与源端不同。\n"
-                         "请选择保留已存在的文件，或覆盖为目标端重新下载。",
+                    text=f"以下 {len(conflicts)} 个文件在新电脑端已存在，但大小与旧电脑端不同。\n"
+                         "请选择保留已存在的文件，或覆盖为新电脑端重新下载。",
                     justify=tk.LEFT,
                     pady=10,
                     fg="#555",
@@ -1800,9 +2119,9 @@ class Controller:
                 header_frame.pack(fill=tk.X, padx=15, pady=(0, 0))
                 tk.Label(header_frame, text="文件路径", width=42, anchor=tk.W,
                          bg="#e0e0e0", font=("", 9, "bold")).pack(side=tk.LEFT, padx=4)
-                tk.Label(header_frame, text="源端大小", width=14, anchor=tk.W,
+                tk.Label(header_frame, text="旧电脑端大小", width=14, anchor=tk.W,
                          bg="#e0e0e0", font=("", 9, "bold")).pack(side=tk.LEFT, padx=4)
-                tk.Label(header_frame, text="目标端大小", width=14, anchor=tk.W,
+                tk.Label(header_frame, text="新电脑端大小", width=14, anchor=tk.W,
                          bg="#e0e0e0", font=("", 9, "bold")).pack(side=tk.LEFT, padx=4)
 
                 # 可滚动冲突列表

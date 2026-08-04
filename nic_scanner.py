@@ -347,6 +347,41 @@ def wait_for_ip_change(timeout_sec: float = 20.0) -> bool:
     return False
 
 
+def get_wired_adapters() -> list:
+    """
+    返回仅包含有线以太网适配器 (Type == 6, IF_TYPE_ETHERNET_CSMACD) 的列表。
+    排除 Wi-Fi (Type 71) 和虚拟适配器。
+    每项: (display_name, description, adapter_name, speed_str, index, ip_address)
+    """
+    iphlpapi = ctypes.windll.iphlpapi
+    buf_size = wintypes.ULONG(0)
+    ret = iphlpapi.GetAdaptersInfo(None, ctypes.byref(buf_size))
+    if ret != ERROR_BUFFER_OVERFLOW:
+        return []
+    buf = ctypes.create_string_buffer(buf_size.value)
+    ret = iphlpapi.GetAdaptersInfo(buf, ctypes.byref(buf_size))
+    if ret != ERROR_SUCCESS:
+        return []
+
+    result = []
+    adapter = ctypes.cast(buf, ctypes.POINTER(IP_ADAPTER_INFO))
+    while adapter:
+        if_type = adapter.contents.Type
+        if if_type == 6:  # IF_TYPE_ETHERNET_CSMACD
+            desc = adapter.contents.Description.decode("gbk", errors="replace").strip()
+            adapter_name = adapter.contents.AdapterName.decode("ascii", errors="replace").strip()
+            if_index = adapter.contents.Index
+            speed_bps = _get_if_speed(if_index)
+            speed_str = _format_speed(speed_bps)
+            ip_str = adapter.contents.IpAddressList.IpAddress.decode("ascii").strip()
+            if ip_str == "0.0.0.0":
+                ip_str = ""
+            display_name = f"{desc} {speed_str}" if speed_str else desc
+            result.append((display_name, desc, adapter_name, speed_str, if_index, ip_str))
+        adapter = adapter.contents.Next
+    return result
+
+
 if __name__ == "__main__":
     # 测试
     nics = scan_nics()
@@ -355,3 +390,7 @@ if __name__ == "__main__":
         print(f"  描述: {nic[1]}")
         print(f"  适配器: {nic[2]}")
         print()
+    print("--- 仅有线网卡 ---")
+    wired = get_wired_adapters()
+    for w in wired:
+        print(f"显示: {w[0]}  IP: {w[5]}  Index: {w[4]}")

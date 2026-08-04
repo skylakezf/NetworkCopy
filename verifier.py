@@ -20,6 +20,37 @@ import urllib.parse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+
+# ---- 编码自动检测 ----
+
+def _detect_csv_encoding(csv_path: str) -> str:
+    """根据文件头 BOM 自动检测 CSV 编码。
+
+    支持的 BOM:
+      - FF FE       → UTF-16 LE (Windows PowerShell Out-File -Encoding Unicode 等)
+      - FE FF       → UTF-16 BE
+      - EF BB BF    → UTF-8-SIG
+      - 无 BOM      → UTF-8 (回退)
+
+    返回: 编码名称字符串 (如 "utf-16-le", "utf-8-sig")
+    """
+    if not os.path.isfile(csv_path):
+        return "utf-8-sig"
+    try:
+        with open(csv_path, "rb") as f:
+            head = f.read(4)
+    except OSError:
+        return "utf-8-sig"
+
+    if len(head) >= 2:
+        if head[:2] == b"\xff\xfe":
+            return "utf-16-le"
+        if head[:2] == b"\xfe\xff":
+            return "utf-16-be"
+    if len(head) >= 3 and head[:3] == b"\xef\xbb\xbf":
+        return "utf-8-sig"
+    return "utf-8"
+
 # 客户端 SSL 上下文: 不校验自签名证书 (与 file_transfer.py 一致)
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
@@ -31,7 +62,7 @@ SKIP_PREFIXES = ("$",)
 TRANSFER_PORT = 9999
 
 # 校验线程数 (文件多时 I/O 是瓶颈，多线程可大幅加速)
-DEFAULT_VERIFY_WORKERS = 12
+DEFAULT_VERIFY_WORKERS = 48
 
 
 def is_running_in_winpe() -> bool:
@@ -154,7 +185,8 @@ def _patch_csv_gtmc_paths(csv_path: str, gtmc_new_name: str) -> None:
     old_name = "GTMC_User_Profiles"
     new_name = gtmc_new_name
 
-    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+    enc = _detect_csv_encoding(csv_path)
+    with open(csv_path, "r", encoding=enc, newline="") as f:
         content = f.read()
 
     if old_name not in content or new_name in content:
@@ -325,7 +357,8 @@ def _retry_missing_files_inner(
     _skipped_parents = set()  # 已知无法创建/写入的父目录 (与首次下载一致)
 
     try:
-        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        enc = _detect_csv_encoding(csv_path)
+        with open(csv_path, "r", encoding=enc, newline="") as f:
             reader = csv.reader(f)
             _header = next(reader, None)
             for idx, row in enumerate(reader):
@@ -582,7 +615,8 @@ def verify_csv(
     # 读取 CSV
     rows = []
     try:
-        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        enc = _detect_csv_encoding(csv_path)
+        with open(csv_path, "r", encoding=enc, newline="") as f:
             reader = csv.reader(f)
             header = next(reader, None)
             if not header:
@@ -790,7 +824,8 @@ def run_verification(
 
             # 解析 CSV 列 (与 verify_csv 内相同逻辑)
             header = []
-            with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            enc = _detect_csv_encoding(csv_path)
+            with open(csv_path, "r", encoding=enc, newline="") as f:
                 reader = csv.reader(f)
                 header = next(reader, None)
 

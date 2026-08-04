@@ -1,0 +1,3 @@
+  {base_url}/list?partition={normal_partition}&pwd={pwd}", timeout=300,
+  example
+  127.0.0.1/list?partition=D&pwd=123456

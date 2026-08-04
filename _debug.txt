@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import sys, os, time; sys.path.insert(0, '.'); from ui import WinGUI; from control import Controller; app = WinGUI(); ctl = Controller(); ctl.init(app); app.ctl = ctl; time.sleep(0.5); app.update_idletasks(); print('Step:', app._step); print('Combo:', list(app.tk_select_box_mqfzkd6x['values'])[:3]); print('Cur:', app.tk_select_box_mqfzkd6x.get()); ctl._auto_select_wired_nic(); app.update_idletasks(); print('After auto Cur:', app.tk_select_box_mqfzkd6x.get()); ctl._device_type = 'source'; ctl._on_role_selected('source'); app.update_idletasks(); print('Step2:', app._step); print('Next:', str(app.tk_button_next.cget('state'))); app.destroy()
+                                                   ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Xinyi\Desktop\���翽��\NetworkzCopy\ui.py", line 9, in <module>
+    import ttkbootstrap as ttk
+ModuleNotFoundError: No module named 'ttkbootstrap'

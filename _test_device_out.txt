@@ -1,0 +1,58 @@
+============================================================
+  �豸����ȫ���̶˵��˲��� (25 ��)
+============================================================
+
+C:\Users\Xinyi\Desktop\���翽��\NetworkzCopy\python-3.13.14-embed-amd64\Lib\site-packages\ttkbootstrap\style\bootstyle.py:1074: UserWarning: invalid bootstyle combination 'outline-checkbutton' in 'primary-outline' (unknown tokens are ignored; see the bootstyle reference)
+  ttkstyle = Bootstyle.update_ttk_widget_style(
+
+============================================================
+  �������
+============================================================
+  PASS: A1. ���Ͷ˵�����ť��ʼ״̬
+  PASS: A2. ���ն˲���ʾ������ť
+  PASS: A3. ���Ͷ˵�����ѹ�����ϴ���ť״̬��·
+  PASS: A4. ���Ͷ�ѹ���ɹ����ϴ�ʧ��
+  PASS: A5. ���Ͷ�ѹ��ʧ��
+  PASS: B1. ���ն�������ɡ��Զ���ת step5 (�������ļ�)
+  PASS: B2. ���ն�������ɡ�ͣ�� step4 (�������ļ�)
+  PASS: B3. ���ն˵�'ʹ�ô�����'���� step5 ��ѡ�������ļ���
+  PASS: B4. ���ն˵�'����'���� step5 ���Զ�ѡ��
+  PASS: C1. step5 ����ҳ��ؼ�״̬
+  PASS: C2. ����������� step6
+  PASS: C3. step6 ���˵� step5 ��ť���ָֻ�
+  PASS: D1. ZIP ѹ����������ʽ��ȷ
+  PASS: D2. ZIP ѹ���������ļ��в�����ʱʧ��
+  PASS: D3. ZIP ѹ�������ļ���
+  PASS: D4. �ϴ������ɴ������������ compress_ok=True, upload_ok=False
+  ERROR: D5. multipart/form-data body ��ʽ��ȷ �� module 'urllib.request' has no attribute 'request'
+Traceback (most recent call last):
+  File "C:\Users\Xinyi\Desktop\���翽��\NetworkzCopy\_test_device_replacement.py", line 28, in wrapper
+    fn()
+    ~~^^
+  File "C:\Users\Xinyi\Desktop\���翽��\NetworkzCopy\_test_device_replacement.py", line 598, in test_multipart_format
+    _orig_urlopen = _urllib.request.urlopen
+                    ^^^^^^^^^^^^^^^
+AttributeError: module 'urllib.request' has no attribute 'request'. Did you mean: 'Request'?
+
+  PASS: E1. ���Ͷ���������: step0��1��2��3��4��6 (����5)
+  PASS: E2. ���ն���������: step0��1��2��3��4��5��6
+  PASS: E3. �豸�����л�һ����
+  PASS: E4. ���ü�������� step0/1/2/3/5/6 ����ʾ
+  PASS: E5. �Զ�������ú����ֶ�ѡ�������ļ���
+  PASS: F1. �������ð�ť�������÷��ظ�
+  PASS: F2. ������ť�������������(���ظ����)
+  PASS: F3. ��λ���ǰ��������
+
+  �ܼ�: 25  ͨ��: 24  ʧ��: 1
+
+  ʧ������:
+      ERROR: D5. multipart/form-data body ��ʽ��ȷ �� module 'urllib.request' has no attribute 'request'
+Traceback (most recent call last):
+  File "C:\Users\Xinyi\Desktop\���翽��\NetworkzCopy\_test_device_replacement.py", line 28, in wrapper
+    fn()
+    ~~^^
+  File "C:\Users\Xinyi\Desktop\���翽��\NetworkzCopy\_test_device_replacement.py", line 598, in test_multipart_format
+    _orig_urlopen = _urllib.request.urlopen
+                    ^^^^^^^^^^^^^^^
+AttributeError: module 'urllib.request' has no attribute 'request'. Did you mean: 'Request'?
+

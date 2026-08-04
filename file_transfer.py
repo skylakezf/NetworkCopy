@@ -263,11 +263,33 @@ class FileServerHandler(BaseHTTPRequestHandler):
             self._send_json({"error": f"分区 {partition} 未映射或不可访问"}, 404)
             return
 
-        files = []
         dirs_info = []
         total_size = 0
+        file_count = 0
         current_user = _detect_source_user()
+
+        # 流式写入: 不分 Content-Length，用 Connection: close 让客户端读至连接关闭。
+        # 文件条目一边 walk 一边写入 wfile, 定期 flush, 避免大磁盘 (100GB+ 小文件)
+        # 因响应构建时间过长导致客户端 30s 超时。
         try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            wf = self.wfile
+            # 写入 JSON 头部
+            head = json.dumps({
+                "partition": partition,
+                "current_user": current_user,
+                "files": None,  # 占位, 后面手动扩开数组
+            }, ensure_ascii=False).rstrip("}")
+            # 结果形如 {"partition": "D", "current_user": "...", "files": null
+            # 把 "files": null 替换为 "files": [
+            head = head[:head.rfind('"files"')] + '"files":['
+            wf.write(head.encode("utf-8"))
+
+            first_file = True
             for root, dirs, filenames in os.walk(base):
                 rel_root = os.path.relpath(root, base)
                 rel_parts = rel_root.replace("\\", "/").split("/")
@@ -276,17 +298,15 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 def _keep_dir(d):
                     if d in SKIP_DIRS or d.startswith(SKIP_PREFIXES):
                         return False
-                    # 根目录跳过程序安装目录
                     if rel_parts == ["."]:
                         if d.lower() in (
                             "program files", "program files (x86)",
                             "programdata",
                         ):
                             return False
-                    # 在 User/Users 第一层: 只保留当前用户的子目录
                     if rel_parts == ["."]:
                         if d.lower() in ("users", "user") and current_user:
-                            pass  # 进入 Users/User 后按子名过滤
+                            pass
                     elif (
                         len(rel_parts) == 1
                         and rel_parts[0].lower() in ("users", "user")
@@ -298,11 +318,9 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
                 dirs[:] = [d for d in dirs if _keep_dir(d)]
 
-                # 额外: 跳过路径中包含 AppData 的文件 (AppData 下的内容)
                 if "AppData" in rel_parts:
                     continue
 
-                # 收集目录的原始修改时间（跳过根目录自身）
                 if rel_root != ".":
                     try:
                         d_mtime = os.stat(root).st_mtime
@@ -314,13 +332,10 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     })
 
                 for fname in filenames:
-                    # 跳过临时文件 (.tmp 等)
                     if fname.lower().endswith(SKIP_FILE_SUFFIXES):
                         continue
-                    # 跳过 Office 自动保存文件 (~$ 前缀)
                     if fname.startswith(SKIP_FILE_PREFIXES):
                         continue
-                    # 跳过系统文件 (仅根目录)
                     if os.path.normpath(root) == os.path.normpath(base):
                         if fname in SKIP_FILES:
                             continue
@@ -328,32 +343,54 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     try:
                         st = os.stat(full)
                         fsize = st.st_size
-                        f_mtime = st.st_mtime  # 保留原始修改时间，传输后还原
+                        f_mtime = st.st_mtime
                     except OSError:
-                        # stat 失败则文件不可读, 不加入列表 (否则客户端请求后会因无法读取而跳过)
                         if FileServerHandler.log_callback:
                             rel_fail = os.path.relpath(full, base).replace("\\", "/")
                             FileServerHandler.log_callback(
                                 f"[诊断] 扫描跳过(stat失败): {rel_fail}")
                         continue
                     rel = os.path.relpath(full, base)
-                    files.append({
+
+                    # 写入文件条目 (逐条流式)
+                    if not first_file:
+                        wf.write(b",")
+                    else:
+                        first_file = False
+                    entry = json.dumps({
                         "path": rel.replace("\\", "/"),
                         "size": fsize,
                         "mtime": f_mtime,
-                    })
+                    }, ensure_ascii=False)
+                    wf.write(entry.encode("utf-8"))
                     total_size += fsize
+                    file_count += 1
 
-            self._send_json({
-                "partition": partition,
-                "file_count": len(files),
-                "total_size": total_size,
-                "files": files,
-                "dirs": dirs_info,
-                "current_user": current_user,
-            })
+                    # 每 500 个文件 flush 一次，保持连接活跃防止客户端超时
+                    if file_count % 500 == 0:
+                        wf.flush()
+
+                # 每个目录处理完也 flush 一次 (目录跳转时可能没有文件但耗时)
+                wf.flush()
+
+            # 写入 JSON 尾部: 闭合 files 数组 + 附加元数据
+            tail = '],"dirs":' + json.dumps(dirs_info, ensure_ascii=False) + \
+                   ',"file_count":' + str(file_count) + \
+                   ',"total_size":' + str(total_size) + '}'
+            wf.write(tail.encode("utf-8"))
+            wf.flush()
+
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # 客户端提前断开, 无需处理
+            pass
         except Exception as e:
-            self._send_json({"error": str(e)}, 500)
+            # 若已开始写响应体 (header 已发), 无法回退 500；
+            # 尝试追加错误标记, 客户端需容错处理。
+            try:
+                wf.write(('\n,"_list_error":"' + str(e).replace('"', "'") + '"}').encode("utf-8"))
+                wf.flush()
+            except Exception:
+                pass
 
     def _handle_get(self, params):
         partition = params.get("partition", "").upper()
@@ -673,8 +710,28 @@ def _urlopen_https(url: str, timeout: int = 5, context=CLIENT_SSL_CTX, log_callb
     证书校验已被关闭 (CERT_NONE), 故证书/主机名错误不会在此抛出,
     连接失败通常是网络层问题 (主机不可达/超时/被拒绝)。诊断信息会明确区分。
     """
+    import urllib.error
     try:
         return urllib.request.urlopen(url, timeout=timeout, context=context, **kwargs)
+    except urllib.error.HTTPError as e:
+        # HTTP 层错误: 对 403 给出友好提示
+        if e.code == 403:
+            try:
+                body = e.read().decode("utf-8-sig", errors="replace")
+                data = json.loads(body)
+                svr_msg = data.get("error", "")
+            except Exception:
+                svr_msg = ""
+            msg = "验证码错误，请输入正确的验证码"
+            if svr_msg:
+                msg = f"{msg}（服务器: {svr_msg}）"
+            if log_callback:
+                log_callback(f"[诊断] 验证码错误 (HTTP 403) {url}")
+            raise RuntimeError(msg) from e
+        # 其他 HTTP 错误照常处理
+        if log_callback:
+            log_callback(f"[诊断] HTTP {e.code} 错误 {url}: {e}")
+        raise
     except Exception as e:
         # 把底层原因展开, 便于定位"连不上"的真实原因
         reason = getattr(e, "reason", None)
@@ -784,7 +841,7 @@ def _download_single_file(
                     os.utime(target_path, (mtime, mtime))
                 except OSError:
                     pass
-            log(f"  [✓] 跳过(已存在): {rel_path}")
+            log(f"  [OK] 跳过(已存在): {rel_path}")
             with stats_lock:
                 completed_files_list[0] += 1
                 completed_bytes_list[0] += fsize
@@ -976,7 +1033,7 @@ def _download_batch(
                         os.utime(target_path, (mtime, mtime))
                     except OSError:
                         pass
-                log(f"  [✓] 跳过(已存在): {rel_path}")
+                log(f"  [OK] 跳过(已存在): {rel_path}")
                 with stats_lock:
                     completed_files_list[0] += 1
                     completed_bytes_list[0] += fsize
@@ -1010,7 +1067,10 @@ def _download_batch(
 
         if resp.status != 200:
             body_text = resp.read().decode("utf-8-sig", errors="replace")
-            log(f"  [!] 批次跳过(HTTP {resp.status}): {body_text}")
+            if resp.status == 403:
+                log(f"  [!] 验证码错误，请检查验证码是否正确")
+            else:
+                log(f"  [!] 批次跳过(HTTP {resp.status}): {body_text}")
             return
 
         # 解析二进制响应
@@ -1280,7 +1340,12 @@ def _download_files_inner(
             else:
                 log(f"[诊断] 服务器已连通但返回非 ok: {data}")
         except Exception as e:
-            log(f"[诊断] 第 {attempt+1}/5 次连接失败: {type(e).__name__}: {e}")
+            err_msg = f"{type(e).__name__}: {e}"
+            # 验证码错误不再重试, 直接返回
+            if "验证码" in str(e):
+                log(f"验证码错误: {e}")
+                return False, 0, 0, errors
+            log(f"[诊断] 第 {attempt+1}/5 次连接失败: {err_msg}")
             if attempt == 4:
                 log(f"无法连接到源设备 ({base_url}): {e}")
                 log("排查建议: 1) 源端是否已点'源设备'启动服务器; 2) 两端网线/网卡已连接; "
@@ -1307,10 +1372,10 @@ def _download_files_inner(
             continue
 
         log(f"\n{'='*40}")
-        log(f"正在获取 {normal_partition} 盘文件列表...")
+        log(f"正在获取 {normal_partition} 盘文件列表 等待时间最长不超过5min")
         try:
             req = _urlopen_https(
-                f"{base_url}/list?partition={normal_partition}&pwd={pwd}", timeout=30,
+                f"{base_url}/list?partition={normal_partition}&pwd={pwd}", timeout=300,
             )
             list_data = json.loads(req.read().decode("utf-8-sig"))
         except Exception as e:
@@ -1431,7 +1496,7 @@ def _download_files_inner(
                     conflict_seen.add(target_path)
 
         if conflicts:
-            log(f"\n检测到 {len(conflicts)} 个同名文件冲突 (源端/目标端大小不同), 等待用户决定...")
+            log(f"\n检测到 {len(conflicts)} 个同名文件冲突 (旧电脑/新电脑大小不同), 等待用户决定...")
             skip_paths = conflict_callback(conflicts, log)
             if skip_paths:
                 # 用户选择保留目标端文件 → 过滤掉这些任务

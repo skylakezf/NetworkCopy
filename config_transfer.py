@@ -14,15 +14,18 @@ import re
 import sys
 import subprocess
 import shutil
+import zipfile
 import datetime
+import urllib.request
 
 
 # ==================== 导出配置 (入口) ====================
 
-def export_config(log_callback=None):
+def export_config(log_callback=None, status_callback=None):
     """导出当前系统配置到 F:\\Appl\\YYYY-MM-DD\\
 
     优先调用 out.cmd, 不可用时回退到 Python 内置实现。
+    status_callback(name, status) — 每个导出项目完成时回调。
     返回: (success: bool, export_path: str)
     """
     if log_callback is None:
@@ -41,7 +44,7 @@ def export_config(log_callback=None):
         log_callback("")
 
     # 2. 回退到 Python 内置实现
-    return _export_config_builtin(log_callback)
+    return _export_config_builtin(log_callback, status_callback=status_callback)
 
 
 # ==================== out.cmd 子进程调用 ====================
@@ -81,9 +84,12 @@ def _run_out_cmd(out_cmd_path, log_callback):
     log_callback("-" * 50)
 
     try:
-        # 设置 NETWORKCOPY_HEADLESS 环境变量, 令 out.cmd 跳过交互式弹窗
+        # 设置环境变量:
+        #   NETWORKCOPY_HEADLESS=1 → out.cmd 跳过交互式弹窗
+        #   HEADLESS=1             → out.cmd 跳过压缩上传 (由 Python 统一处理)
         env = os.environ.copy()
         env["NETWORKCOPY_HEADLESS"] = "1"
+        env["HEADLESS"] = "1"
 
         # bufsize=1 → 行缓冲, 每行 flush 后立即可读
         process = subprocess.Popen(
@@ -125,11 +131,12 @@ def _run_out_cmd(out_cmd_path, log_callback):
 
 # ==================== Python 内置导出 (回退方案) ====================
 
-def _export_config_builtin(log_callback):
+def _export_config_builtin(log_callback, status_callback=None):
     """Python 内置导出实现 (out.cmd 不可用时的回退方案)。
 
-    仅覆盖核心功能 (注册表/收藏夹/IP 配置/程序列表),
-    不包含截图、磁盘空间估算等 PowerShell 脚本功能。
+    覆盖核心功能 (注册表/收藏夹/IP 配置/程序列表/磁盘空间估算),
+    不包含截图、Office 模板宏等 PowerShell 脚本功能。
+    status_callback(name, status) — status 为 "成功"|"失败"|"跳过"。
     """
     today = datetime.datetime.now()
     date_str = today.strftime("%Y-%m-%d")
@@ -144,44 +151,61 @@ def _export_config_builtin(log_callback):
 
     results = []
 
-    # 1. 导出 Outlook 邮件规则
-    results.append(_export_reg(
+    def _track(name, success, skipped=False):
+        """记录单项结果并回调状态。"""
+        results.append(success)
+        if status_callback:
+            if skipped:
+                status_callback(name, "跳过")
+            elif success:
+                status_callback(name, "成功")
+            else:
+                status_callback(name, "失败")
+
+    # 1. 导出 Outlook 邮件规则 (optional: 大部分用户未配置)
+    _track("Outlook 邮件规则", _export_reg(
         r"HKCU\Software\Microsoft\Office\14.0\Outlook\Rules",
         os.path.join(export_root, "Outlook_Rules.reg"),
-        "Outlook 邮件规则", log_callback
-    ))
+        "Outlook 邮件规则", log_callback, optional=True
+    ), skipped=(not os.path.exists(os.path.join(export_root, "Outlook_Rules.reg"))))
 
     # 2. 导出 Outlook 配置文件
-    results.append(_export_reg(
+    _track("Outlook 配置文件", _export_reg(
         r"HKCU\Software\Microsoft\Windows NT\CurrentVersion\Windows Messaging Subsystem\Profiles",
         os.path.join(export_root, "Outlook_Profiles.reg"),
         "Outlook 配置文件", log_callback
     ))
 
-    # 3. 导出 Outlook 自动存档
-    results.append(_export_reg(
+    # 3. 导出 Outlook 自动存档 (optional: 大部分用户未配置)
+    _track("Outlook 自动存档", _export_reg(
         r"HKCU\Software\Microsoft\Office\14.0\Outlook\Preferences",
         os.path.join(export_root, "Outlook_AutoArchive.reg"),
-        "Outlook 自动存档", log_callback
-    ))
+        "Outlook 自动存档", log_callback, optional=True
+    ), skipped=(not os.path.exists(os.path.join(export_root, "Outlook_AutoArchive.reg"))))
 
     # 4. 导出 Chrome 浏览器收藏夹
-    results.append(_export_chrome_bookmarks(export_root, log_callback))
+    _track("Chrome 收藏夹", _export_chrome_bookmarks(export_root, log_callback))
 
     # 5. 导出 Edge 浏览器收藏夹
-    results.append(_export_edge_bookmarks(export_root, log_callback))
+    _track("Edge 收藏夹", _export_edge_bookmarks(export_root, log_callback))
 
     # 6. 导出打印机列表
-    results.append(_export_printers(export_root, log_callback))
+    _track("打印机列表", _export_printers(export_root, log_callback))
 
     # 7. 导出输入法设置
-    results.append(_export_ime(export_root, log_callback))
+    _track("输入法设置", _export_ime(export_root, log_callback))
 
-    # 8. 导出网卡 IP 地址配置
-    results.append(_export_ip_config(export_root, log_callback))
+    # 8. 导出网卡 IP 配置
+    _track("网卡 IP 配置", _export_ip_config(export_root, log_callback))
 
-    # 9. 导出已安装程序列表
-    results.append(_export_installed_programs(export_root, log_callback))
+    # 9. 导出已安装程序列表 (注册表 Win32)
+    _track("已安装程序 (注册表)", _export_installed_programs(export_root, log_callback))
+
+    # 10. 磁盘分配单元迁移空间估算 (512B -> 4K)
+    _track("磁盘分配单元估算", _export_disk_allocation_estimate(export_root, log_callback))
+
+    # 11. 导出开始菜单 App 列表 (Shell:AppsFolder)
+    _track("开始菜单 App", _export_start_menu_apps(export_root, log_callback))
 
     # 写入 systemconfig.ini (与 out.cmd 格式一致)
     try:
@@ -199,7 +223,7 @@ def _export_config_builtin(log_callback):
     fail_count = sum(1 for r in results if not r)
     log_callback(f"\n内置导出完成: 成功 {success_count} 项, 失败 {fail_count} 项")
     log_callback(f"配置已保存到: {export_root}")
-    log_callback("注意: 截图/磁盘空间估算等功能仅在 out.cmd 模式下可用")
+    # log_callback("注意: 截图/Office模板宏等功能需通过 out.cmd 执行")
 
     return fail_count == 0, export_root
 
@@ -250,7 +274,7 @@ def import_config(config_folder, log_callback=None):
         log_callback("跳过 输入法设置: 备份文件不存在")
 
     # 5. 显示打印机信息 (导入需手动)
-    printers_file = os.path.join(config_folder, "Printers.txt")
+    printers_file = os.path.join(config_folder, "Printers.csv")
     if os.path.exists(printers_file):
         results.append(_import_printers(printers_file, log_callback))
 
@@ -271,7 +295,7 @@ def find_config_folders():
     """
     results = []
 
-    # 1. 读取 systemconfig.ini
+    # 1. 读取 systemconfig.ini (支持 PATH= 和 LastExportPath= 两种格式)
     ini_path = os.path.join("F:\\", "systemconfig.ini")
     ini_folder = None
     if os.path.isfile(ini_path):
@@ -279,10 +303,13 @@ def find_config_folders():
             with open(ini_path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
                     line = line.strip()
-                    if line.startswith("PATH="):
-                        path = line.split("=", 1)[1].strip()
-                        if os.path.isdir(path):
-                            ini_folder = path
+                    for prefix in ("LastExportPath=", "PATH="):
+                        if line.startswith(prefix):
+                            path = line.split("=", 1)[1].strip()
+                            if os.path.isdir(path):
+                                ini_folder = path
+                            break
+                    if ini_folder:
                         break
         except Exception:
             pass
@@ -311,26 +338,31 @@ def find_config_folders():
 
 
 def get_config_from_ini():
-    """从 F:\\systemconfig.ini 读取配置路径，返回路径或 None"""
+    """从 F:\\systemconfig.ini 读取配置路径 (支持 PATH= 和 LastExportPath=)，
+    返回 (path, time_str) 或 (None, None)。"""
     ini_path = os.path.join("F:\\", "systemconfig.ini")
     if not os.path.isfile(ini_path):
-        return None
+        return None, None
+    path = None
+    time_str = None
     try:
         with open(ini_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
-                if line.startswith("PATH="):
-                    path = line.split("=", 1)[1].strip()
-                    if os.path.isdir(path):
-                        return path
+                if line.startswith("LastExportTime="):
+                    time_str = line.split("=", 1)[1].strip()
+                elif line.startswith("LastExportPath=") or line.startswith("PATH="):
+                    p = line.split("=", 1)[1].strip()
+                    if os.path.isdir(p):
+                        path = p
     except Exception:
         pass
-    return None
+    return path, time_str
 
 
 # ==================== 内部辅助函数 ====================
 
-def _run_command(cmd, log_callback, timeout=30):
+def _run_command(cmd, log_callback, timeout=30, log_errors=True):
     """运行命令并返回 (success, output)"""
     try:
         result = subprocess.run(
@@ -341,7 +373,8 @@ def _run_command(cmd, log_callback, timeout=30):
         if result.returncode == 0:
             return True, output
         else:
-            log_callback(f"  [失败] {' '.join(cmd)[:60]}: {output[:200]}")
+            if log_errors:
+                log_callback(f"  [失败] {' '.join(cmd)[:60]}: {output[:200]}")
             return False, output
     except FileNotFoundError:
         log_callback(f"  [跳过] 命令不可用: {cmd[0]}")
@@ -351,15 +384,19 @@ def _run_command(cmd, log_callback, timeout=30):
         return False, str(e)
 
 
-def _export_reg(key, output_path, label, log_callback):
-    """导出注册表键到 .reg 文件"""
+def _export_reg(key, output_path, label, log_callback, optional=False):
+    """导出注册表键到 .reg 文件。
+    optional=True 时，键不存在不视为错误（如 Outlook 规则/自动存档）。"""
     log_callback(f"导出 {label}: {key}")
     success, _ = _run_command(
         ["reg", "export", key, output_path, "/y"],
-        log_callback
+        log_callback, log_errors=(not optional)
     )
     if success:
         log_callback(f"  [OK] 已导出 {label}")
+    elif optional:
+        log_callback(f"  [跳过] {label} 未配置（正常）")
+        return True  # 视为成功
     return success
 
 
@@ -493,22 +530,52 @@ def _import_edge_bookmarks(config_folder, log_callback):
 
 
 def _export_printers(export_root, log_callback):
-    """导出打印机列表 (wmic)"""
+    """导出打印机列表 (PowerShell Get-Printer, 替代已移除的 wmic)"""
     log_callback("导出打印机列表...")
-    output_path = os.path.join(export_root, "Printers.txt")
-    success, output = _run_command(
-        ["wmic", "printer", "get", "Name,DriverName", "/format:csv"],
-        log_callback
+    output_path = os.path.join(export_root, "Printers.csv")
+
+    # 用管道 + Out-String 抑制进度条 CLIXML 输出
+    ps_script = (
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+        "$ProgressPreference='SilentlyContinue';"
+        "Get-Printer | Select Name, DriverName |"
+        "ConvertTo-Csv -NoTypeInformation | Out-String"
     )
-    if success:
-        try:
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(output)
-            log_callback("  [OK] 打印机列表已导出")
-        except Exception as e:
-            log_callback(f"  写入打印机列表失败: {e}")
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace",
+        )
+        if result.returncode != 0:
+            stderr_snippet = result.stderr.strip()[:200] if result.stderr.strip() else ""
+            log_callback(f"  [失败] Get-Printer 退出码 {result.returncode}"
+                         + (f": {stderr_snippet}" if stderr_snippet else ""))
             return False
-    return success
+
+        # 过滤掉 CLIXML 尾部（若有）
+        stdout_text = result.stdout
+        clixml_pos = stdout_text.find("#< CLIXML")
+        if clixml_pos >= 0:
+            stdout_text = stdout_text[:clixml_pos]
+
+        lines = [l for l in stdout_text.strip().splitlines() if l.strip()]
+        if len(lines) <= 1:
+            log_callback("  [警告] 未发现任何打印机")
+
+        with open(output_path, "w", encoding="utf-8-sig") as f:
+            f.write(stdout_text.strip() + "\n")
+        log_callback(f"  [OK] 打印机列表已导出 ({max(0, len(lines) - 1)} 台)")
+        return True
+    except FileNotFoundError:
+        log_callback("  [跳过] PowerShell 不可用 (WinPE)")
+        return True
+    except subprocess.TimeoutExpired:
+        log_callback("  [失败] Get-Printer 超时")
+        return False
+    except Exception as e:
+        log_callback(f"  [失败] 导出打印机列表异常: {e}")
+        return False
 
 
 def _import_printers(printers_file, log_callback):
@@ -573,11 +640,12 @@ def _export_ip_config(export_root, log_callback):
 
 
 def _export_installed_programs(export_root, log_callback):
-    """通过 PowerShell 导出已安装程序列表"""
-    log_callback("导出已安装程序列表 (PowerShell)...")
-    output_path = os.path.join(export_root, "Installed_Programs.txt")
+    """通过注册表导出已安装程序列表 (Win32 传统应用)"""
+    log_callback("导出已安装程序列表 (注册表 Win32)...")
+    output_path = os.path.join(export_root, "Installed_Programs_Regedit.csv")
 
     ps_script = (
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
         "$paths=@('HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',"
         "'HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',"
         "'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*');"
@@ -590,9 +658,9 @@ def _export_installed_programs(export_root, log_callback):
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps_script],
             capture_output=True, text=True, timeout=60,
-            encoding="gbk", errors="replace"
+            encoding="utf-8", errors="replace"
         )
-        with open(output_path, "w", encoding="utf-8") as f:
+        with open(output_path, "w", encoding="utf-8-sig") as f:
             f.write(result.stdout)
         log_callback("  [OK] 已安装程序列表已导出")
         return True
@@ -602,3 +670,203 @@ def _export_installed_programs(export_root, log_callback):
     except Exception as e:
         log_callback(f"  [失败] 导出已安装程序列表失败: {e}")
         return False
+
+
+def _export_start_menu_apps(export_root, log_callback):
+    """通过 Shell:AppsFolder 枚举"开始"菜单中的所有 App (UWP + 快捷方式)。
+    输出 CSV: AppName, AppPath (AppUserModelId 或 .lnk 路径)。
+    """
+    log_callback("导出开始菜单 App 列表 (Shell:AppsFolder)...")
+    output_path = os.path.join(export_root, "StartMenu_Apps.csv")
+
+    # 通过 Shell.Application COM 对象遍历 shell:AppsFolder
+    # 注意: 依赖 explorer.exe shell, PE 环境下不可用
+    ps_script = (
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+        "$sh=New-Object -ComObject Shell.Application;"
+        "$f=$sh.NameSpace('shell:AppsFolder');"
+        "$f.Items()|%{$n=$_.Name;$p=$_.Path;"
+        "[PSCustomObject]@{AppName=$n;AppPath=$p}}|"
+        "Sort AppName|"
+        "ConvertTo-Csv -NoTypeInformation"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, text=True, timeout=120,
+            encoding="utf-8", errors="replace",
+        )
+        if result.returncode != 0:
+            stderr_snippet = result.stderr.strip()[:200] if result.stderr.strip() else ""
+            log_callback(f"  [失败] PowerShell 退出码 {result.returncode}"
+                         + (f": {stderr_snippet}" if stderr_snippet else ""))
+            return False
+
+        lines = result.stdout.strip().splitlines()
+        if len(lines) <= 1:
+            log_callback("  [警告] AppsFolder 返回空 (可能无 App 或 shell 不可用)")
+            # 空结果也写出表头
+            with open(output_path, "w", encoding="utf-8-sig") as f:
+                f.write('"AppName","AppPath"\n')
+            return True
+
+        with open(output_path, "w", encoding="utf-8-sig") as f:
+            f.write(result.stdout.strip() + "\n")
+        log_callback(f"  [OK] 开始菜单 App 列表已导出 ({len(lines) - 1} 个)")
+        return True
+    except FileNotFoundError:
+        log_callback("  [跳过] PowerShell 不可用 (WinPE)")
+        return True
+    except Exception as e:
+        log_callback(f"  [失败] 导出开始菜单 App 列表失败: {e}")
+        return False
+
+
+def _export_disk_allocation_estimate(export_root, log_callback):
+    """磁盘分配单元迁移空间估算 (512B -> 4K)。
+    直接导入 calc_allocation_migration 模块遍历 D/E/F 分区，
+    输出全量文件清单及 <4KB 小文件清单 CSV。
+    （在 frozen exe 中亦可用，无需 subprocess。）
+    """
+    log_callback("磁盘分配单元迁移空间估算 (512B->4K)...")
+
+    try:
+        from systemconfig import calc_allocation_migration
+    except ImportError:
+        log_callback("  [跳过] 磁盘扫描模块未找到")
+        return True
+
+    def log_wrapper(msg):
+        """只记录汇总/关键行到日志，跳过逐文件路径。"""
+        stripped = msg.strip()
+        if any(kw in stripped for kw in (
+            "文件总数", "汇总结果", "计算完成",
+            "原占用", "预估迁移", "总计:", "正在扫描",
+            "分区不存在", "错误:", "磁盘分配",
+            "输出目录", "输出文件", "全量文件清单",
+            "小文件清单", "ceil",
+        )):
+            try:
+                log_callback(f"  {stripped}")
+            except UnicodeError:
+                pass
+
+    try:
+        _ok, results = calc_allocation_migration.run_estimate(
+            output_dir=export_root,
+            log_callback=log_wrapper,
+        )
+
+        for r in results:
+            log_callback(
+                f"  [{r.drive}:] {r.file_count} 文件, "
+                + f"<4KB: {r.small_count}, "
+                + f"512B->4K: {r.old_aligned_gb}GB -> {r.new_aligned_gb}GB "
+                + f"(+{r.diff_gb}GB)"
+            )
+
+        log_callback("  [OK] 磁盘空间估算完成")
+        return True
+    except Exception as e:
+        log_callback(f"  [失败] 磁盘空间估算异常: {e}")
+        return False
+
+
+# ============================================================
+# 压缩 & 上传到 Profile 服务器
+# ============================================================
+
+# Profile 上传服务器地址
+PROFILE_UPLOAD_URL = "http://ipcheck.gtmcl.com:3000/api/upload"
+
+
+def compress_and_upload_config(export_path: str, log_callback=None):
+    """将导出文件夹压缩为 zip 并上传到 Profile 服务器。
+
+    命名为 <计算机名>_<日期>.zip，例如 QDNB5098_2026-07-31.zip。
+    成功后不会删除本地 ZIP，失败则保留 ZIP 供手工上传。
+
+    Args:
+        export_path: 导出文件夹路径 (如 F:\\Appl\\2026-07-31)
+        log_callback: 日志回调 (msg: str) -> None
+
+    Returns:
+        (compress_ok: bool, zip_path: str, upload_ok: bool)
+    """
+    if log_callback is None:
+
+        def log_callback(msg):
+            print(msg)
+
+    computer_name = os.environ.get("COMPUTERNAME", "UNKNOWN")
+    folder_name = os.path.basename(export_path)  # YYYY-MM-DD
+    zip_name = f"{computer_name}_{folder_name}.zip"
+    zip_dir = os.path.dirname(export_path)  # F:\\Appl
+    zip_path = os.path.join(zip_dir, zip_name)
+
+    # ---- 步骤 1: 压缩为 ZIP ----
+    log_callback(f"正在压缩配置文件夹...")
+    log_callback(f"  源目录: {export_path}")
+    log_callback(f"  目标文件: {zip_name}")
+
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, dirs, files in os.walk(export_path):
+                for fname in files:
+                    full = os.path.join(root, fname)
+                    arcname = os.path.relpath(full, export_path)
+                    zf.write(full, arcname)
+        zip_size = os.path.getsize(zip_path)
+        log_callback(f"  压缩完成 ({zip_size / 1024:.1f} KB)")
+    except Exception as e:
+        log_callback(f"  [失败] 压缩异常: {e}")
+        return False, "", False
+
+    # ---- 步骤 2: 上传到 Profile 服务器 ----
+    log_callback(f"正在上传到 Profile 服务器...")
+
+    try:
+        boundary = "----NetworkCopyUpload"
+
+        # 构造 multipart/form-data body
+        body_parts = []
+
+        body_parts.append(f"--{boundary}".encode("utf-8"))
+        body_parts.append(
+            f'Content-Disposition: form-data; name="file"; filename="{zip_name}"'.encode(
+                "utf-8"
+            )
+        )
+        body_parts.append(b"Content-Type: application/zip")
+        body_parts.append(b"")
+
+        with open(zip_path, "rb") as fh:
+            body_parts.append(fh.read())
+
+        body_parts.append(f"--{boundary}--".encode("utf-8"))
+        body_parts.append(b"")
+
+        data = b"\r\n".join(body_parts)
+
+        req = urllib.request.Request(
+            PROFILE_UPLOAD_URL,
+            data=data,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result_body = resp.read().decode("utf-8", errors="replace")
+            if resp.status == 200:
+                log_callback(f"  上传成功! 服务器响应: {result_body}")
+                return True, zip_path, True
+            else:
+                log_callback(
+                    f"  上传返回 HTTP {resp.status}: {result_body}"
+                )
+                return True, zip_path, False
+
+    except Exception as e:
+        log_callback(f"  [失败] 上传异常: {e}")
+        log_callback(f"  ZIP 文件已保留在: {zip_path}")
+        return True, zip_path, False

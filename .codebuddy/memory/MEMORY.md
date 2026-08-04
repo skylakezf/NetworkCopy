@@ -28,6 +28,7 @@
 - 新增依赖 cryptography（已 pip 安装进 python-3.13.14-embed-amd64，PyInstaller 需 --hidden-import cryptography --collect-data cryptography）
 - 盘符映射是核心难点，需用户手动指定
 - 组网方式（2026-07-28 核实代码更正）：目标设备设静态 IP 169.254.100.1 并运行内置 DHCP 服务器，源设备通过 DHCP 获得 169.254.100.2；传输端口为 9999（不是 443/80）
+- 网卡选择已改为自动（2026-08-02）：发送端 HTTP Server bind 0.0.0.0（无需网卡选择）；接收端 DHCP 在所有有线网卡(Type=6)上广播 OFFER/ACK（多 send socket）；网卡选择下拉框移至步骤 1"高级选项"折叠面板中，仅在需要手动覆盖时使用
 - 所有传输端点 (/ping /list /get /batch_get) 必须携带 ?pwd=<验证码>，否则 403
 - 客户端不校验自签名证书 (CERT_NONE)，安全性由随机验证码保证；如需防 MITM 需改为校验证书
 - 已知重大问题（2026-07-28 审查，尚未修复）：control.py 未向 FileServer/download_files/scan_source_device 传 auth_code 与 cert_paths，主流程实际跑不通；_send_json 缺 Content-Length 导致 HTTP/1.1 keep-alive 下 JSON 端点挂起；_download_batch except 分支对 4 元组按 3 值解包；verifier 重试下载走明文 http 且无 pwd；run_verification 未传 server_ip/gtmc_new_name。详见 2026-07-28.md
