@@ -62,7 +62,7 @@ SKIP_PREFIXES = ("$",)
 TRANSFER_PORT = 9999
 
 # 校验线程数 (文件多时 I/O 是瓶颈，多线程可大幅加速)
-DEFAULT_VERIFY_WORKERS = 48
+DEFAULT_VERIFY_WORKERS = 64
 
 
 def is_running_in_winpe() -> bool:
@@ -175,6 +175,371 @@ def find_csv_file(folder_path: str) -> str:
             return os.path.join(folder_path, f)
 
     raise FileNotFoundError(f"在 {folder_path} 中未找到 FullFilelist_DEF.csv")
+
+
+def _find_csv_from_ini(f_drive_pe: str) -> str | None:
+    """从 systemconfig.ini 读取配置路径，定位对应的 FullFilelist_DEF.csv。
+
+    发送端导出配置时会将路径写入 F:\\systemconfig.ini (如 LastExportPath=F:\\Appl\\2026-07-28\\)。
+    接收端数据传输完成后, F 盘内容完整复制, systemconfig.ini 也随之到达。
+    此函数读取 ini, 将路径中的原始盘符(F:)映射为 PE 下实际盘符(f_drive_pe),
+    然后查找对应的 CSV 文件。
+
+    f_drive_pe: PE 下 F 盘的实际盘符，如 "K:"
+    返回 CSV 完整路径，找不到则返回 None。
+    """
+    ini_path = os.path.join(f_drive_pe.rstrip("\\") + "\\", "systemconfig.ini")
+    if not os.path.isfile(ini_path):
+        return None
+
+    config_path = None
+    try:
+        with open(ini_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("LastExportPath=") or line.startswith("PATH="):
+                    p = line.split("=", 1)[1].strip()
+                    # 路径中的盘符是原始盘符(如 F:), PE 下需映射为 f_drive_pe
+                    if len(p) >= 3 and p[1:3] == ":\\":
+                        rel = p[3:]  # Appl\\2026-07-28\\
+                        mapped = os.path.join(f_drive_pe.rstrip("\\") + "\\", rel)
+                        if os.path.isdir(mapped):
+                            config_path = mapped
+                    elif os.path.isdir(p):
+                        config_path = p
+    except Exception:
+        pass
+
+    if config_path:
+        csv_path = os.path.join(config_path, "FullFilelist_DEF.csv")
+        if os.path.isfile(csv_path):
+            return csv_path
+        # 也搜索不区分大小写
+        try:
+            for fname in os.listdir(config_path):
+                if fname.lower() == "fullfilelist_def.csv":
+                    return os.path.join(config_path, fname)
+        except OSError:
+            pass
+    return None
+
+
+# ---- 文件类型查询 (fileinfo.com) ----
+
+# 模块级缓存: 已查询过的扩展名 → 文件类型描述
+_EXTENSION_CACHE: dict = {}
+_ext_cache_lock = threading.Lock()
+
+# 常用 Windows 扩展名内置映射 (减少网络请求, 即时返回)
+_BUILTIN_EXTENSIONS: dict[str, str] = {
+    # 可执行文件 / 库
+    "exe": "Executable File",
+    "dll": "Dynamic Link Library",
+    "sys": "System File",
+    "drv": "Device Driver",
+    "ocx": "ActiveX Control",
+    "ax": "ActiveX Control",
+    "cpl": "Control Panel Applet",
+    "scr": "Screen Saver",
+    "msi": "Windows Installer Package",
+    "msp": "Windows Installer Patch",
+    "com": "Command File",
+    # 脚本 / 批处理
+    "bat": "Batch File",
+    "cmd": "Windows Command Script",
+    "ps1": "PowerShell Script",
+    "vbs": "VBScript File",
+    "js": "JavaScript File",
+    "wsf": "Windows Script File",
+    # 配置文件
+    "ini": "Configuration Settings",
+    "cfg": "Configuration File",
+    "conf": "Configuration File",
+    "inf": "Setup Information File",
+    "reg": "Registry File",
+    "pol": "Policy File",
+    "manifest": "Assembly Manifest",
+    # 文档
+    "doc": "Microsoft Word Document",
+    "docx": "Microsoft Word Document",
+    "xls": "Microsoft Excel Spreadsheet",
+    "xlsx": "Microsoft Excel Spreadsheet",
+    "ppt": "Microsoft PowerPoint Presentation",
+    "pptx": "Microsoft PowerPoint Presentation",
+    "pdf": "Portable Document Format",
+    "txt": "Text Document",
+    "rtf": "Rich Text Format",
+    "csv": "Comma Separated Values File",
+    # 数据 / 数据库
+    "mdb": "Microsoft Access Database",
+    "accdb": "Microsoft Access Database",
+    "db": "Database File",
+    "sqlite": "SQLite Database",
+    "xml": "XML File",
+    "json": "JSON Data File",
+    "dat": "Data File",
+    "bin": "Binary Data File",
+    # 日志 / 临时 / 缓存
+    "log": "Log File",
+    "log1": "Registry Transaction Log",
+    "log2": "Registry Transaction Log",
+    "tmp": "Temporary File",
+    "temp": "Temporary File",
+    "bak": "Backup File",
+    "old": "Old/Backup File",
+    "cache": "Cache File",
+    "etl": "Event Trace Log",
+    "evtx": "Windows Event Log",
+    # 注册表相关
+    "blf": "Registry Transaction Log",
+    "regtrans-ms": "Registry Transaction File",
+    # 快捷方式
+    "lnk": "Windows Shortcut",
+    "url": "Internet Shortcut",
+    "pif": "Program Information File",
+    # 字体
+    "ttf": "TrueType Font",
+    "ttc": "TrueType Collection Font",
+    "otf": "OpenType Font",
+    "fon": "Font File",
+    # 媒体
+    "jpg": "JPEG Image",
+    "jpeg": "JPEG Image",
+    "png": "PNG Image",
+    "gif": "GIF Image",
+    "bmp": "Bitmap Image",
+    "ico": "Icon File",
+    "svg": "SVG Image",
+    "tif": "TIFF Image",
+    "tiff": "TIFF Image",
+    "wav": "WAV Audio",
+    "mp3": "MP3 Audio",
+    "wma": "Windows Media Audio",
+    "mp4": "MP4 Video",
+    "avi": "AVI Video",
+    "wmv": "Windows Media Video",
+    "mkv": "Matroska Video",
+    "mov": "QuickTime Movie",
+    # 压缩
+    "zip": "Compressed Zip Archive",
+    "rar": "WinRAR Archive",
+    "7z": "7-Zip Archive",
+    "tar": "Tape Archive",
+    "gz": "Gzip Compressed Archive",
+    "cab": "Windows Cabinet File",
+    "msu": "Windows Update Standalone Package",
+    # 系统文件
+    "cat": "Security Catalog",
+    "mui": "Multilingual User Interface File",
+    "pf": "Prefetch File",
+    "dmp": "Memory Dump File",
+    "wer": "Windows Error Report",
+    "hdmp": "Heap Dump File",
+    "mdmp": "Minidump File",
+    # 证书 / 安全
+    "cer": "Security Certificate",
+    "crt": "Security Certificate",
+    "pem": "Privacy Enhanced Mail Certificate",
+    "pfx": "Personal Information Exchange",
+    "der": "DER Encoded Certificate",
+    # 其他常见
+    "chm": "Compiled HTML Help",
+    "hlp": "Windows Help File",
+    "cur": "Cursor File",
+    "ani": "Animated Cursor",
+    "icl": "Icon Library",
+    "theme": "Windows Theme File",
+    "themepack": "Windows Theme Pack",
+    "diagcab": "Troubleshooting Pack",
+    "sdb": "Application Compatibility Database",
+    "nls": "National Language Support File",
+    "luac": "Compiled Lua Script",
+    "lua": "Lua Script",
+    "py": "Python Script",
+    "pyc": "Python Compiled File",
+    "pyd": "Python Dynamic Module",
+    "cs": "C# Source Code",
+    "h": "C/C++ Header File",
+    "cpp": "C++ Source Code",
+    "lib": "Static Library",
+    "obj": "Object File",
+    "pdb": "Program Database",
+    "lib": "Static Library",
+    "exp": "Exports Library File",
+    "res": "Compiled Resource File",
+    "rc": "Resource Script",
+    # 打印机
+    "ppd": "PostScript Printer Description",
+    "gpd": "Generic Printer Description",
+    "inf_loc": "Localized INF File",
+    "pnf": "Precompiled INF File",
+}
+
+
+def _fetch_extension_info(ext: str) -> str:
+    """查询 fileinfo.com 获取扩展名对应的文件类型描述 (线程安全, 带缓存)。
+
+    优先使用内置映射, 其次模块级缓存, 最后通过 HTTP 查询 JSON-LD 结构化数据。
+    """
+    ext_lower = ext.lower()
+    if not ext_lower:
+        return ""
+
+    with _ext_cache_lock:
+        if ext_lower in _BUILTIN_EXTENSIONS:
+            return _BUILTIN_EXTENSIONS[ext_lower]
+        if ext_lower in _EXTENSION_CACHE:
+            return _EXTENSION_CACHE[ext_lower]
+
+    result = f"{ext.upper()} File"
+    try:
+        url = f"https://fileinfo.com/extension/{ext_lower}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        resp = urllib.request.urlopen(req, timeout=10, context=_SSL_CTX)
+        html = resp.read().decode("utf-8", errors="replace")
+
+        # 策略: 解析 JSON-LD 结构化数据 (alternateName = 主文件类型名称)
+        m = re.search(
+            r'<script\s+type="application/ld\+json">(.*?)</script>',
+            html, re.I | re.S,
+        )
+        if m:
+            try:
+                data = json.loads(m.group(1))
+                items = data.get("@graph", [data]) if isinstance(data, dict) else [data]
+                if isinstance(items, list):
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        alt = item.get("alternateName", "")
+                        if alt and alt.lower() != f"{ext_lower} file extension":
+                            result = alt
+                            break
+            except json.JSONDecodeError:
+                pass
+
+    except Exception:
+        pass
+
+    with _ext_cache_lock:
+        _EXTENSION_CACHE[ext_lower] = result
+    return result
+
+
+def _get_file_extension(file_path: str) -> str:
+    """从文件路径提取扩展名 (不含点号, 小写)"""
+    _, ext = os.path.splitext(file_path)
+    return ext.lstrip(".").lower()
+
+
+def add_file_type_column(csv_path: str, log_callback=None) -> bool:
+    """为校验后的 CSV 添加 G 列 (FileType), 通过 fileinfo.com 查询扩展名描述。
+
+    收集 CSV 中所有唯一扩展名 → 并行查询 fileinfo.com (内置映射即时 + 未知扩展名在线查询)
+    → 写入 G 列, 供用户判断缺失文件的重要性。
+
+    返回 True 表示成功添加。
+    """
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    # ---- 读取 CSV ----
+    rows = []
+    header = []
+    enc = _detect_csv_encoding(csv_path)
+    try:
+        with open(csv_path, "r", encoding=enc, newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                log("  CSV 为空，跳过文件类型标记")
+                return False
+            rows = list(reader)
+    except Exception as e:
+        log(f"  读取 CSV 失败: {e}")
+        return False
+
+    if not rows:
+        log("  无数据行，跳过文件类型标记")
+        return False
+
+    # ---- 收集所有唯一扩展名 ----
+    try:
+        col_fullpath = header.index("FullPath")
+    except ValueError:
+        col_fullpath = 1
+
+    extensions: set = set()
+    for row in rows:
+        if len(row) > col_fullpath:
+            ext = _get_file_extension(row[col_fullpath])
+            if ext:
+                extensions.add(ext)
+
+    if not extensions:
+        log("  未检测到任何文件扩展名")
+        return False
+
+    log(f"\n查询文件类型: {len(extensions)} 种扩展名...")
+
+    # ---- 分两阶段查询 ----
+    # 阶段 1: 内置映射 (即时)
+    builtin_hits = [e for e in extensions if e in _BUILTIN_EXTENSIONS]
+    if builtin_hits:
+        log(f"  内置映射命中: {len(builtin_hits)} 种扩展名")
+
+    # 阶段 2: 在线查询未知扩展名 (线程池并发)
+    network_exts = sorted(e for e in extensions if e not in _BUILTIN_EXTENSIONS and e not in _EXTENSION_CACHE)
+    if network_exts:
+        log(f"  在线查询: {len(network_exts)} 种扩展名...")
+        done = [0]
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {
+                executor.submit(_fetch_extension_info, e): e
+                for e in network_exts
+            }
+            for future in as_completed(futures):
+                done[0] += 1
+                if done[0] % 30 == 0 or done[0] == len(network_exts):
+                    log(f"    扩展名查询进度: {done[0]}/{len(network_exts)}")
+
+    # ---- 构建映射表 ----
+    ext_map: dict = {}
+    for ext in extensions:
+        ext_map[ext] = _fetch_extension_info(ext)
+
+    # ---- 写入 G 列 (index 6, column F 留空) ----
+    col_g = 6
+    full_header = list(header)
+    while len(full_header) <= col_g:
+        full_header.append("")
+    full_header[col_g] = "FileType"
+
+    for row in rows:
+        while len(row) <= col_g:
+            row.append("")
+        if len(row) > col_fullpath:
+            ext = _get_file_extension(row[col_fullpath])
+            row[col_g] = ext_map.get(ext, "")
+        else:
+            row[col_g] = ""
+
+    # ---- 写回 CSV ----
+    try:
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(full_header)
+            writer.writerows(rows)
+        log(f"文件类型已写入 G 列 (共 {len(extensions)} 种扩展名, "
+            f"内置 {len(builtin_hits)}, 在线查询 {len(network_exts)})")
+        return True
+    except Exception as e:
+        log(f"  写入文件类型失败: {e}")
+        return False
 
 
 def _patch_csv_gtmc_paths(csv_path: str, gtmc_new_name: str) -> None:
@@ -452,7 +817,7 @@ def _retry_missing_files_inner(
                 resp = urllib.request.urlopen(req, timeout=60, context=_SSL_CTX)
 
                 if resp.status != 200:
-                    log(f"  [X] 批量重试 HTTP {resp.status}")
+                    log(f"  [X] 批量重试 HTTPS {resp.status}")
                     break
 
                 raw = resp.read()
@@ -791,14 +1156,19 @@ def run_verification(
 
     try:
         if csv_path and os.path.isfile(csv_path):
-            # 接收端手动指定了 CSV: 直接采用，跳过文件夹自动识别
+            # 1) 接收端手动指定了 CSV: 直接采用
             log(f"使用手动指定的 CSV 文件: {csv_path}")
         else:
-            folder = find_latest_appl_folder(f_drive_pe)
-            log(f"找到最新 Appl 文件夹: {folder}")
-
-            csv_path = find_csv_file(folder)
-            log(f"找到 CSV 文件: {csv_path}")
+            # 2) 尝试从 systemconfig.ini 自动定位 (与步骤1导出配置联动)
+            csv_path = _find_csv_from_ini(f_drive_pe)
+            if csv_path:
+                log(f"从 systemconfig.ini 定位到 CSV: {csv_path}")
+            else:
+                # 3) 回退: 搜索最新 Appl 文件夹
+                folder = find_latest_appl_folder(f_drive_pe)
+                log(f"找到最新 Appl 文件夹: {folder}")
+                csv_path = find_csv_file(folder)
+                log(f"找到 CSV 文件: {csv_path}")
 
         # 仅当运行在 WinPE 下 (源端会将 GTMC_User_Profiles 重命名为带日期后缀)
         # 且确实检测到新目录名时，才修改 CSV 文件中的路径；
@@ -874,6 +1244,15 @@ def run_verification(
                         progress_callback=progress_callback,
                     )
                     passed, failed, skipped, total = passed2, failed2, skipped2, total2
+
+        # ---- 添加文件类型列 (G 列), 帮助用户判断缺失文件重要性 ----
+        if stop_check and stop_check():
+            log("文件类型标记已中止")
+            return True, passed, failed, skipped, total
+        try:
+            add_file_type_column(csv_path, log)
+        except Exception as e:
+            log(f"文件类型标记失败: {e}")
 
         return True, passed, failed, skipped, total
 

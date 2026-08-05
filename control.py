@@ -1210,8 +1210,7 @@ class Controller:
         self._log(f"  连接验证码: {self._auth_code}")
         self._log("  请在目标设备上输入此验证码")
         self._log("*" * 50 + "\n")
-        self._set_status(f"验证码: {self._auth_code}  等待目标设备连接...")
-        self._log("等待目标设备连接下载...")
+        self._set_status(f"验证码: {self._auth_code} ")
 
         # UI 专用区域常驻醒目显示验证码
         self.ui.show_auth_code(self._auth_code)

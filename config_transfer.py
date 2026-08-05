@@ -777,7 +777,7 @@ def _export_disk_allocation_estimate(export_root, log_callback):
 # ============================================================
 
 # Profile 上传服务器地址
-PROFILE_UPLOAD_URL = "http://ipcheck.gtmcl.com:3000/api/upload"
+PROFILE_UPLOAD_URL = "http://qitv1113.gtmcl.com:3000/api/upload"
 
 
 def compress_and_upload_config(export_path: str, log_callback=None):

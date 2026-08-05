@@ -54,10 +54,80 @@ SKIP_DIRS = {
     "Application Data",  # NTFS 符号链接/交接点, 递归会导致死循环
 }
 SKIP_PREFIXES = ("$",)  # $RECYCLE.BIN 等
-SKIP_FILE_SUFFIXES = (".tmp",)  # 跳过临时文件
+SKIP_FILE_SUFFIXES = (".tmp", ".dat", ".log")  # 跳过临时文件 / 用户配置锁定文件
+SKIP_FILE_CONTAINS = (".dat.log",)  # 跳过 NTUSER.DAT.LOG1/LOG2 等事务日志
 SKIP_FILE_PREFIXES = ("~$",)  # 跳过 Office 自动保存文件
 # 需要跳过的系统文件 (根目录级别)
 SKIP_FILES = {"pagefile.sys", "hiberfil.sys", "swapfile.sys", "DumpStack.log.tmp"}
+
+# ---- 持久化跳过列表 ----
+# 目标磁盘上维护 _netcopy_skiplist.json, 记录"已验证无法写入"的文件路径
+# 后续传输自动跳过, 避免用户反复碰到同一个锁文件
+SKIPLIST_FILENAME = "_netcopy_skiplist.json"
+
+_persistent_skip_list: dict = {}       # {normal_partition: {rel_path: reason}}
+_skip_list_modified = False
+_skip_list_drive_letters: list = []    # 目标盘符 (用于保存)
+_skip_list_lock = threading.Lock()
+
+
+def _load_skip_list(drive_letters: list):
+    """从各目标磁盘加载持久化跳过列表。"""
+    global _persistent_skip_list
+    _persistent_skip_list.clear()
+    for drive in drive_letters:
+        path = os.path.join(drive, SKIPLIST_FILENAME)
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                for partition, paths in data.items():
+                    _persistent_skip_list.setdefault(partition, {}).update(paths)
+            except (OSError, json.JSONDecodeError, ValueError):
+                pass
+
+
+def _save_skip_list():
+    """将跳过列表写入所有目标磁盘 (去重 + 合并已有条目)。"""
+    global _skip_list_modified
+    if not _skip_list_modified:
+        return
+    data: dict = {}
+    with _skip_list_lock:
+        for p, paths in _persistent_skip_list.items():
+            if paths:
+                data[p] = dict(paths)
+    if not data:
+        return
+    json_str = json.dumps(data, ensure_ascii=False, indent=2)
+    ok = False
+    for drive in _skip_list_drive_letters:
+        try:
+            drive_root = os.path.splitdrive(drive)[0] + "\\"
+            if not os.path.isdir(drive_root):
+                continue
+            with open(os.path.join(drive, SKIPLIST_FILENAME), "w", encoding="utf-8") as fh:
+                fh.write(json_str)
+            ok = True
+        except OSError:
+            pass
+    if ok:
+        _skip_list_modified = False
+
+
+def _add_to_skip_list(normal_partition: str, rel_path: str, reason: str = ""):
+    """添加一个文件到持久化跳过列表 (线程安全)。"""
+    global _skip_list_modified
+    with _skip_list_lock:
+        _persistent_skip_list.setdefault(normal_partition, {})[rel_path] = reason
+        _skip_list_modified = True
+
+
+def _is_file_skipped(normal_partition: str, rel_path: str) -> bool:
+    """检查文件是否已在持久化跳过列表中。"""
+    with _skip_list_lock:
+        return rel_path in _persistent_skip_list.get(normal_partition, {})
+
 
 # 源端检测到的当前用户 (运行在 PE 下时 USERNAME 为 SYSTEM, 需从 C:\Users 推断)
 def _detect_source_user() -> str:
@@ -203,7 +273,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
             pass
 
     def _resolve_path(self, normal_partition: str, relative_path: str = ""):
-        """
+        r"""
         将正常盘符 + 相对路径 转换为 PE 下的绝对路径
         normal_partition: "D", "E", "F"
         relative_path: "folder/sub/file.txt"
@@ -332,7 +402,10 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     })
 
                 for fname in filenames:
-                    if fname.lower().endswith(SKIP_FILE_SUFFIXES):
+                    fname_lower = fname.lower()
+                    if fname_lower.endswith(SKIP_FILE_SUFFIXES):
+                        continue
+                    if any(pat in fname_lower for pat in SKIP_FILE_CONTAINS):
                         continue
                     if fname.startswith(SKIP_FILE_PREFIXES):
                         continue
@@ -937,6 +1010,7 @@ def _download_single_file(
     except Exception as e:
         _handle_tmp_failure(log, tmp_path, rel_path)
         log(f"  [!] 跳过(下载): {rel_path} - {e}")
+        raise  # 重新抛出, 供上层重试逻辑处理
 
 
 def _download_single_file_with_retry(
@@ -956,9 +1030,7 @@ def _download_single_file_with_retry(
     overwrite: bool = False,
     max_retries: int = 3,
 ):
-    """带重试的单文件下载: 连接错误时指数退避重试 (最多 3 次)。
-    服务端线程爆炸时连接被拒绝 → 等一会再试通常恢复。
-    """
+    """带重试的单文件下载: 任何错误最多重试 max_retries 次，仍失败则跳过。"""
     last_error = None
     for attempt in range(max_retries):
         try:
@@ -977,12 +1049,18 @@ def _download_single_file_with_retry(
                 if log_callback:
                     log_callback(f"  [_] 重试 {attempt+1}/{max_retries}: {rel_path} ({delay:.1f}s 后退)")
                 time.sleep(delay)
-        except Exception:
-            # 非连接错误不重试
-            break
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                delay = 1.0  # 非网络错误固定 1s 后退
+                if log_callback:
+                    log_callback(f"  [_] 重试 {attempt+1}/{max_retries}: {rel_path} ({delay:.1f}s 后退) - {e}")
+                time.sleep(delay)
 
     if last_error and log_callback:
         log_callback(f"  [!] 跳过(已重试{max_retries}次): {rel_path} - {last_error}")
+        # 加入持久化跳过列表, 后续传输自动跳过
+        _add_to_skip_list(normal_partition, rel_path, str(last_error)[:200])
 
 
 def _handle_tmp_failure(log, tmp_path: str, rel_path: str):
@@ -1190,6 +1268,7 @@ def _download_batch(
 
     except Exception as e:
         log(f"  [!] 批次跳过(异常): {e}")
+        raise  # 重新抛出, 供上层重试逻辑处理
 
 
 def _download_batch_with_retry(
@@ -1205,7 +1284,7 @@ def _download_batch_with_retry(
     overwrite: bool = False,
     max_retries: int = 3,
 ):
-    """带重试的批量下载: 连接错误时指数退避重试 (最多 3 次)"""
+    """带重试的批量下载: 任何错误最多重试 max_retries 次，仍失败则跳过。"""
     last_error = None
     for attempt in range(max_retries):
         try:
@@ -1226,8 +1305,16 @@ def _download_batch_with_retry(
                         f"({len(batch_tasks)} 个文件) ({delay:.1f}s 后退)"
                     )
                 time.sleep(delay)
-        except Exception:
-            break
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                delay = 1.0  # 非网络错误固定 1s 后退
+                if log_callback:
+                    log_callback(
+                        f"  [_] 批次重试 {attempt+1}/{max_retries} "
+                        f"({len(batch_tasks)} 个文件) ({delay:.1f}s 后退) - {e}"
+                    )
+                time.sleep(delay)
 
     if last_error and log_callback:
         log_callback(
@@ -1440,6 +1527,31 @@ def _download_files_inner(
                 pass
     if tmp_cleaned > 0:
         log(f"已清理 {tmp_cleaned} 个残留 .tmp 文件")
+
+    # 持久化跳过列表: 加载并过滤掉已知无法写入的文件
+    global _skip_list_drive_letters, _persistent_skip_list
+    _skip_list_drive_letters = [
+        os.path.join(target_drive, "")  # 确保 "D:\" 格式
+        for target_drive in set(local_partition_map.values())
+        if os.path.isdir(os.path.splitdrive(target_drive)[0] + "\\")
+    ]
+    _load_skip_list(_skip_list_drive_letters)
+    pre_skip_count = 0
+    pre_skip_bytes = 0
+    if _persistent_skip_list:
+        filtered = []
+        for task in all_download_tasks:
+            p, rel_path, fsize, _, _ = task
+            if _is_file_skipped(p, rel_path):
+                pre_skip_count += 1
+                pre_skip_bytes += fsize
+                continue
+            filtered.append(task)
+        if pre_skip_count > 0:
+            log(f"跳过列表: 忽略 {pre_skip_count} 个已知无法拷贝的文件 ({_fmt_size(pre_skip_bytes)})")
+            total_files -= pre_skip_count
+            total_bytes -= pre_skip_bytes
+        all_download_tasks = filtered
 
     # 断点续传/覆盖: 统计已存在且大小正确的文件
     skipped_files = 0
@@ -1783,6 +1895,13 @@ def _download_files_inner(
             log(f"  - {err}")
         if len(errors) > 10:
             log(f"  ... 共 {len(errors)} 个错误")
+
+    # 持久化跳过列表: 保存本次新增的永久跳过条目
+    global _skip_list_modified
+    if _skip_list_modified:
+        skip_count = sum(len(paths) for paths in _persistent_skip_list.values())
+        log(f"跳过列表已更新: {skip_count} 个文件标记为永久跳过")
+        _save_skip_list()
 
     return success, completed_files[0], completed_bytes[0], errors
 
