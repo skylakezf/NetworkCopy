@@ -30,7 +30,8 @@ SKIP_DIRS = {
     "Application Data",  # NTFS 符号链接/交接点, 递归会导致死循环
 }
 SKIP_PREFIXES = ("$",)  # $RECYCLE.BIN 等
-SKIP_FILE_SUFFIXES = (".tmp",)  # 跳过临时文件
+SKIP_FILE_SUFFIXES = (".tmp", ".log")  # 跳过临时文件 / 事务日志 (与 file_transfer 对齐)
+SKIP_FILENAMES = {"ntuser.dat"}  # 已知锁定文件 (与 file_transfer 对齐)
 SKIP_FILE_PREFIXES = ("~$",)  # 跳过 Office 自动保存文件
 SKIP_FILES = {"pagefile.sys", "hiberfil.sys", "swapfile.sys", "DumpStack.log.tmp"}
 
@@ -56,11 +57,14 @@ def should_skip_dir(dirname: str) -> bool:
 
 def should_skip_file(filename: str) -> bool:
     """判断文件是否应跳过。"""
+    fname_lower = filename.lower()
     if filename in SKIP_FILES:
         return True
     if filename.startswith(SKIP_FILE_PREFIXES):
         return True
-    if filename.endswith(SKIP_FILE_SUFFIXES):
+    if fname_lower.endswith(SKIP_FILE_SUFFIXES):
+        return True
+    if fname_lower in SKIP_FILENAMES:
         return True
     return False
 
@@ -95,8 +99,10 @@ def format_bytes_gb(b: int) -> float:
 
 
 def escape_csv(val: str) -> str:
-    """CSV 中逗号替换为中文逗号。"""
-    return val.replace(",", "，")
+    """CSV 路径标准化: 统一正斜杠为反斜杠, 移除末尾空格。
+    注: 不再替换逗号为中文逗号 — Python csv.writer 会自动对含逗号
+        的字段加双引号转义, 手动替换会导致校验器路径不匹配。"""
+    return val.replace("/", "\\").rstrip()
 
 
 class DriveScanResult:

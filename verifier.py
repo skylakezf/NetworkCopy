@@ -20,6 +20,80 @@ import urllib.parse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ---- CSV 路径修复 (兼容旧版 escape_csv 的全角逗号 bug) ----
+# 旧版 calc_allocation_migration.py 的 escape_csv 会将路径中的 ASCII 逗号替换为全角逗号,
+# 导致 CSV 中的路径与磁盘实际路径不一致。此映射表用于修复已损坏的路径。
+# 注意: 仅修复已知的 escape_csv 替换, 不做泛化 (避免误改文件名中原本就是全角逗号的情况,
+#       这种情况极端罕见, 即使存在也意味着 CSV 路径与磁盘路径一致, 无需修复)。
+_CSV_PATH_REPAIR_MAP = {
+    "，": ",",   # 全角逗号 → ASCII 逗号 (旧 escape_csv 替换)
+}
+
+
+def _normalize_csv_path(path: str) -> str:
+    """修复旧版 escape_csv 造成的路径损坏 (全角逗号→ASCII逗号)"""
+    for old, new in _CSV_PATH_REPAIR_MAP.items():
+        if old in path:
+            path = path.replace(old, new)
+    return path
+
+
+def _repair_csv_in_place(csv_path: str, log_callback=None) -> int:
+    """原地修复 CSV 中被 escape_csv 损坏的路径。返回修复的字段数。"""
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    repaired = 0
+    try:
+        enc = _detect_csv_encoding(csv_path)
+        with open(csv_path, "r", encoding=enc, newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                return 0
+
+            # 定位需要修复的列
+            try:
+                col_fullpath = header.index("FullPath")
+            except ValueError:
+                try:
+                    col_fullpath = header.index("fullpath")
+                except ValueError:
+                    col_fullpath = 1  # 默认 B 列
+
+            try:
+                col_filename = header.index("FileName")
+            except ValueError:
+                try:
+                    col_filename = header.index("filename")
+                except ValueError:
+                    col_filename = 2  # 默认 C 列
+
+            rows = [header]
+            for row in reader:
+                changed = False
+                for col in (col_fullpath, col_filename):
+                    if col < len(row):
+                        original = row[col]
+                        fixed = _normalize_csv_path(original)
+                        if fixed != original:
+                            row[col] = fixed
+                            changed = True
+                            repaired += 1
+                rows.append(row)
+
+        if repaired > 0:
+            # 写回修复后的 CSV
+            with open(csv_path, "w", encoding=enc, newline="") as f:
+                writer = csv.writer(f, lineterminator="\n")
+                writer.writerows(rows)
+            log(f"  [修复] CSV 路径修复完成: {repaired} 个字段中的全角逗号已还原为 ASCII 逗号")
+    except Exception as e:
+        log(f"  [注意] CSV 路径修复失败: {e}")
+
+    return repaired
+
 
 # ---- 编码自动检测 ----
 
@@ -62,7 +136,7 @@ SKIP_PREFIXES = ("$",)
 TRANSFER_PORT = 9999
 
 # 校验线程数 (文件多时 I/O 是瓶颈，多线程可大幅加速)
-DEFAULT_VERIFY_WORKERS = 64
+DEFAULT_VERIFY_WORKERS = 512
 
 
 def is_running_in_winpe() -> bool:
@@ -635,10 +709,15 @@ def _verify_single_row(
 
         # 校验文件存在性
         if not os.path.isfile(actual_path):
-            while len(row) <= col_e:
-                row.append("")
-            row[col_e] = "N"
-            return (idx, row, "N", f"  [N] 文件不存在: {actual_path}")
+            # 兼容旧版 escape_csv: 尝试修复路径中的全角字符后再查
+            fixed_path = _normalize_csv_path(actual_path)
+            if fixed_path != actual_path and os.path.isfile(fixed_path):
+                actual_path = fixed_path
+            else:
+                while len(row) <= col_e:
+                    row.append("")
+                row[col_e] = "N"
+                return (idx, row, "N", f"  [N] 文件不存在: {actual_path}")
 
         actual_size = os.path.getsize(actual_path)
 
@@ -747,6 +826,16 @@ def _retry_missing_files_inner(
                 actual_path = os.path.join(pe_drive, rel_path)
 
                 if os.path.isfile(actual_path):
+                    continue
+
+                # 兼容旧版 escape_csv: 尝试修复路径中的全角字符后再查
+                fixed_path = _normalize_csv_path(actual_path)
+                if fixed_path != actual_path and os.path.isfile(fixed_path):
+                    # 文件以正确路径存在, 跳过重试; 同时修复 CSV row 中的路径
+                    fixed_full = _normalize_csv_path(full_path)
+                    if fixed_full != full_path:
+                        row[col_b] = fixed_full
+                        full_path = fixed_full
                     continue
 
                 # 预检查父目录: 若已知无法创建 (与首次下载跳过的一致), 直接跳过
@@ -1169,6 +1258,10 @@ def run_verification(
                 log(f"找到最新 Appl 文件夹: {folder}")
                 csv_path = find_csv_file(folder)
                 log(f"找到 CSV 文件: {csv_path}")
+
+        # ---- 修复旧版 escape_csv 造成的路径损坏 (全角逗号 → ASCII 逗号) ----
+        # 必须在 GTMC 路径替换之前执行，因为修复的是原始路径
+        _repair_csv_in_place(csv_path, log)
 
         # 仅当运行在 WinPE 下 (源端会将 GTMC_User_Profiles 重命名为带日期后缀)
         # 且确实检测到新目录名时，才修改 CSV 文件中的路径；

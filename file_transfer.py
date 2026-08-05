@@ -54,7 +54,10 @@ SKIP_DIRS = {
     "Application Data",  # NTFS 符号链接/交接点, 递归会导致死循环
 }
 SKIP_PREFIXES = ("$",)  # $RECYCLE.BIN 等
-SKIP_FILE_SUFFIXES = (".tmp", ".dat", ".log")  # 跳过临时文件 / 用户配置锁定文件
+SKIP_FILE_SUFFIXES = (".tmp", ".log")  # 跳过临时文件 / 事务日志
+# 已知的锁定/系统文件 (精确文件名匹配, 大小写不敏感)
+# 仅跳过已知会被系统锁定的注册表配置单元, 不做 .dat 后缀全局过滤 (会误杀微信等应用数据)
+SKIP_FILENAMES = {"ntuser.dat"}
 SKIP_FILE_CONTAINS = (".dat.log",)  # 跳过 NTUSER.DAT.LOG1/LOG2 等事务日志
 SKIP_FILE_PREFIXES = ("~$",)  # 跳过 Office 自动保存文件
 # 需要跳过的系统文件 (根目录级别)
@@ -404,6 +407,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 for fname in filenames:
                     fname_lower = fname.lower()
                     if fname_lower.endswith(SKIP_FILE_SUFFIXES):
+                        continue
+                    if fname_lower in SKIP_FILENAMES:
                         continue
                     if any(pat in fname_lower for pat in SKIP_FILE_CONTAINS):
                         continue
