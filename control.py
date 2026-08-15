@@ -4,6 +4,7 @@ Phase 1-5 全部集成
 """
 import threading
 import time
+import socket
 import subprocess
 import os
 from typing import Literal
@@ -87,6 +88,10 @@ class Controller:
 
         # ---- 传输取消 ----
         self._stop_transfer = False  # 窗口关闭时通知传输线程停止
+
+        # ---- 网络断开检测 ----
+        self._network_down = False          # 传输过程中网络是否断开
+        self._network_monitor_stop = threading.Event()  # 停止监控信号
 
         # ---- 网络/鉴权状态 (避免未选网卡直接点按钮时 AttributeError) ----
         self._use_dhcp = False
@@ -308,6 +313,8 @@ class Controller:
             self.ui.show_tgt_connect()
             self.ui.show_discover()
             self.ui.show_manual_ip()
+            # 接收端: 隐藏验证码横幅 (避免从发送方角色切换过来时残留显示)
+            self.ui.hide_auth_code()
             # 显示接收端信息，隐藏导出配置区域
             if hasattr(self.ui, '_target_info_frame'):
                 self.ui._target_info_frame.pack(fill=tk.BOTH, expand=True)
@@ -1183,6 +1190,12 @@ class Controller:
 
         # 生成验证码 + 固定自签名证书 (HTTPS 必需; 证书与 IP 无关, 统一使用一份)
         self._auth_code = tls_utils.generate_auth_code()
+
+        # 立即在传输页显示验证码横幅 — 必须在证书生成/防火墙等耗时操作之前,
+        # 否则用户进入传输页后长时间看不到验证码 (防火墙 subprocess 最多阻塞 10 秒)
+        self._set_status(f"验证码: {self._auth_code} ")
+        self.ui.show_auth_code(self._auth_code)
+
         try:
             cert_paths = tls_utils.get_or_create_fixed_cert()
             self._log(f"使用固定 TLS 证书: {cert_paths[0]}")
@@ -1256,6 +1269,68 @@ class Controller:
             self._log(f"重命名 GTMC_User_Profiles 失败: {e}")
 
     # ==================== 目标设备：下载文件 ====================
+
+    def _host_reachable(self, ip: str) -> bool:
+        """检测源设备是否可达: 纯 TCP 9999 端口探测。
+        传输实际使用 TCP 9999, 该端口已放行防火墙 — 探测它最能反映传输是否可用,
+        且 TCP 握手由内核完成 (即使服务器应用繁忙/限流, 新连接仍能建立)。
+        不依赖 ICMP ping: Windows 防火墙默认拦截 ping, 仅靠 ping 会在网络正常时误报。"""
+        try:
+            s = socket.create_connection((ip, TRANSFER_PORT), timeout=2)
+            s.close()
+            return True
+        except (OSError, TimeoutError, Exception):
+            return False
+
+    def _start_network_monitor(self, source_ip):
+        """启动后台网络监控线程: 检测传输过程中是否断网。
+        每 1 秒 TCP 探测一次 9999 端口 (传输真实通道),
+        连续 3 次无响应判定断网, 并立即在主线程提示用户。"""
+        self._network_down = False
+        self._network_monitor_stop.clear()
+
+        def _monitor():
+            fail_count = 0
+            max_fails = 3  # 连续 3 次失败判定为断网
+            while not self._network_monitor_stop.is_set():
+                self._network_monitor_stop.wait(timeout=1)  # 每 1 秒探测一次
+                if self._network_monitor_stop.is_set():
+                    break
+                if self._host_reachable(source_ip):
+                    fail_count = 0  # 可达, 重置失败计数
+                else:
+                    fail_count += 1
+                    if fail_count >= max_fails:
+                        self._network_down = True
+                        self._log(f"\n[诊断] 网络连接已断开! "
+                                  f"(连续 {fail_count} 次无法连接 "
+                                  f"{source_ip}:{TRANSFER_PORT})")
+                        # 立即在主线程弹出提示, 不等传输结束/网络恢复
+                        try:
+                            self.ui.after(0, self._on_network_lost_ui)
+                        except Exception:
+                            pass
+                        break
+
+        t = threading.Thread(target=_monitor, daemon=True)
+        t.start()
+
+    def _stop_network_monitor(self):
+        """停止网络监控线程"""
+        self._network_monitor_stop.set()
+
+    def _on_network_lost_ui(self):
+        """网络断开时的立即 UI 提示 (在主线程执行)。
+        只负责提示与按钮状态; 传输线程会在下次 stop_check 时自行停止。"""
+        self.ui.show_transfer_error(
+            "网络连接已断开 — 请检查网线连接后重新开始传输"
+        )
+        self._set_status("网络已断开 — 请检查网线连接")
+        if hasattr(self.ui, 'tk_button_mqfzl35t'):
+            try:
+                self.ui.tk_button_mqfzl35t.config(text="重新接收", state="normal")
+            except Exception:
+                pass
 
     def _start_target_download(self, manual_ip=None):
         """目标设备连接源设备下载文件。
@@ -1367,9 +1442,10 @@ class Controller:
                 try:
                     import ssl as _ssl
                     _ctx = _ssl._create_unverified_context()
-                    _s = _ssl.wrap_socket(
+                    # Python 3.13 已移除 ssl.wrap_socket, 改用 context.wrap_socket
+                    _s = _ctx.wrap_socket(
                         _sock.create_connection((source_ip, TRANSFER_PORT), timeout=5),
-                        server_side=False, context=_ctx,
+                        server_side=False,
                     )
                     _s.close()
                     self._log(f"[诊断] TLS 端口 {source_ip}:{TRANSFER_PORT} 可达 (TCP+TLS 握手成功)")
@@ -1428,10 +1504,15 @@ class Controller:
                     self.ui.after(0, lambda: self._set_progress(files_done, total_files))
 
             def _check_stop():
-                """供 file_transfer.download_files 轮询, 窗口关闭时返回 'cancel'"""
+                """供 file_transfer.download_files 轮询, 窗口关闭时返回 'cancel', 断网返回 'network_down'"""
                 if self._stop_transfer:
                     return "cancel"
+                if self._network_down:
+                    return "network_down"
                 return None
+
+            # ---- 启动网络断开监控 ----
+            self._start_network_monitor(source_ip)
 
             success, files, bytes_done, errors = download_files(
                 server_ip=source_ip,
@@ -1444,6 +1525,10 @@ class Controller:
                 conflict_callback=self._resolve_conflicts,
                 stop_check=_check_stop,
             )
+
+            # ---- 停止网络断开监控 ----
+            self._stop_network_monitor()
+
             self.ui.after(0, lambda: self._on_download_complete(success, files, bytes_done, errors))
 
         threading.Thread(target=_connect_and_download, daemon=True).start()
@@ -1465,6 +1550,26 @@ class Controller:
     def _on_download_complete(self, success, files, bytes_done, errors):
         """下载完成回调"""
         self._transferring = False
+
+        # 传输过程中网络断开: 停止等待并提示用户
+        if self._network_down:
+            self._network_down = False
+            self._log("\n传输中断: 网络连接已断开")
+            self._reset_progress("网络已断开")
+            self.ui.hide_config_detect()
+            self.ui.set_button_next("disabled")
+            self.ui.set_button_prev("normal", text="< 返回")
+            self.ui.show_transfer_error(
+                "网络连接已断开 — 请检查网线连接后重新开始传输"
+            )
+            self.ui.tk_button_mqfzl35t.config(text="重新接收", state="normal")
+            if hasattr(self, "_dhcp_server") and self._dhcp_server:
+                self._dhcp_server.stop()
+                self._dhcp_server = None
+            if hasattr(self, "_tgt_server") and self._tgt_server:
+                self._tgt_server.stop()
+                self._tgt_server = None
+            return
 
         # 传输未启动就失败 (files==0: 验证码错误、网络不通等)
         if not success and files == 0:

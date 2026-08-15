@@ -286,6 +286,13 @@ class WinGUI(ttk.Window):
             self.show_start_button()
         else:
             self.hide_start_button()
+        # 步骤 4: 发送端传输页 — 重新断言验证码横幅可见
+        # (页面 pack_forget 切换后可能丢失横幅显示, 这里按需重新 pack)
+        if step == 4:
+            ctl_type = getattr(getattr(self, 'ctl', None), '_device_type', '')
+            if ctl_type == "源设备" or self._device_type == "source":
+                code = getattr(getattr(self, 'ctl', None), '_auth_code', '') or ''
+                self.show_auth_code(code)
         # 根据步骤设置「下一步」按钮默认状态
         transfer_done = getattr(getattr(self, 'ctl', None), '_transfer_done', False)
         is_target = getattr(getattr(self, 'ctl', None), '_device_type', '') == "目标设备"
@@ -1317,7 +1324,15 @@ class WinGUI(ttk.Window):
         if hasattr(self, 'tk_label_transfer_auth_code'):
             self.tk_label_transfer_auth_code.config(text=code)
         if hasattr(self, '_auth_banner_frame'):
-            self._auth_banner_frame.pack(fill=X, pady=(0, 8))
+            # before= 固定横幅位置在状态标签之前 (紧接"传输中..."标题) —
+            # 首次 pack 若发生在角色选择阶段 (此时步骤4其它控件已 pack 完),
+            # 不带 before 会被排到页面底部(日志区下方)导致不可见
+            if hasattr(self, 'tk_label_transfer_status'):
+                self._auth_banner_frame.pack(
+                    fill=X, pady=(0, 8), before=self.tk_label_transfer_status
+                )
+            else:
+                self._auth_banner_frame.pack(fill=X, pady=(0, 8))
 
     def hide_auth_code(self):
         """隐藏验证码横幅 (接收端调用)"""

@@ -1018,6 +1018,20 @@ def _download_single_file(
         raise  # 重新抛出, 供上层重试逻辑处理
 
 
+class _TransferCancelled(Exception):
+    """传输被取消或网络断开 (用户中止 / 断网), 用于中断重试循环并向上传播。"""
+
+
+def _sleep_interruptible(seconds: float, stop_check=None):
+    """可被 stop_check 中断的睡眠: 分小块轮询, 取消/断网时抛 _TransferCancelled。
+    用于重试后退 (backoff), 避免网络已断开时仍傻等 0.5s/1s/2s。"""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if stop_check is not None and stop_check():
+            raise _TransferCancelled("传输已取消或网络断开")
+        time.sleep(min(0.1, max(0.0, deadline - time.time())))
+
+
 def _download_single_file_with_retry(
     base_url: str,
     normal_partition: str,
@@ -1034,10 +1048,14 @@ def _download_single_file_with_retry(
     file_progress_callback=None,
     overwrite: bool = False,
     max_retries: int = 3,
+    stop_check=None,
 ):
-    """带重试的单文件下载: 任何错误最多重试 max_retries 次，仍失败则跳过。"""
+    """带重试的单文件下载: 任何错误最多重试 max_retries 次，仍失败则跳过。
+    stop_check: 取消/断网信号 (返回真值即中止), 让重试循环立即退出而非傻等后退。"""
     last_error = None
     for attempt in range(max_retries):
+        if stop_check is not None and stop_check():
+            raise _TransferCancelled("传输已取消或网络断开")
         try:
             return _download_single_file(
                 base_url, normal_partition, rel_path, fsize, target_path,
@@ -1053,14 +1071,14 @@ def _download_single_file_with_retry(
                 delay = 0.5 * (2 ** attempt)  # 0.5s, 1s, 2s
                 if log_callback:
                     log_callback(f"  [_] 重试 {attempt+1}/{max_retries}: {rel_path} ({delay:.1f}s 后退)")
-                time.sleep(delay)
+                _sleep_interruptible(delay, stop_check)
         except Exception as e:
             last_error = e
             if attempt < max_retries - 1:
                 delay = 1.0  # 非网络错误固定 1s 后退
                 if log_callback:
                     log_callback(f"  [_] 重试 {attempt+1}/{max_retries}: {rel_path} ({delay:.1f}s 后退) - {e}")
-                time.sleep(delay)
+                _sleep_interruptible(delay, stop_check)
 
     if last_error and log_callback:
         log_callback(f"  [!] 跳过(已重试{max_retries}次): {rel_path} - {last_error}")
@@ -1288,10 +1306,14 @@ def _download_batch_with_retry(
     log_callback=None,
     overwrite: bool = False,
     max_retries: int = 3,
+    stop_check=None,
 ):
-    """带重试的批量下载: 任何错误最多重试 max_retries 次，仍失败则跳过。"""
+    """带重试的批量下载: 任何错误最多重试 max_retries 次，仍失败则跳过。
+    stop_check: 取消/断网信号 (返回真值即中止), 网络断开时立即退出而非继续重试。"""
     last_error = None
     for attempt in range(max_retries):
+        if stop_check is not None and stop_check():
+            raise _TransferCancelled("传输已取消或网络断开")
         try:
             return _download_batch(
                 base_url, normal_partition, batch_tasks,
@@ -1309,7 +1331,7 @@ def _download_batch_with_retry(
                         f"  [_] 批次重试 {attempt+1}/{max_retries} "
                         f"({len(batch_tasks)} 个文件) ({delay:.1f}s 后退)"
                     )
-                time.sleep(delay)
+                _sleep_interruptible(delay, stop_check)
         except Exception as e:
             last_error = e
             if attempt < max_retries - 1:
@@ -1319,7 +1341,7 @@ def _download_batch_with_retry(
                         f"  [_] 批次重试 {attempt+1}/{max_retries} "
                         f"({len(batch_tasks)} 个文件) ({delay:.1f}s 后退) - {e}"
                     )
-                time.sleep(delay)
+                _sleep_interruptible(delay, stop_check)
 
     if last_error and log_callback:
         log_callback(
@@ -1681,22 +1703,26 @@ def _download_files_inner(
     reporter_thread = threading.Thread(target=progress_reporter, daemon=True)
     reporter_thread.start()
 
-    # 暂停/取消信号: stop_check() 返回 ("cancel",) 终止传输; 返回 ("pause",) 阻塞等待恢复
+    # 暂停/取消信号: stop_check() 返回 "cancel" 终止传输; "pause" 阻塞等待恢复;
+    # "network_down" 网络断开, 停止等待
     _pause_event = threading.Event()
     _pause_event.set()
 
     def _check_stop():
-        """返回 True 表示已取消; 暂停时阻塞直到恢复"""
+        """返回 None 表示继续; "cancel"/"network_down" 表示应停止; 暂停时阻塞直到恢复。
+        返回字符串供调用方区分原因 (用户取消 / 网络断开), 真值即应停止。"""
         if stop_check is None:
-            return False
+            return None
         sig = stop_check()
         if sig == "cancel":
-            return True
+            return "cancel"
+        if sig == "network_down":
+            return "network_down"
         if sig == "pause":
             _pause_event.clear()
             _pause_event.wait()  # 等待 control 层调用 set() 恢复
-            return False
-        return False
+            return None
+        return None
 
     # 逐分区处理 (D → E → F)，避免跨分区并发 IO 导致崩溃
     cancelled = False
@@ -1705,10 +1731,14 @@ def _download_files_inner(
         if not partition_tasks:
             continue
 
-        # 进入新分区前检查暂停/取消
-        if _check_stop():
+        # 进入新分区前检查暂停/取消/断网
+        _sig = _check_stop()
+        if _sig:
             cancelled = True
-            log(f"{normal_partition} 盘: 传输已取消 (用户中止)")
+            if _sig == "network_down":
+                log(f"{normal_partition} 盘: 传输中断 (网络已断开)")
+            else:
+                log(f"{normal_partition} 盘: 传输已取消 (用户中止)")
             break
 
         partition_total = len(partition_tasks)
@@ -1813,7 +1843,7 @@ def _download_files_inner(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
 
-            # 提交批次任务 (带重试: 连接错误重试最多3次)
+            # 提交批次任务 (带重试: 连接错误重试最多3次, 断网/取消时立即中止)
             for batch in partition_batches:
                 future = executor.submit(
                     _download_batch_with_retry,
@@ -1827,10 +1857,11 @@ def _download_files_inner(
                     errors,
                     log_callback,
                     overwrite,
+                    stop_check=_check_stop,
                 )
                 futures.append(future)
 
-            # 提交单文件任务 (带重试: 连接错误重试最多3次)
+            # 提交单文件任务 (带重试: 连接错误重试最多3次, 断网/取消时立即中止)
             for task in partition_singles:
                 np, rp, fs, tp, mt = task
                 future = executor.submit(
@@ -1849,6 +1880,7 @@ def _download_files_inner(
                     log_callback,
                     None,  # file_progress_callback 不再使用 (简化进度显示)
                     overwrite,
+                    stop_check=_check_stop,
                 )
                 futures.append(future)
 
@@ -1856,16 +1888,27 @@ def _download_files_inner(
             for future in as_completed(futures):
                 try:
                     future.result()
+                except _TransferCancelled as e:
+                    # 用户取消或断网: 取消剩余任务并退出
+                    cancelled = True
+                    for f in futures:
+                        f.cancel()
+                    log(f"{normal_partition} 盘: 传输中断 ({e})")
+                    break
                 except Exception as e:
                     log(f"  [X] 线程异常: {e}")
                     errors.append(f"线程异常: {e}")
 
-                # 每完成一个文件检查暂停/取消 (取消则取消剩余任务并跳出)
-                if _check_stop():
+                # 每完成一个任务检查暂停/取消/断网 (是则取消剩余任务并跳出)
+                _sig = _check_stop()
+                if _sig:
                     cancelled = True
                     for f in futures:
                         f.cancel()
-                    log(f"{normal_partition} 盘: 传输已取消 (用户中止)")
+                    if _sig == "network_down":
+                        log(f"{normal_partition} 盘: 传输中断 (网络已断开)")
+                    else:
+                        log(f"{normal_partition} 盘: 传输已取消 (用户中止)")
                     break
 
                 # 更新分区进度条

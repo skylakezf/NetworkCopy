@@ -1111,12 +1111,195 @@ def test_step1_has_auto_nic_card():
 
 
 # ============================================================
+# 测试 20: 验证码横幅显示 (2026-08-11 修复)
+# ============================================================
+
+@test("37. 发送端选角色后传输页验证码横幅已 pack")
+def test_auth_banner_packed_source():
+    t = make_app()
+    try:
+        t.select_role("source")
+        try:
+            t.app._auth_banner_frame.pack_info()
+        except Exception:
+            check(False, "发送端选角色后横幅应已 pack")
+    finally:
+        t.destroy()
+
+@test("38. 发送端 go_step(4) 横幅可见并显示验证码")
+def test_auth_banner_visible_step4():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.ctl._auth_code = "XY12"
+        t.app.go_step(4)
+        t.app.update_idletasks()
+        eq(t.step, 4)
+        check(t.app._auth_banner_frame.winfo_ismapped(), "step4 横幅应可见")
+        eq(t.app.tk_label_transfer_auth_code.cget("text"), "XY12",
+           "横幅应显示当前验证码")
+    finally:
+        t.destroy()
+
+@test("39. 接收端选角色后验证码横幅未 pack")
+def test_auth_banner_not_packed_target():
+    t = make_app()
+    try:
+        t.select_role("target")
+        try:
+            t.app._auth_banner_frame.pack_info()
+            check(False, "接收端横幅不应 pack")
+        except Exception:
+            pass
+    finally:
+        t.destroy()
+
+@test("40. 发送端切到接收端后横幅 pack_forget")
+def test_auth_banner_hidden_on_role_switch():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.prev_step()  # →0
+        t.select_role("target")
+        try:
+            t.app._auth_banner_frame.pack_info()
+            check(False, "切换到接收端后横幅应取消 pack")
+        except Exception:
+            pass
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 21: 传输错误提示区
+# ============================================================
+
+@test("41. show_transfer_error 显示红色错误区, hide 后隐藏")
+def test_show_transfer_error():
+    t = make_app()
+    try:
+        t.app.show_transfer_error("测试错误消息")
+        t.app.update_idletasks()
+        try:
+            t.app._transfer_error_frame.pack_info()
+        except Exception:
+            check(False, "错误区应已 pack")
+        eq(t.app.tk_label_transfer_error.cget("text"), "测试错误消息")
+        check("传输失败" in t.app.tk_label_transfer_status.cget("text"),
+              "状态标签应显示传输失败")
+        t.app.hide_transfer_error()
+        t.app.update_idletasks()
+        try:
+            t.app._transfer_error_frame.pack_info()
+            check(False, "隐藏后错误区不应 pack")
+        except Exception:
+            pass
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 22: 网络断开检测 (2026-08-05 新增)
+# ============================================================
+
+@test("42. _on_download_complete 断网分支显示提示并复位标志")
+def test_network_down_completion():
+    t = make_app()
+    try:
+        t.select_role("target")
+        t.ctl._network_down = True
+        t.ctl._on_download_complete(False, 100, 0, [])
+        t.app.update_idletasks()
+        eq(t.ctl._network_down, False, "处理后应复位标志")
+        check("网络连接已断开" in t.app.tk_label_transfer_error.cget("text"),
+              "错误提示应含'网络连接已断开'")
+        check("重新接收" in t.app.tk_button_mqfzl35t.cget("text"),
+              "按钮应变为'重新接收'")
+    finally:
+        t.destroy()
+
+@test("43. 网络监控线程生命周期 (本地回环不误判)")
+def test_network_monitor_lifecycle():
+    import time as _time
+    t = make_app()
+    try:
+        t.ctl._start_network_monitor("127.0.0.1")
+        _time.sleep(0.6)
+        eq(t.ctl._network_down, False, "本地回环不应误判断网")
+        t.ctl._stop_network_monitor()
+        _time.sleep(0.3)
+    finally:
+        t.destroy()
+
+@test("44. 断网时 download_files 的 stop_check 返回 'network_down'")
+def test_stop_check_network_down():
+    import control as _ctl_mod
+    import time as _time
+    t = make_app()
+    captured = {}
+    orig_dl = _ctl_mod.download_files
+
+    def fake_download_files(**kwargs):
+        captured['stop_check'] = kwargs.get('stop_check')
+        return True, 0, 0, []
+
+    # control.py 是 `from file_transfer import download_files`, 需 patch control 模块内的引用
+    _ctl_mod.download_files = fake_download_files
+    try:
+        # 测试无 mainloop: 后台线程的 after/_log 访问 Tk 控件会阻塞 → 替换为安全 no-op
+        t.app.after = lambda *a, **kw: None
+        t.ctl._log = lambda m: None
+        # 手动 IP 直连, 避免 DHCP 依赖; 填入验证码
+        t.app.tk_entry_code.delete(0, 'end')
+        t.app.tk_entry_code.insert(0, "ABCD")
+        t.ctl._start_target_download(manual_ip="127.0.0.1")
+        # 等待下载线程调用 download_files
+        deadline = _time.time() + 3
+        while 'stop_check' not in captured and _time.time() < deadline:
+            _time.sleep(0.05)
+            t.app.update_idletasks()
+        sc = captured.get('stop_check')
+        assert sc is not None, "stop_check 应被传入 download_files"
+        eq(sc(), None, "正常状态返回 None")
+        t.ctl._stop_transfer = True
+        eq(sc(), "cancel", "取消时返回 cancel")
+        t.ctl._stop_transfer = False
+        t.ctl._network_down = True
+        eq(sc(), "network_down", "断网时返回 network_down")
+    finally:
+        t.ctl._stop_transfer = False
+        t.ctl._network_down = False
+        _ctl_mod.download_files = orig_dl
+        t.destroy()
+
+@test("45. 验证码输入自动转大写并限制4位")
+def test_auth_code_entry():
+    t = make_app()
+    try:
+        # 大写转换 (validate 允许 ≤4 位字母数字)
+        t.app.tk_entry_code.delete(0, 'end')
+        t.app.tk_entry_code.insert(0, "ab1d")
+        t.ctl._on_auth_code_changed()
+        eq(t.app.tk_entry_code.get(), "AB1D", "应自动转大写")
+        # validatecommand 是实际输入拦截机制: 超4位/特殊字符被拒
+        eq(t.app._auth_validate("ABCD"), True, "4位应允许")
+        eq(t.app._auth_validate("ABCDE"), False, "5位应被拦截")
+        eq(t.app._auth_validate("AB!D"), False, "含特殊字符应被拦截")
+        # _on_auth_code_changed 对超长输入的兜底截断 (绕过 validate 直接注入)
+        t.app.tk_entry_code.configure(validate="none")
+        t.app.tk_entry_code.delete(0, 'end')
+        t.app.tk_entry_code.insert(0, "ABCDE")
+        t.ctl._on_auth_code_changed()
+        eq(t.app.tk_entry_code.get(), "ABCD", "应截断为4位")
+    finally:
+        t.destroy()
+
+# ============================================================
 # 运行
 # ============================================================
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  UI 全场景导航测试 (55 项)")
+    print("  UI 全场景导航测试 (62 项)")
     print("=" * 60)
     print()
 
@@ -1157,6 +1340,17 @@ if __name__ == "__main__":
     test_next_blocked_no_nic()
     test_auto_jump_step5()
     test_stay_step4_with_config()
+
+    # 新增 — 验证码横幅 / 传输错误 / 网络断开检测 (2026-08-11)
+    test_auth_banner_packed_source()
+    test_auth_banner_visible_step4()
+    test_auth_banner_not_packed_target()
+    test_auth_banner_hidden_on_role_switch()
+    test_show_transfer_error()
+    test_network_down_completion()
+    test_network_monitor_lifecycle()
+    test_stop_check_network_down()
+    test_auth_code_entry()
 
     # 新增 — 自动网卡 & 高级选项 (2026-08-02)
     test_get_wired_adapters_struct()
