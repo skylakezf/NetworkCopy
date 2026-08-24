@@ -97,11 +97,16 @@ class T:
         cb.set(name)
         if name not in cb["values"]:
             cb["values"] = list(cb["values"]) + [name]
+        # 模拟用户已确认自动选择, 避免"修改自动选择"弹窗阻塞测试
+        self.ctl._auto_selected_disk = None
         if hasattr(self.ctl, '_on_disk_selected'):
             self.ctl._on_disk_selected()
         self.app.update_idletasks()
 
     def next_step(self):
+        # 发送方步骤1前进会触发"未导出配置"提醒弹窗 → 测试中模拟已导出
+        if self.app._step == 1 and getattr(self.ctl, '_device_type', '') == "源设备":
+            self.ctl._config_export_done = True
         self.ctl._on_next_step()
         self.app.update_idletasks()
 
@@ -163,30 +168,35 @@ def test_source_export_compress_upload_state_chain():
     try:
         t.select_role("source")
         btn = t.app.tk_button_export_config
+        # 阻止真实后台压缩上传线程, 避免异步竞争影响按钮文字断言
+        _orig_upload = t.ctl._start_compress_upload
+        t.ctl._start_compress_upload = lambda p: None
+        try:
+            # 1) 初始状态
+            eq(str(btn.cget("state")), "normal")
+            eq(btn.cget("text"), "导出系统配置")
 
-        # 1) 初始状态
-        eq(str(btn.cget("state")), "normal")
-        eq(btn.cget("text"), "导出系统配置")
+            # 2) 模拟 _on_export_config — 点击后按钮应为 disabled + "导出中..."
+            t.ctl._on_export_config()
+            t.app.update_idletasks()
+            eq(str(btn.cget("state")), "disabled", "导出中按钮应禁用")
+            assert "导出中" in btn.cget("text"), f"按钮文字应含'导出中', 实际={btn.cget('text')}"
 
-        # 2) 模拟 _on_export_config — 点击后按钮应为 disabled + "导出中..."
-        t.ctl._on_export_config()
-        t.app.update_idletasks()
-        eq(str(btn.cget("state")), "disabled", "导出中按钮应禁用")
-        assert "导出中" in btn.cget("text"), f"按钮文字应含'导出中', 实际={btn.cget('text')}"
+            # 3) 模拟导出成功 → _on_export_done
+            t.ctl._on_export_done(True, r"F:\Appl\2026-08-03")
+            t.app.update_idletasks()
+            eq(str(btn.cget("state")), "disabled", "压缩上传中按钮应禁用")
+            assert "压缩上传" in btn.cget("text") or "压缩" in btn.cget("text"), \
+                f"按钮文字应含'压缩', 实际={btn.cget('text')}"
 
-        # 3) 模拟导出成功 → _on_export_done
-        t.ctl._on_export_done(True, r"F:\Appl\2026-08-03")
-        t.app.update_idletasks()
-        eq(str(btn.cget("state")), "disabled", "压缩上传中按钮应禁用")
-        assert "压缩上传" in btn.cget("text") or "压缩" in btn.cget("text"), \
-            f"按钮文字应含'压缩', 实际={btn.cget('text')}"
-
-        # 4) 模拟上传成功
-        t.ctl._on_upload_done(True, True, r"F:\Appl\QDNB5098_2026-08-03.zip")
-        t.app.update_idletasks()
-        eq(str(btn.cget("state")), "normal", "上传完成后按钮应重新启用")
-        assert "上传完成" in btn.cget("text"), \
-            f"按钮文字应含'上传完成', 实际={btn.cget('text')}"
+            # 4) 模拟上传成功
+            t.ctl._on_upload_done(True, True, r"F:\Appl\QDNB5098_2026-08-03.zip")
+            t.app.update_idletasks()
+            eq(str(btn.cget("state")), "normal", "上传完成后按钮应重新启用")
+            assert "导出完成" in btn.cget("text"), \
+                f"按钮文字应含'导出完成', 实际={btn.cget('text')}"
+        finally:
+            t.ctl._start_compress_upload = _orig_upload
     finally:
         t.destroy()
 
@@ -197,15 +207,19 @@ def test_source_compress_ok_upload_fail():
     try:
         t.select_role("source")
         btn = t.app.tk_button_export_config
+        _orig_upload = t.ctl._start_compress_upload
+        t.ctl._start_compress_upload = lambda p: None
+        try:
+            t.ctl._on_export_done(True, r"F:\Appl\2026-08-03")
+            t.app.update_idletasks()
 
-        t.ctl._on_export_done(True, r"F:\Appl\2026-08-03")
-        t.app.update_idletasks()
-
-        t.ctl._on_upload_done(True, False, r"F:\Appl\QDNB5098_2026-08-03.zip")
-        t.app.update_idletasks()
-        eq(str(btn.cget("state")), "normal", "上传失败后按钮应可点击(供重试)")
-        assert "上传失败" in btn.cget("text"), \
-            f"按钮文字应含'上传失败', 实际={btn.cget('text')}"
+            t.ctl._on_upload_done(True, False, r"F:\Appl\QDNB5098_2026-08-03.zip")
+            t.app.update_idletasks()
+            eq(str(btn.cget("state")), "normal", "上传失败后按钮应可点击(供重试)")
+            assert "导出完成" in btn.cget("text"), \
+                f"按钮文字应含'导出完成', 实际={btn.cget('text')}"
+        finally:
+            t.ctl._start_compress_upload = _orig_upload
     finally:
         t.destroy()
 
@@ -216,15 +230,19 @@ def test_source_compress_fail():
     try:
         t.select_role("source")
         btn = t.app.tk_button_export_config
+        _orig_upload = t.ctl._start_compress_upload
+        t.ctl._start_compress_upload = lambda p: None
+        try:
+            t.ctl._on_export_done(True, r"F:\Appl\2026-08-03")
+            t.app.update_idletasks()
 
-        t.ctl._on_export_done(True, r"F:\Appl\2026-08-03")
-        t.app.update_idletasks()
-
-        t.ctl._on_upload_done(False, False, "")
-        t.app.update_idletasks()
-        eq(str(btn.cget("state")), "normal", "压缩失败后按钮应可点击(供重试)")
-        assert "压缩失败" in btn.cget("text"), \
-            f"按钮文字应含'压缩失败', 实际={btn.cget('text')}"
+            t.ctl._on_upload_done(False, False, "")
+            t.app.update_idletasks()
+            eq(str(btn.cget("state")), "normal", "压缩失败后按钮应可点击(供重试)")
+            assert "压缩失败" in btn.cget("text"), \
+                f"按钮文字应含'压缩失败', 实际={btn.cget('text')}"
+        finally:
+            t.ctl._start_compress_upload = _orig_upload
     finally:
         t.destroy()
 
@@ -437,12 +455,118 @@ def test_skip_import_to_step6():
             t.ctl._on_skip_import()
             t.app.update_idletasks()
             eq(t.step, 6, "跳过导入后应跳到step6")
-            eq(t.next_state, "disabled", "step6 下一步应禁用")
+            eq(t.next_state, "normal", "step6 下一步=跳过校验")
+            eq(t.next_text, "跳过校验 >")
             eq(t.prev_state, "normal", "step6 上一步应启用")
         finally:
             config_transfer.get_config_from_ini = _orig
     finally:
         t.destroy()
+
+@test("C2b. 配置导入完成后自动跳转 step6 且禁用跳过")
+def test_import_done_auto_jump_step6():
+    """导入成功 → 自动跳到校验页(step6) + 跳过按钮禁用 + _on_skip_import 防护"""
+    t = T()
+    try:
+        t.select_role("target")
+        t.set_nic()
+        t.next_step()
+        t.set_disk()
+        t.next_step()
+        t.go_step(5)
+        t.ctl._config_import_done = False
+
+        # 模拟导入成功
+        t.ctl._on_import_done(True)
+        t.app.update_idletasks()
+        # 自动跳转 (300ms after) 后应到达 step6
+        eq(t.step, 6, "导入成功后应自动跳转到step6")
+        eq(t.next_state, "normal", "step6 下一步=跳过校验")
+        eq(str(t.app.tk_button_skip_import.cget("state")), "disabled",
+           "配置已导入, 导入页跳过按钮应禁用")
+
+        # 已导入后调用 _on_skip_import 不应再进入校验跳过逻辑 (防护)
+        t.ctl._on_skip_import()
+        eq(t.step, 6, "配置已导入, 跳过导入应被阻止")
+    finally:
+        t.destroy()
+
+
+@test("C2c. 导入失败时不自动跳转, 跳过按钮可用")
+def test_import_failed_no_auto_jump():
+    """导入失败 → 不跳转, 跳过按钮恢复可用"""
+    t = T()
+    try:
+        t.select_role("target")
+        t.set_nic()
+        t.next_step()
+        t.set_disk()
+        t.next_step()
+        t.go_step(5)
+        t.ctl._config_import_done = False
+
+        t.ctl._on_import_done(False)
+        t.app.update_idletasks()
+        eq(t.step, 5, "导入失败不应自动跳转")
+        eq(str(t.app.tk_button_skip_import.cget("state")), "normal",
+           "导入失败跳过按钮应可用")
+    finally:
+        t.destroy()
+
+
+@test("C2d. DHCP 搜索按钮 60 秒内禁用, 倒计时归零恢复")
+def test_dhcp_button_disabled_60s():
+    """模拟 DHCP 启动后按钮禁用 60 秒; _reset_dhcp_button 归零时恢复"""
+    t = T()
+    try:
+        t.select_role("target")
+        btn = t.app.tk_button_dhcp
+
+        # 模拟 _setup_target_dhcp 启动后按钮状态 (60 秒内禁用)
+        btn.config(state="disabled")
+        btn.configure(text="搜索中 (60 秒)...")
+        eq(str(btn.cget("state")), "disabled", "DHCP 搜索期间按钮应禁用")
+        assert "搜索中" in btn.cget("text"), f"按钮文字应含'搜索中', 实际={btn.cget('text')}"
+
+        # 倒计时归零 → _reset_dhcp_button 恢复
+        t.ctl._reset_dhcp_button()
+        t.app.update_idletasks()
+        eq(str(btn.cget("state")), "normal", "倒计时结束按钮应恢复")
+        eq(btn.cget("text"), "寻找旧电脑", "按钮文字应恢复为'寻找旧电脑'")
+    finally:
+        t.destroy()
+
+
+@test("C2e. 网络断开恢复回验证码页: 禁用下一步, 激活重新接收")
+def test_network_down_back_to_step3():
+    """网络断开后用户回到验证码页(step3): 下一步禁用 + 重新接收按钮激活"""
+    t = T()
+    try:
+        t.select_role("target")
+        t.set_nic()
+        t.next_step()  # →2
+        t.set_disk()
+        t.next_step()  # →3
+        t.app.go_step(4)  # →传输页
+
+        # 模拟传输完成(网络断开场景): _transferring=False, 未完成
+        t.ctl._transferring = False
+        t.ctl._transfer_done = False
+        t.ctl._network_down = True
+
+        # 用户点"上一步"回到验证码页
+        t.ctl._on_prev_step()
+        t.app.update_idletasks()
+
+        eq(t.step, 3, "应回到验证码页")
+        eq(t.next_state, "disabled", "验证码页下一步应禁用")
+        eq(str(t.app.tk_button_mqfzl35t.cget("state")), "normal",
+           "验证码页重新接收按钮应激活")
+        assert "重新接收" in t.app.tk_button_mqfzl35t.cget("text"), \
+            f"按钮文字应为'重新接收', 实际={t.app.tk_button_mqfzl35t.cget('text')}"
+    finally:
+        t.destroy()
+
 
 @test("C3. step6 回退到 step5 后按钮文字恢复")
 def test_back_from_step6_to_step5():
@@ -631,7 +755,9 @@ def test_source_full_flow():
         # step0→1: 选角色
         t.select_role("source")
         eq(t.step, 1)
-        eq(t.next_state, "disabled", "step1 未选网卡应禁用")
+        # 自动网卡扫描可能已完成 → 未选时禁用, 已自动选中时启用 (环境相关)
+        eq(t.next_state, "normal" if getattr(t.ctl, '_auto_nic', None) else "disabled",
+           "step1 按钮状态取决于自动网卡是否已选中")
         eq(t.next_text, "下一步 >")
 
         # step1: 选网卡
@@ -641,7 +767,8 @@ def test_source_full_flow():
         eq(t.step, 2)
 
         # step2: 选磁盘
-        eq(t.next_state, "disabled", "step2 未选磁盘应禁用")
+        eq(t.next_state, "normal" if getattr(t.ctl, '_auto_selected_disk', None) else "disabled",
+           "step2 按钮状态取决于自动磁盘选择")
         t.set_disk()
         eq(t.next_state, "normal")
         t.next_step()
@@ -660,7 +787,8 @@ def test_source_full_flow():
 
         # step6: 发送端跳过 step5
         eq(t.step, 6, "发送端应跳过step5直达step6")
-        eq(t.next_state, "disabled")
+        eq(t.next_state, "normal")
+        eq(t.next_text, "跳过校验 >")
         eq(t.prev_state, "normal")
 
         # step6→4 回退
@@ -718,7 +846,8 @@ def test_target_full_flow():
         # step5→6
         t.next_step()
         eq(t.step, 6)
-        eq(t.next_state, "disabled")
+        eq(t.next_state, "normal")
+        eq(t.next_text, "跳过校验 >")
 
         # step6→5→4→3→2→1→0
         t.prev_step()

@@ -208,11 +208,23 @@ def _export_config_builtin(log_callback, status_callback=None):
     _track("开始菜单 App", _export_start_menu_apps(export_root, log_callback))
 
     # 写入 systemconfig.ini (与 out.cmd 格式一致)
+    # 用户可能多次导出, 每次导出都追加一条记录, 保留历史
     try:
         ini_path = os.path.join("F:\\", "systemconfig.ini")
         now = datetime.datetime.now()
+        lines = []
+        if os.path.isfile(ini_path):
+            with open(ini_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
         with open(ini_path, "w", encoding="utf-8") as f:
-            f.write("[ExportInfo]\n")
+            # 保留原内容 (去重 [ExportInfo] 头, 兼容带 BOM 的旧文件)
+            if not any(l.strip().lstrip("\ufeff") == "[ExportInfo]" for l in lines):
+                f.write("[ExportInfo]\n")
+            for l in lines:
+                if l.strip().lstrip("\ufeff") == "[ExportInfo]":
+                    continue
+                f.write(l + "\n")
+            # 追加本次导出记录 (最新一条在文件末尾, 各读取方均取最后一条)
             f.write(f"LastExportPath={export_root}\n")
             f.write(f"LastExportTime={now.strftime('%Y-%m-%d %H:%M:%S')}\n")
         log_callback(f"已写入配置索引: {ini_path}")
@@ -309,8 +321,7 @@ def find_config_folders():
                             if os.path.isdir(path):
                                 ini_folder = path
                             break
-                    if ini_folder:
-                        break
+                # 存在多次导出历史时, 取最后一条 (最新一次导出)
         except Exception:
             pass
 
@@ -777,7 +788,7 @@ def _export_disk_allocation_estimate(export_root, log_callback):
 # ============================================================
 
 # Profile 上传服务器地址
-PROFILE_UPLOAD_URL = "http://qitv1113.gtmcl.com:3000/api/upload"
+PROFILE_UPLOAD_URL = "http://QITV1113.gtmcl.com:3000/api/upload"
 
 
 def compress_and_upload_config(export_path: str, log_callback=None):
@@ -826,47 +837,84 @@ def compress_and_upload_config(export_path: str, log_callback=None):
     log_callback(f"正在上传到 Profile 服务器...")
 
     try:
-        boundary = "----NetworkCopyUpload"
-
-        # 构造 multipart/form-data body
-        body_parts = []
-
-        body_parts.append(f"--{boundary}".encode("utf-8"))
-        body_parts.append(
-            f'Content-Disposition: form-data; name="file"; filename="{zip_name}"'.encode(
-                "utf-8"
-            )
-        )
-        body_parts.append(b"Content-Type: application/zip")
-        body_parts.append(b"")
-
-        with open(zip_path, "rb") as fh:
-            body_parts.append(fh.read())
-
-        body_parts.append(f"--{boundary}--".encode("utf-8"))
-        body_parts.append(b"")
-
-        data = b"\r\n".join(body_parts)
-
-        req = urllib.request.Request(
-            PROFILE_UPLOAD_URL,
-            data=data,
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-            method="POST",
-        )
-
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result_body = resp.read().decode("utf-8", errors="replace")
-            if resp.status == 200:
-                log_callback(f"  上传成功! 服务器响应: {result_body}")
-                return True, zip_path, True
-            else:
-                log_callback(
-                    f"  上传返回 HTTP {resp.status}: {result_body}"
-                )
-                return True, zip_path, False
+        upload_ok, result_body = _upload_zip_multipart(zip_path, zip_name, log_callback)
+        if upload_ok:
+            log_callback(f"  上传成功! 服务器响应: {result_body}")
+        else:
+            log_callback(f"  上传返回错误: {result_body}")
+        return True, zip_path, upload_ok
 
     except Exception as e:
         log_callback(f"  [失败] 上传异常: {e}")
         log_callback(f"  ZIP 文件已保留在: {zip_path}")
         return True, zip_path, False
+
+
+def _upload_zip_multipart(zip_path: str, zip_name: str, log_callback) -> tuple[bool, str]:
+    """将 ZIP 文件以 multipart/form-data 上传到 Profile 服务器。
+
+    返回: (upload_ok: bool, result_body: str)
+    """
+    boundary = "----NetworkCopyUpload"
+
+    # 构造 multipart/form-data body
+    body_parts = []
+
+    body_parts.append(f"--{boundary}".encode("utf-8"))
+    body_parts.append(
+        f'Content-Disposition: form-data; name="file"; filename="{zip_name}"'.encode(
+            "utf-8"
+        )
+    )
+    body_parts.append(b"Content-Type: application/zip")
+    body_parts.append(b"")
+
+    with open(zip_path, "rb") as fh:
+        body_parts.append(fh.read())
+
+    body_parts.append(f"--{boundary}--".encode("utf-8"))
+    body_parts.append(b"")
+
+    data = b"\r\n".join(body_parts)
+
+    req = urllib.request.Request(
+        PROFILE_UPLOAD_URL,
+        data=data,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result_body = resp.read().decode("utf-8", errors="replace")
+        return resp.status == 200, result_body
+
+
+def upload_zip_to_server(zip_path: str, log_callback=None) -> tuple[bool, str]:
+    """上传任意 ZIP 文件到 Profile 服务器 (校验结果上传等场景复用)。
+
+    文件名取自 zip_path 本身, 由调用方负责按规则命名。
+    返回: (upload_ok: bool, result_body: str)
+    """
+    if log_callback is None:
+
+        def log_callback(msg):
+            print(msg)
+
+    if not os.path.isfile(zip_path):
+        log_callback(f"  [失败] ZIP 文件不存在: {zip_path}")
+        return False, ""
+
+    zip_name = os.path.basename(zip_path)
+    log_callback(f"正在上传到 Profile 服务器...")
+    log_callback(f"  文件: {zip_name}")
+
+    try:
+        upload_ok, result_body = _upload_zip_multipart(zip_path, zip_name, log_callback)
+        if upload_ok:
+            log_callback(f"  上传成功! 服务器响应: {result_body}")
+        else:
+            log_callback(f"  上传返回错误: {result_body}")
+        return upload_ok, result_body
+    except Exception as e:
+        log_callback(f"  [失败] 上传异常: {e}")
+        return False, str(e)

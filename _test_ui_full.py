@@ -105,6 +105,9 @@ class T:
         self.app.update_idletasks()
 
     def next_step(self):
+        # 发送方步骤1前进会触发"未导出配置"提醒弹窗 → 测试中模拟已导出
+        if self.app._step == 1 and getattr(self.ctl, '_device_type', '') == "源设备":
+            self.ctl._config_export_done = True
         self.ctl._on_next_step()
         self.app.update_idletasks()
 
@@ -225,7 +228,7 @@ def test_source_step4_done():
     finally:
         t.destroy()
 
-@test("8. 发送端: 4→6 前进, 跳过步骤5, step=6, 下一步禁用")
+@test("8. 发送端: 4→6 前进, 跳过步骤5, step=6, 下一步为'跳过校验 >'")
 def test_source_step6():
     t = make_app()
     try:
@@ -239,7 +242,8 @@ def test_source_step6():
         t.app.update_idletasks()
         t.next_step()
         eq(t.step, 6)
-        eq(t.next_state, "disabled")
+        eq(t.next_state, "normal")
+        eq(t.next_text, "跳过校验 >")
         eq(t.prev_state, "normal")
     finally:
         t.destroy()
@@ -347,7 +351,7 @@ def test_target_step5():
     finally:
         t.destroy()
 
-@test("14. 接收端: 5→6 前进, step=6, 下一步禁用")
+@test("14. 接收端: 5→6 前进, step=6, 下一步为'跳过校验 >'")
 def test_target_step6():
     t = make_app()
     try:
@@ -362,7 +366,8 @@ def test_target_step6():
         t.next_step()  # →5
         t.next_step()  # →6
         eq(t.step, 6)
-        eq(t.next_state, "disabled")
+        eq(t.next_state, "normal")
+        eq(t.next_text, "跳过校验 >")
         eq(t.prev_state, "normal")
     finally:
         t.destroy()
@@ -693,7 +698,8 @@ def test_skip_import():
         eq(t.step, 5)
         t.ctl._on_skip_import()
         eq(t.step, 6)
-        eq(t.next_state, "disabled")
+        eq(t.next_state, "normal")
+        eq(t.next_text, "跳过校验 >")
         eq(t.prev_state, "normal")
     finally:
         t.destroy()

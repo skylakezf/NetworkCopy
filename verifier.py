@@ -15,6 +15,7 @@ import re
 import ssl
 import threading
 import json
+import zipfile
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -753,10 +754,13 @@ def _retry_missing_files(
     col_e: int,
     log_callback=None,
     auth_code: str = "",
+    missing_indices_out=None,
 ) -> int:
     """
     校验完成后，对缺失文件进行批量重试下载
-    返回成功下载的文件数
+    返回成功下载的文件数;
+    若传入 missing_indices_out (list), 会将缺失文件在 CSV 数据行中的索引
+    (与 verify_csv 的 rows 索引一致) 收集到该列表, 供二次校验只校验缺失文件
     """
     import socket as _socket
     import struct as _struct
@@ -775,7 +779,7 @@ def _retry_missing_files(
         return _retry_missing_files_inner(
             server_ip, port, partition_map, csv_path,
             col_a, col_b, col_d, col_e,
-            log, auth_code,
+            log, auth_code, missing_indices_out,
         )
     finally:
         _socket.setdefaulttimeout(_old_timeout)
@@ -792,6 +796,7 @@ def _retry_missing_files_inner(
     col_e: int,
     log,
     auth_code: str,
+    missing_indices_out=None,
 ) -> int:
     import struct as _struct
     import time as _time
@@ -805,10 +810,17 @@ def _retry_missing_files_inner(
         with open(csv_path, "r", encoding=enc, newline="") as f:
             reader = csv.reader(f)
             _header = next(reader, None)
-            for idx, row in enumerate(reader):
+            # 数据行索引 (与 verify_csv 的 rows 索引一致: 仅 B 列非空的行占索引)
+            data_idx = 0
+            for raw_row in reader:
+                if len(raw_row) <= col_b:
+                    continue
+                idx = data_idx
+                data_idx += 1
+                row = raw_row
                 if len(row) <= col_e or row[col_e].strip() != "N":
                     continue
-                full_path = row[col_b].strip() if len(row) > col_b else ""
+                full_path = row[col_b].strip()
                 drive_letter = row[col_a].strip().upper() if len(row) > col_a else ""
                 if not drive_letter:
                     continue
@@ -861,6 +873,10 @@ def _retry_missing_files_inner(
 
     if _skipped_parents:
         log(f"  跳过 {len(_skipped_parents)} 个无写入权限的目录 (与首次下载一致)")
+
+    # 收集缺失文件的数据行索引, 供二次校验只校验这些文件
+    if isinstance(missing_indices_out, list):
+        missing_indices_out.extend(e[0] for e in missing_entries)
 
     if not missing_entries:
         log("没有可重试的缺失文件")
@@ -1050,6 +1066,7 @@ def verify_csv(
     max_workers: int = DEFAULT_VERIFY_WORKERS,
     stop_check=None,
     progress_callback=None,
+    target_indices=None,
 ) -> tuple:
     """
     校验 CSV 文件 (多线程) —— 纯校验，不做重试下载
@@ -1058,6 +1075,8 @@ def verify_csv(
     max_workers: 校验线程数 (默认 12)
     stop_check: callable, 返回 True 时中止校验
     progress_callback: callable(done, total), 每完成一个文件调用一次
+    target_indices: set 或 None。非 None 时只校验这些数据行索引 (二次校验缺失文件用),
+                    其余行保留 CSV 原值直接写回, 不参与统计
     返回: (通过数, 失败数, 跳过数, 总文件数)
     """
     def log(msg):
@@ -1116,20 +1135,33 @@ def verify_csv(
         return 0, 0, 0, 0
 
     total = len(rows)
-    log(f"共 {total} 个文件待校验，使用 {max_workers} 线程并行校验")
+
+    # 结果按原始顺序存储
+    result_map = {}
+
+    # 二次校验模式: 只校验指定索引 (缺失/重试下载的文件), 其余行保留原值直接写回
+    if target_indices is not None:
+        verify_items = [(i, r) for i, r in enumerate(rows) if i in target_indices]
+        for i, r in enumerate(rows):
+            if i not in target_indices:
+                result_map[i] = r
+        work_total = len(verify_items)
+        log(f"共 {work_total} 个缺失文件待二次校验，使用 {max_workers} 线程并行校验")
+    else:
+        verify_items = [(i, r) for i, r in enumerate(rows)]
+        work_total = total
+        log(f"共 {total} 个文件待校验，使用 {max_workers} 线程并行校验")
 
     passed = 0
     failed = 0
     skipped = 0
     stats_lock = threading.Lock()
 
-    # 结果按原始顺序存储
-    result_map = {}
-
     # 多线程校验
+    verify_row_map = {i: r for i, r in verify_items}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
-        for idx, row in enumerate(rows):
+        for idx, row in verify_items:
             future = executor.submit(
                 _verify_single_row,
                 row, idx, col_a, col_b, col_d, col_e, partition_map,
@@ -1145,8 +1177,8 @@ def verify_csv(
                 for f in futures:
                     f.cancel()
                 executor.shutdown(wait=False, cancel_futures=True)
-                log(f"校验已中止: 已校验 {completed_count[0]}/{total}")
-                return passed, failed, skipped, total
+                log(f"校验已中止: 已校验 {completed_count[0]}/{work_total}")
+                return passed, failed, skipped, work_total
 
             try:
                 idx, updated_row, result, log_msg = future.result()
@@ -1168,17 +1200,29 @@ def verify_csv(
                 # 每完成一个文件回调进度
                 current = completed_count[0]
                 if progress_callback:
-                    progress_callback(current, total)
+                    progress_callback(current, work_total)
 
                 # 每 500 个输出一次进度
                 if current % 500 == 0:
-                    log(f"校验进度: {current}/{total} (通过:{passed}, 失败:{failed}, 跳过:{skipped})")
+                    log(f"校验进度: {current}/{work_total} (通过:{passed}, 失败:{failed}, 跳过:{skipped})")
 
             except Exception as e:
                 with stats_lock:
                     failed += 1
                     completed_count[0] += 1
                 log(f"  [N] 线程异常: {e}")
+                # 异常行也标记 N 并保留, 防止写回丢行导致后续数据错位
+                try:
+                    ex_idx = futures.get(future)
+                    if ex_idx is not None and ex_idx not in result_map:
+                        ex_row = verify_row_map.get(ex_idx)
+                        if ex_row is not None:
+                            while len(ex_row) <= col_e:
+                                ex_row.append("")
+                            ex_row[col_e] = "N"
+                            result_map[ex_idx] = ex_row
+                except Exception:
+                    pass
 
     # 按原始顺序重组结果
     updated_rows = [result_map[i] for i in range(len(rows)) if i in result_map]
@@ -1199,8 +1243,81 @@ def verify_csv(
     except Exception as e:
         log(f"写入 CSV 失败: {e}")
 
-    log(f"\n校验完成: 通过 {passed}, 失败 {failed}, 跳过 {skipped}, 总计 {total}")
-    return passed, failed, skipped, total
+    log(f"\n校验完成: 通过 {passed}, 失败 {failed}, 跳过 {skipped}, 总计 {work_total}")
+    return passed, failed, skipped, work_total
+
+
+# ==================== 校验报告打包 ====================
+
+def _default_appl_dir() -> str:
+    """校验报告默认保存目录 (F:\\Appl, 与导出配置一致)"""
+    return os.path.join("F:\\", "Appl")
+
+
+def package_verifier_report(csv_path: str, log_callback=None) -> tuple:
+    """校验完成后, 将校验结果 CSV 打包为 <设备名>_verifierReport.zip。
+
+    Args:
+        csv_path: 校验后的 FullFilelist_DEF.csv 完整路径 (含 VerifyResult 列)
+        log_callback: 日志回调 (msg: str) -> None
+    Returns:
+        (ok: bool, zip_path: str)
+    """
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    computer_name = os.environ.get("COMPUTERNAME", "UNKNOWN")
+    zip_name = f"{computer_name}_verifierReport.zip"
+    # 保存在 CSV 同目录 (已映射到 PE 下实际盘符)
+    zip_dir = os.path.dirname(csv_path) or _default_appl_dir()
+    zip_path = os.path.join(zip_dir, zip_name)
+
+    log(f"\n正在打包校验报告...")
+    log(f"  源文件: {csv_path}")
+    log(f"  目标文件: {zip_path}")
+
+    try:
+        os.makedirs(zip_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(csv_path, os.path.basename(csv_path))
+        log(f"  校验报告已打包: {zip_name} ({os.path.getsize(zip_path) / 1024:.1f} KB)")
+        return True, zip_path
+    except Exception as e:
+        log(f"  [失败] 校验报告打包异常: {e}")
+        return False, ""
+
+
+def create_unverifi_zip(log_callback=None, save_dir: str = "") -> tuple:
+    """跳过校验时创建空压缩包 <设备名>_Unverifi.zip (仅占位, 无文件内容)。
+
+    Args:
+        log_callback: 日志回调 (msg: str) -> None
+        save_dir: 保存目录, 为空时默认 F:\\Appl
+    Returns:
+        (ok: bool, zip_path: str)
+    """
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    computer_name = os.environ.get("COMPUTERNAME", "UNKNOWN")
+    zip_name = f"{computer_name}_Unverifi.zip"
+    zip_dir = save_dir or _default_appl_dir()
+    zip_path = os.path.join(zip_dir, zip_name)
+
+    log(f"\n跳过校验: 创建空校验报告占位包...")
+    log(f"  目标文件: {zip_path}")
+
+    try:
+        os.makedirs(zip_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            pass  # 空包 (无任何文件)
+        log(f"  空校验报告已创建: {zip_name}")
+        return True, zip_path
+    except Exception as e:
+        log(f"  [失败] 创建空校验报告异常: {e}")
+        return False, ""
 
 
 # ==================== 公开入口 ====================
@@ -1217,6 +1334,7 @@ def run_verification(
     auth_code: str = "",
     winpe: bool | None = None,
     csv_path: str = "",
+    report_zip_out=None,
 ) -> tuple:
     """
     执行完整校验流程
@@ -1314,12 +1432,14 @@ def run_verification(
                     col_e = 4
 
                 # 批量重试下载
+                missing_indices_out = []
                 recovered = _retry_missing_files(
                     server_ip, TRANSFER_PORT,
                     partition_map, csv_path,
                     col_a, col_b, col_d, col_e,
                     log_callback=log,
                     auth_code=auth_code,
+                    missing_indices_out=missing_indices_out,
                 )
 
                 if recovered > 0:
@@ -1329,14 +1449,17 @@ def run_verification(
                         log("二次校验已中止")
                         return False, passed, failed, skipped, total
 
-                    # 只对恢复的文件做二次校验 (全量校验也可以，但避免重复扫描)
-                    passed2, failed2, skipped2, total2 = verify_csv(
+                    # 只对缺失(重试下载)的文件做二次校验, 避免全量重复扫描
+                    passed2, failed2, _, _ = verify_csv(
                         csv_path, partition_map, log_callback,
                         max_workers=max_workers,
                         stop_check=stop_check,
                         progress_callback=progress_callback,
+                        target_indices=set(missing_indices_out),
                     )
-                    passed, failed, skipped, total = passed2, failed2, skipped2, total2
+                    # 合并统计 (保持全量视角): 第一次通过/跳过的 + 二次校验恢复的
+                    passed = passed + passed2
+                    failed = failed2
 
         # ---- 添加文件类型列 (G 列), 帮助用户判断缺失文件重要性 ----
         if stop_check and stop_check():
@@ -1346,6 +1469,14 @@ def run_verification(
             add_file_type_column(csv_path, log)
         except Exception as e:
             log(f"文件类型标记失败: {e}")
+
+        # ---- 校验完成后打包校验报告 <设备名>_verifierReport.zip ----
+        try:
+            report_ok, report_zip = package_verifier_report(csv_path, log)
+            if report_ok and isinstance(report_zip_out, list):
+                report_zip_out.append(report_zip)
+        except Exception as e:
+            log(f"打包校验报告异常: {e}")
 
         return True, passed, failed, skipped, total
 

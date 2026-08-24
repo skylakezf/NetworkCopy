@@ -296,9 +296,11 @@ class WinGUI(ttk.Window):
         # 根据步骤设置「下一步」按钮默认状态
         transfer_done = getattr(getattr(self, 'ctl', None), '_transfer_done', False)
         is_target = getattr(getattr(self, 'ctl', None), '_device_type', '') == "目标设备"
-        if step >= self._total_steps - 1:  # step 6 (校验) 是最后一步
+        if step == 3:
             self.set_button_next("disabled")
-        elif step == 3:
+        elif step == 6:  # step 6 (校验) 是最后一步: 下一步 = 跳过校验
+            self.set_button_next("normal", text="跳过校验 >")
+        elif step >= self._total_steps - 1:  # 越界保护
             self.set_button_next("disabled")
         elif step == 4:
             if transfer_done:
@@ -705,10 +707,13 @@ class WinGUI(ttk.Window):
         info += f"\n配置路径: {config_path}"
         info += "\n是否使用此配置文件进行导入？"
         self.tk_label_config_detect.config(text=info)
-        # 将配置检测区域打包在控制台日志之前 (上方), 确保用户可见
-        if hasattr(self, 'tk_text_mqg105ch'):
+        # 配置检测区域需放在日志区上方; 若日志区当前折叠, 先展开
+        if hasattr(self, '_transfer_log_frame'):
+            if not self._transfer_log_frame.winfo_ismapped():
+                self._transfer_log_show_var.set(True)
+                self._transfer_log_frame.pack(fill=BOTH, expand=True)
             self._config_detect_frame.pack(fill=X, pady=(0, 10),
-                                           before=self.tk_text_mqg105ch)
+                                           before=self._transfer_log_frame)
         else:
             self._config_detect_frame.pack(fill=X, pady=(0, 10))
 
@@ -721,9 +726,13 @@ class WinGUI(ttk.Window):
         """步骤 4: 显示传输错误提示（红色醒目区域）
         同时将传输状态标签改为红色错误文本"""
         self.tk_label_transfer_error.config(text=message)
+        # 错误区放在"显示详细日志"复选框上方 (进度条已隐藏, 不再作为锚点)
         if hasattr(self, '_transfer_error_frame'):
-            self._transfer_error_frame.pack(fill=X, pady=(0, 10),
-                                            before=self.tk_progress_bar)
+            if hasattr(self, 'tk_check_transfer_log'):
+                self._transfer_error_frame.pack(fill=X, pady=(0, 10),
+                                                before=self.tk_check_transfer_log)
+            else:
+                self._transfer_error_frame.pack(fill=X, pady=(0, 10))
         # 状态标签也变红
         self.tk_label_transfer_status.config(
             text="传输失败 — 请返回上一步检查后重试",
@@ -757,7 +766,7 @@ class WinGUI(ttk.Window):
                   font=("Microsoft YaHei UI", 16, "bold"),
                   fg=C_TEXT, bg=C_WHITE).pack(anchor=CENTER, pady=(0, 4))
 
-        _tk.Label(self._src_connect, text="点击下方按钮启动 HTTP 文件传输服务",
+        _tk.Label(self._src_connect, text="点击下方按钮启动传输",
                   font=("Microsoft YaHei UI", 10), fg=C_TEXT_SEC,
                   bg=C_WHITE).pack(anchor=CENTER, pady=(0, 20))
 
@@ -912,30 +921,41 @@ class WinGUI(ttk.Window):
         self.tk_label_transfer_error.pack(fill=X)
         # 不在此处 pack frame — 由 show_transfer_error() 按需显示
 
-        # 总进度条
-        _tk.Label(inner, text="总进度",
-                  font=("Microsoft YaHei UI", 8, "bold"),
-                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W)
+        # 提示文字: 传输期间不可操作
+        self.tk_label_transfer_hint = _tk.Label(
+            inner, text="在数据拷贝期间不可操作电脑上的任何文档",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            fg="#E65100", bg=C_WHITE,
+            wraplength=700, justify=LEFT,
+        )
+        self.tk_label_transfer_hint.pack(fill=X, pady=(0, 8))
+
+        # 总进度条 (保留显示, 避免页面过于空旷)
+        self.tk_label_transfer_total = _tk.Label(
+            inner, text="总进度",
+            font=("Microsoft YaHei UI", 8, "bold"),
+            fg=C_TEXT, bg=C_WHITE,
+        )
+        self.tk_label_transfer_total.pack(anchor=W)
         self.tk_progress_bar = ttk.Progressbar(inner, mode="determinate",
                                                 maximum=100, value=0, bootstyle="success")
         self.tk_progress_bar.pack(fill=X, pady=(2, 8))
 
-        # 分区进度条
-        _tk.Label(inner, text="当前分区进度",
-                  font=("Microsoft YaHei UI", 8, "bold"),
-                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W)
+        # 当前分区进度条 (隐藏不显示, 仅保留供 control.py 更新)
         self.tk_file_progress_bar = ttk.Progressbar(inner, mode="determinate",
                                                      maximum=100, value=0, bootstyle="info")
-        self.tk_file_progress_bar.pack(fill=X, pady=(2, 8))
 
-        # 日志区域 - 深色背景
-        log_header = _tk.Frame(inner, bg=C_WHITE)
+        # ---- 详细日志折叠区 (勾选"显示详细日志"后才显示) ----
+        self._transfer_log_frame = _tk.Frame(inner, bg=C_WHITE)
+
+        log_header = _tk.Frame(self._transfer_log_frame, bg=C_WHITE)
         log_header.pack(fill=X, pady=(4, 2))
         _tk.Label(log_header, text="传输日志",
                   font=("Microsoft YaHei UI", 9, "bold"),
                   fg=C_TEXT, bg=C_WHITE).pack(side=LEFT)
 
-        self.tk_text_mqg105ch = _tk.Text(inner, wrap=WORD, font=("Consolas", 8),
+        self.tk_text_mqg105ch = _tk.Text(self._transfer_log_frame, wrap=WORD,
+                                         font=("Consolas", 8),
                                          bg=C_CONSOLE_BG, fg=C_CONSOLE_FG,
                                          bd=1, relief=SOLID,
                                          insertbackground=C_CONSOLE_FG,
@@ -947,6 +967,16 @@ class WinGUI(ttk.Window):
                                bootstyle="dark-round")
         scroll.config(command=self.tk_text_mqg105ch.yview)
         self.tk_text_mqg105ch.configure(yscrollcommand=scroll.set)
+
+        # "显示详细日志"复选框 (默认不显示, 点击后才展开日志区)
+        self._transfer_log_show_var = _tk.BooleanVar(value=False)
+        self.tk_check_transfer_log = ttk.Checkbutton(
+            inner, text="显示详细日志",
+            variable=self._transfer_log_show_var,
+            command=self._toggle_transfer_log,
+            takefocus=False,
+        )
+        self.tk_check_transfer_log.pack(anchor=W, pady=(0, 4))
 
         # ---- 配置检测提示区 (接收端传输完成后显示, 默认隐藏) ----
         self._config_detect_frame = _tk.Frame(inner, bg=C_INFO_BG, padx=14, pady=10)
@@ -1182,6 +1212,13 @@ class WinGUI(ttk.Window):
             table.item(name, values=(name, status), tags=(tag,))
 
     # ==================== 导出日志弹窗管理 ====================
+
+    def _toggle_transfer_log(self):
+        """勾选/取消"显示详细日志" → 展开/折叠传输日志区"""
+        if self._transfer_log_show_var.get():
+            self._transfer_log_frame.pack(fill=BOTH, expand=True)
+        else:
+            self._transfer_log_frame.pack_forget()
 
     def _toggle_export_log_window(self):
         """勾选/取消"显示详细日志" → 打开/关闭日志弹窗"""

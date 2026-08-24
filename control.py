@@ -85,6 +85,7 @@ class Controller:
         # ---- 校验线程 (独立于传输线程，可并行) ----
         self._verify_thread = None
         self._stop_verify = False  # 新传输开始时通知旧校验停止
+        self._verify_done = False  # 校验是否已完成 (完成后"跳过校验"不再生效)
 
         # ---- 传输取消 ----
         self._stop_transfer = False  # 窗口关闭时通知传输线程停止
@@ -99,6 +100,18 @@ class Controller:
         self._dhcp_server = None
         self._auth_code = ""        # 源: 生成并显示; 目标: 用户输入
         self._last_source_ip = ""   # 目标: 最近一次成功连接的源设备 IP (供校验重试)
+
+        # ---- UI 交互状态 ----
+        self._config_export_done = False   # 发送方: 是否已完成系统配置导出
+        self._auto_selected_disk = None    # 程序自动选中的磁盘 (检测用户手动更改)
+        self._auto_partition_map = {}      # 程序自动填充分区映射 {id(cb): value}
+        self._dhcp_countdown = 60          # DHCP 服务关闭倒计时 (秒)
+        self._dhcp_countdown_after = None  # 倒计时 after id
+
+        # ---- 配置导入状态 ----
+        self._auto_import_active = False    # 是否处于"自动导入"(从检测配置直接导入)
+        self._config_import_done = False    # 配置导入是否已完成 (完成后禁用"跳过")
+        self._send_skip_verify_done = False  # 关闭程序时是否已发送跳过校验信息
 
     # ==================== 初始化 ====================
 
@@ -288,6 +301,10 @@ class Controller:
     def _on_role_selected(self, role: str):
         """角色选择: 'source'(旧电脑/发送方) 或 'target'(新电脑/接收方)"""
         self._device_type = "源设备" if role == "source" else "目标设备"
+        # 切换角色时重置导出状态与自动选择标记
+        self._config_export_done = False
+        self._auto_selected_disk = None
+        self._auto_partition_map = {}
         role_display = "旧设备 (发送方)" if role == "source" else "新设备 (接收方)"
         self._log(f"已选择角色: {role_display}")
 
@@ -373,8 +390,15 @@ class Controller:
                     else:
                         self.ui.set_button_next("disabled")
             elif new_step == 3:
-                # 连接页面: 禁用"下一步", 使用"开始传输"
+                # 连接页面: 禁用"下一步", 使用"开始传输/重新接收"
                 self.ui.set_button_next("disabled")
+                # 网络断开/传输失败后回到验证码页: 激活"重新接收"按钮
+                if (self._device_type == "目标设备" and not self._transferring
+                        and not self._transfer_done):
+                    try:
+                        self.ui.tk_button_mqfzl35t.config(text="重新接收", state="normal")
+                    except Exception:
+                        pass
             elif new_step == 4:
                 # 传输页面: 若传输已完成(接收方), 启用"导入配置 >"
                 if self._transfer_done:
@@ -389,8 +413,8 @@ class Controller:
                 self.ui.set_button_next("normal", text="校验文件 >")
                 self._populate_config_folders()
             elif new_step == 6:
-                # 校验页面: 禁用"下一步"
-                self.ui.set_button_next("disabled")
+                # 校验页面: 下一步 = 跳过校验
+                self.ui.set_button_next("normal", text="跳过校验 >")
             else:
                 self.ui.set_button_next("normal")
 
@@ -406,6 +430,23 @@ class Controller:
         except Exception:
             pass
         current = self.ui._step
+
+        # 步骤 1 (发送方): 未导出系统配置时, 点击"下一步"需弹窗提醒
+        if current == 1 and self._device_type == "源设备" and not self._config_export_done:
+            from tkinter import messagebox
+            if not messagebox.askyesno(
+                "未导出系统配置",
+                "尚未导出系统配置！\n\n"
+                "若不导出，新设备将无法恢复旧设备的系统配置。\n\n"
+                "是否仍要继续？（建议先点击「导出系统配置」）",
+                parent=self.ui,
+            ):
+                return
+
+        # 步骤 6 (校验页): 下一步 = 跳过文件校验 → 创建空校验报告并上传
+        if current == 6:
+            self._on_skip_verify()
+            return
 
         # 特殊: 步骤 4 接收端已检测到配置文件 → "下一步" = 使用此配置
         if current == 4 and self._device_type == "目标设备":
@@ -444,8 +485,8 @@ class Controller:
             self.ui.set_button_next("normal", text="校验文件 >")
             self._populate_config_folders()
         elif new_step == 6:
-            # 步骤 6 (校验页面): 禁用"下一步", 这是最后一页
-            self.ui.set_button_next("disabled")
+            # 步骤 6 (校验页面): 下一步 = 跳过校验
+            self.ui.set_button_next("normal", text="跳过校验 >")
         elif new_step == 4:
             # 步骤 4 (传输页面): 传输完成前禁用"下一步"
             if self._transfer_done:
@@ -592,6 +633,19 @@ class Controller:
         disk = self.ui.tk_select_box_mqfzmzbe.get()
         if disk in ("未检测到磁盘", "", "请先选择设备类型", "扫描中..."):
             return
+        # 程序已自动选定磁盘后, 用户手动更改 → 弹窗确认
+        auto = self._auto_selected_disk
+        if auto and disk != auto:
+            from tkinter import messagebox
+            changed = messagebox.askyesno(
+                "修改自动选择",
+                f"程序已自动选定正确磁盘: {auto}\n\n是否仍要继续更改？",
+                parent=self.ui,
+            )
+            if not changed:
+                self.ui.tk_select_box_mqfzmzbe.set(auto)
+                return
+            self._auto_selected_disk = None
         self._log(f"已选择磁盘: {disk}")
 
         # 磁盘已选择: 允许用户确认后进入下一步 — 用 set_button_next 确保 pack 状态正确
@@ -641,6 +695,26 @@ class Controller:
 
     def _on_partition_map_changed(self, event=None):
         """分区映射变更，更新 partition_map 并检查按钮状态"""
+        # 程序已自动填充分区映射后, 用户手动更改 → 弹窗确认
+        widget = getattr(event, "widget", None)
+        if widget is not None and self._auto_partition_map:
+            auto_val = self._auto_partition_map.get(id(widget), "")
+            if auto_val:
+                try:
+                    cur = widget.get().strip()
+                except Exception:
+                    cur = ""
+                if cur != auto_val:
+                    from tkinter import messagebox
+                    changed = messagebox.askyesno(
+                        "修改自动映射",
+                        f"程序已自动选定正确盘符: {auto_val}\n\n是否仍要继续更改？",
+                        parent=self.ui,
+                    )
+                    if not changed:
+                        widget.set(auto_val)
+                        return
+                    self._auto_partition_map.pop(id(widget), None)
         self._update_partition_map()
         self._check_button_state()
 
@@ -707,6 +781,7 @@ class Controller:
         valid_disks = [v for v in values if v not in ("未检测到磁盘", "请先选择设备类型", "扫描中...")]
         if len(valid_disks) == 1:
             self.ui.tk_select_box_mqfzmzbe.set(valid_disks[0])
+            self._auto_selected_disk = valid_disks[0]
             self._log(f"自动选择磁盘: {valid_disks[0]}")
             if self.ui._step == 2:
                 self._on_disk_selected()
@@ -739,6 +814,7 @@ class Controller:
                 ))
                 # 自动选择: 仅 1 个磁盘时自动选中并触发分区检测
                 if len(disks) == 1:
+                    self._auto_selected_disk = disks[0]
                     self.ui.after(0, lambda: (
                         self.ui.tk_select_box_mqfzmzbe.set(disks[0])
                         if self.ui._step == 2 else None
@@ -801,6 +877,7 @@ class Controller:
             (self.ui.tk_select_box_mqfzuo2y, "E"),
             (self.ui.tk_select_box_mqfzwehm, "F"),
         )
+        self._auto_partition_map = {}
         for i, (cb, label) in enumerate(combos):
             if i < len(data_letters):
                 try:
@@ -808,6 +885,11 @@ class Controller:
                     self._log(f"自动映射(物理顺序): 源 {label} → 目标 {data_letters[i]}")
                 except tk.TclError:
                     pass
+            # 记录程序自动填充的映射值 (用于检测用户手动更改)
+            try:
+                self._auto_partition_map[id(cb)] = cb.get().strip()
+            except Exception:
+                self._auto_partition_map[id(cb)] = ""
         self._update_partition_map()
 
     def _update_partition_map(self):
@@ -1082,7 +1164,21 @@ class Controller:
             f"DHCP 已启动, 源设备将获取 {DHCP_ASSIGNED_IP} (60s 超时)..."
         ))
         self.ui.after(60000, self._auto_select_target)
-        self.ui.after(0, lambda: self.ui.tk_button_dhcp.configure(text="重新搜索", state="normal"))
+        # 60 秒内禁用搜索按钮 (与 DHCP 自动关闭倒计时一致), 归零后由 _dhcp_tick 恢复
+        self.ui.after(0, lambda: self.ui.tk_button_dhcp.configure(
+            text="搜索中 (60 秒)...", state="disabled"))
+
+        # 倒计时: 显示 DHCP 服务剩余运行时间, 归零后自动关闭
+        self._dhcp_countdown = 60
+        if self._dhcp_countdown_after:
+            try:
+                self.ui.after_cancel(self._dhcp_countdown_after)
+            except Exception:
+                pass
+            self._dhcp_countdown_after = None
+        self.ui.after(0, lambda: self.ui.tk_label_dhcp_status.config(
+            text="设备发现服务将在 60 秒后自动关闭"))
+        self._dhcp_countdown_after = self.ui.after(1000, self._dhcp_tick)
 
     def _update_discover_list(self, ip, mac, hostname=""):
         """更新发现设备下拉框"""
@@ -1103,6 +1199,36 @@ class Controller:
                 self.ui.tk_select_box_discover.current(0)
             self._log(f"[DHCP] 发现设备: {ip} ({mac}) {hostname}")
         self.ui.after(0, _update)
+
+    def _reset_dhcp_button(self):
+        """恢复「寻找旧电脑」按钮为可点击状态 (倒计时结束或服务已停止)"""
+        try:
+            self.ui.tk_button_dhcp.configure(text="寻找旧电脑", state="normal")
+        except Exception:
+            pass
+
+    def _dhcp_tick(self):
+        """每秒更新 DHCP 服务关闭倒计时, 归零后自动停止服务"""
+        self._dhcp_countdown_after = None
+        if not (self._dhcp_server and self._dhcp_server.is_running()):
+            # DHCP 已停止 (提前结束/连接成功): 恢复搜索按钮
+            self._reset_dhcp_button()
+            return
+        self._dhcp_countdown -= 1
+        if self._dhcp_countdown <= 0:
+            self._dhcp_countdown = 0
+            try:
+                self._dhcp_server.stop()
+            except Exception:
+                pass
+            self.ui.tk_label_dhcp_status.config(
+                text="设备发现服务已自动关闭 (60 秒内未连接旧设备)")
+            self._log("设备发现已自动关闭 (60 秒内未连接旧设备)")
+            self._reset_dhcp_button()
+            return
+        self.ui.tk_label_dhcp_status.config(
+            text=f"设备发现服务将在 {self._dhcp_countdown} 秒后自动关闭")
+        self._dhcp_countdown_after = self.ui.after(1000, self._dhcp_tick)
 
     def _auto_select_target(self):
         """60 秒后检查：如果只有 1 个客户端，自动选定"""
@@ -1632,7 +1758,8 @@ class Controller:
         self._set_status("传输完成 — 可进入校验页面")
 
     def _on_use_detected_config(self):
-        """接收端步骤 4: 用户确认使用检测到的配置文件"""
+        """接收端步骤 4: 用户确认使用检测到的配置文件
+        选中后直接进入导入页面并自动开始导入, 无需再次点击「导入配置」"""
         if not hasattr(self, '_detected_config_path'):
             return
         self.ui.hide_config_detect()
@@ -1641,6 +1768,9 @@ class Controller:
         self._populate_config_folders()
         self._select_config_folder(self._detected_config_path)
         self.ui.go_step(5)
+        # 自动开始导入 (已自动选中配置路径, 无需用户再点击)
+        self._auto_import_active = True
+        self.ui.after(150, self._on_import_config)
 
     def _on_skip_detected_config(self):
         """接收端步骤 4: 用户跳过检测到的配置文件"""
@@ -1720,6 +1850,7 @@ class Controller:
         # 只要导出目录有效(非空字符串), 就尝试压缩上传;
         # 部分导出项失败不影响已导出的数据上传
         if export_path:
+            self._config_export_done = True  # 已完成导出, 步骤1不再提醒
             button.config(text="正在压缩", bootstyle="info", state="disabled")
             if success:
                 self._set_status(f"系统配置已导出到: {export_path}")
@@ -1896,16 +2027,21 @@ class Controller:
     def _on_import_done(self, success):
         self.ui.tk_import_progress_bar.stop()
         self.ui.tk_import_progress_bar.pack_forget()
-        self.ui.tk_button_skip_import.config(state="normal")
+        self._auto_import_active = False
 
         if success:
+            self._config_import_done = True  # 配置已导入 → 禁用"跳过"按钮
             self._log("\n配置导入完成!")
             self.ui.tk_button_import_config.config(text="导入完成", bootstyle="success", state="disabled")
-            self.ui.tk_label_import_progress.config(text="配置导入成功! 点击「校验文件 >」进入下一步")
+            self.ui.tk_button_skip_import.config(state="disabled")
+            self.ui.tk_label_import_progress.config(text="配置导入成功! 正在进入校验页面...")
             self._set_status("配置导入完成")
+            # 导入完成后自动跳转到文件校验页面 (步骤 6)
+            self.ui.after(300, self.ui.go_step, 6)
         else:
             self._log("\n部分配置导入失败, 请查看日志")
             self.ui.tk_button_import_config.config(text="重试导入", bootstyle="warning", state="normal")
+            self.ui.tk_button_skip_import.config(state="normal")
             self.ui.tk_label_import_progress.config(text="部分配置导入失败，请点击重试")
             self._set_status("配置导入部分失败")
 
@@ -1915,6 +2051,7 @@ class Controller:
     def _on_import_error(self, error_msg):
         self.ui.tk_import_progress_bar.stop()
         self.ui.tk_import_progress_bar.pack_forget()
+        self._auto_import_active = False
         self._log(f"导入配置出错: {error_msg}")
         self.ui.tk_button_import_config.config(text="重试导入", bootstyle="danger", state="normal")
         self.ui.tk_button_skip_import.config(state="normal")
@@ -1924,10 +2061,13 @@ class Controller:
 
     def _on_skip_import(self):
         """步骤 5: 点击「跳过」按钮, 直接进入校验页面"""
+        # 配置已成功导入: 不允许再"跳过" (跳过按钮已禁用, 此处兜底防护)
+        if self._config_import_done:
+            self._log("配置已导入, 无需跳过")
+            return
         self._log("已跳过配置导入")
-        self.ui.go_step(6)
+        self.ui.go_step(6)  # go_step 会将下一步置为「跳过校验 >」
         self.ui.tk_button_prev.config(state="normal")
-        self.ui.set_button_next("disabled")
 
     def _log_import(self, msg):
         """写入导入日志区域"""
@@ -1999,6 +2139,7 @@ class Controller:
                     if total > 0:
                         self.ui.after(0, lambda: self._set_progress(done, total))
 
+                report_zip_out = []
                 ok, passed, failed, skipped, total = run_verification(
                     f_drive_pe=f_drive,
                     partition_map=partition_map,
@@ -2010,6 +2151,7 @@ class Controller:
                     auth_code=auth_code,
                     winpe=(self.ui.winpe_var.get() == "winpe"),
                     csv_path=csv_path,
+                    report_zip_out=report_zip_out,
                 )
                 if self._stop_verify:
                     self.ui.after(0, lambda: _verify_log("校验已取消"))
@@ -2021,6 +2163,10 @@ class Controller:
                         f"\n{'='*50}\n  {result_text}\n{'='*50}"
                     ))
                     self.ui.after(0, lambda: self._set_verify_result(result_text, success=True))
+                    # 校验报告已由 verifier 打包, 后台线程上传到 Profile 服务器
+                    self._verify_done = True
+                    if report_zip_out:
+                        self._upload_verifier_report(report_zip_out[0], _verify_log)
                 else:
                     self.ui.after(0, lambda: _verify_log("校验失败，请检查日志"))
                     self.ui.after(0, lambda: self._set_verify_result("校验失败，请检查日志", success=False))
@@ -2033,6 +2179,74 @@ class Controller:
 
         self._verify_thread = threading.Thread(target=_verify, daemon=True)
         self._verify_thread.start()
+
+    def _upload_verifier_report(self, zip_path, log_callback=None):
+        """后台线程上传校验报告 ZIP 到 Profile 服务器。"""
+        import config_transfer
+
+        def _log_safe(msg):
+            if log_callback:
+                log_callback(msg)
+
+        def _run():
+            try:
+                _log_safe("")
+                _log_safe("=" * 50)
+                _log_safe("开始上传校验报告...")
+                config_transfer.upload_zip_to_server(zip_path, log_callback=_log_safe)
+                _log_safe("校验报告上传完成")
+                _log_safe("=" * 50)
+            except Exception as e:
+                _log_safe(f"上传校验报告异常: {e}")
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_skip_verify(self):
+        """校验页点击「下一步」: 跳过文件校验, 创建空 <设备名>_Unverifi.zip 并上传。"""
+        from verifier import create_unverifi_zip
+        import config_transfer
+
+        # 校验进行中不允许跳过
+        if getattr(self, '_verify_thread', None) and self._verify_thread.is_alive():
+            self._log("校验正在进行中, 无法跳过")
+            return
+
+        # 校验已完成则无需再跳过 (报告已打包并上传)
+        if self._verify_done:
+            self._log("校验已完成, 校验报告已上传")
+            return
+
+        # 防止重复触发
+        self.ui.set_button_next("disabled")
+        self.ui.set_button_prev("disabled")
+        self._set_verify_status("正在跳过校验, 创建空校验报告...")
+
+        def _log_safe(msg):
+            self.ui.after(0, lambda: self._append_verify_log(msg))
+
+        def _run():
+            try:
+                f_drive = self._partition_map.get("F", "")
+                appl_dir = os.path.join(f_drive.rstrip("\\") + "\\", "Appl") if f_drive else ""
+                ok, zip_path = create_unverifi_zip(log_callback=_log_safe, save_dir=appl_dir)
+                if ok and zip_path:
+                    _log_safe("")
+                    _log_safe("=" * 50)
+                    _log_safe("开始上传校验报告(空包)...")
+                    config_transfer.upload_zip_to_server(zip_path, log_callback=_log_safe)
+                    _log_safe("=" * 50)
+                    self.ui.after(0, lambda: self._set_verify_result(
+                        "已跳过校验 (空校验报告已上传)", success=True
+                    ))
+            except Exception as e:
+                _log_safe(f"跳过校验/上传异常: {e}")
+                self.ui.after(0, lambda: self._set_verify_result(
+                    f"跳过校验异常: {e}", success=False
+                ))
+            finally:
+                self.ui.after(0, lambda: self.ui.set_button_prev("normal"))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _append_verify_log(self, msg: str):
         """向步骤 5 校验日志区域追加一行"""
@@ -2313,6 +2527,48 @@ class Controller:
 
     # ==================== 清理退出 ====================
 
+    def _send_skip_verify_on_close(self):
+        """窗口关闭时: 若接收方已进入校验页但未完成校验, 参照"跳过校验"向服务器
+        发送跳过校验信息 (创建空 <设备名>_Unverifi.zip 并上传)。
+
+        在 shutdown 中同步调用, 进程退出前需完成上传 (否则 os._exit 中断后台线程)。
+        """
+        # 仅接收方 + 已到校验页 (步骤6) + 未完成校验 时触发
+        if self._device_type != "目标设备":
+            return
+        if getattr(self.ui, '_step', 0) != 6:
+            return
+        if self._verify_done:
+            return  # 已正常完成校验, 报告已上传
+        if self._send_skip_verify_done:
+            return  # 已发送过
+
+        # 校验正在运行中 (未完成) → 同样视为跳过
+        self._log("[清理] 校验未完成, 关闭程序时按「跳过校验」处理...")
+
+        try:
+            import config_transfer
+            from verifier import create_unverifi_zip
+
+            f_drive = self._partition_map.get("F", "")
+            appl_dir = os.path.join(f_drive.rstrip("\\") + "\\", "Appl") if f_drive else ""
+            ok, zip_path = create_unverifi_zip(
+                log_callback=lambda m: self._log(m),
+                save_dir=appl_dir,
+            )
+            if ok and zip_path:
+                # 同步上传 (阻塞), 确保进程退出前完成
+                self._log("[清理] 正在上传空校验报告 (跳过校验)...")
+                upload_ok, _ = config_transfer.upload_zip_to_server(
+                    zip_path,
+                    log_callback=lambda m: self._log(m),
+                )
+                if upload_ok:
+                    self._log("[清理] 已发送跳过校验信息")
+                    self._send_skip_verify_done = True
+        except Exception as e:
+            self._log(f"[清理] 发送跳过校验信息失败: {e}")
+
     def shutdown(self):
         """清理所有后台进程和资源 (窗口关闭 / 异常退出 / atexit 时调用)
 
@@ -2323,6 +2579,13 @@ class Controller:
         - 系统休眠策略恢复 (不再阻止锁屏/休眠)
         """
         self._log("[清理] 正在关闭所有后台进程...")
+
+        # -1. 校验页未完成校验就直接关闭程序 → 参照"跳过校验"发送跳过信息
+        #     需在进程退出前同步完成上传, 否则 os._exit 会中断后台线程
+        try:
+            self._send_skip_verify_on_close()
+        except Exception:
+            pass
 
         # 0. 通知传输线程停止 (最高优先级)
         self._stop_transfer = True
