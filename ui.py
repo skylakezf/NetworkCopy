@@ -749,6 +749,16 @@ class WinGUI(ttk.Window):
             fg=C_TEXT_SEC,
             font=("Microsoft YaHei UI", 8),
         )
+        if hasattr(self, 'tk_label_verify_online'):
+            self.tk_label_verify_online.config(text="边传边校验：等待中")
+
+    def set_verify_online_status(self, text: str):
+        """步骤 4: 更新"边传边校验"状态行文本 (由 control.py 通过 after 在主线程调用)"""
+        try:
+            if hasattr(self, 'tk_label_verify_online'):
+                self.tk_label_verify_online.config(text=text)
+        except Exception:
+            pass
 
     # ==================== 步骤 3: 连接设置 ====================
 
@@ -940,6 +950,15 @@ class WinGUI(ttk.Window):
         self.tk_progress_bar = ttk.Progressbar(inner, mode="determinate",
                                                 maximum=100, value=0, bootstyle="success")
         self.tk_progress_bar.pack(fill=X, pady=(2, 8))
+
+        # 边传边校验状态行: 文件传输完成后由独立线程立即复核"存在+大小", 实时展示确认进度
+        self.tk_label_verify_online = _tk.Label(
+            inner, text="边传边校验：等待中",
+            font=("Microsoft YaHei UI", 8),
+            fg=C_TEXT_SEC, bg=C_WHITE,
+            anchor=W,
+        )
+        self.tk_label_verify_online.pack(fill=X, pady=(0, 6))
 
         # 当前分区进度条 (隐藏不显示, 仅保留供 control.py 更新)
         self.tk_file_progress_bar = ttk.Progressbar(inner, mode="determinate",

@@ -81,6 +81,7 @@ class Controller:
         # ---- 传输状态 ----
         self._transferring = False
         self._transfer_done = False  # 传输是否已完成 (用于启用"校验文件"按钮)
+        self._pre_verified_file = None  # 边传边校验确认清单 (供校验阶段增量跳过磁盘校验)
 
         # ---- 校验线程 (独立于传输线程，可并行) ----
         self._verify_thread = None
@@ -1640,6 +1641,10 @@ class Controller:
             # ---- 启动网络断开监控 ----
             self._start_network_monitor(source_ip)
 
+            # 启用边传边校验: 先下载 FullFilelist_DEF.csv 再传输, 文件传输完成后由
+            # 独立校验线程立即复核"存在+大小", 与传输并行; 校验结果写入确认清单,
+            # 供后续校验阶段增量跳过, 大幅缩短校验时间
+            pre_verified_out = [None]
             success, files, bytes_done, errors = download_files(
                 server_ip=source_ip,
                 partition_map=self._partition_map,
@@ -1650,7 +1655,11 @@ class Controller:
                 auth_code=self._auth_code,
                 conflict_callback=self._resolve_conflicts,
                 stop_check=_check_stop,
+                verify_after_transfer=True,
+                pre_verified_out=pre_verified_out,
+                verify_progress_callback=self._verify_online_progress,
             )
+            self._pre_verified_file = pre_verified_out[0]
 
             # ---- 停止网络断开监控 ----
             self._stop_network_monitor()
@@ -1732,6 +1741,11 @@ class Controller:
 
         self._transfer_done = True
         self.ui.hide_transfer_error()
+        # 边传边校验: 传输阶段结束后展示最终确认状态 (hide_transfer_error 已重置该标签)
+        if self._pre_verified_file:
+            self.ui.set_verify_online_status(
+                "边传边校验：已完成，已确认文件将在校验阶段跳过重复校验"
+            )
         # 传输完成: 隐藏"开始传输"按钮, 清理 UI
         self.ui.hide_start_button()
 
@@ -2140,6 +2154,16 @@ class Controller:
                         self.ui.after(0, lambda: self._set_progress(done, total))
 
                 report_zip_out = []
+                # 读取边传边校验确认清单: 已确认的文件在校验阶段直接标记 Y 跳过磁盘校验
+                pre_ok_paths = None
+                pre_file = getattr(self, "_pre_verified_file", "")
+                if pre_file and os.path.isfile(pre_file):
+                    try:
+                        with open(pre_file, "r", encoding="utf-8") as _pf:
+                            pre_ok_paths = {ln.strip() for ln in _pf if ln.strip()}
+                        _verify_log(f"已读取边传边校验确认清单: {len(pre_ok_paths)} 个文件将跳过磁盘校验")
+                    except Exception as _e:
+                        _verify_log(f"读取边传边校验确认清单失败: {_e}")
                 ok, passed, failed, skipped, total = run_verification(
                     f_drive_pe=f_drive,
                     partition_map=partition_map,
@@ -2152,6 +2176,7 @@ class Controller:
                     winpe=(self.ui.winpe_var.get() == "winpe"),
                     csv_path=csv_path,
                     report_zip_out=report_zip_out,
+                    pre_ok_paths=pre_ok_paths,
                 )
                 if self._stop_verify:
                     self.ui.after(0, lambda: _verify_log("校验已取消"))
@@ -2389,6 +2414,22 @@ class Controller:
             pct = min(done / total * 100, 100) if total > 0 else 0
             self.ui.after(0, lambda: self.ui.tk_file_progress_bar.config(value=pct))
             self.ui.after(0, lambda p=partition: self._set_status(f"正在拷贝 {p} 盘 ({done}/{total})"))
+        except Exception:
+            pass
+
+    def _verify_online_progress(self, ok: int, fail: int, total: int):
+        """边传边校验进度回调 (在传输的校验线程中调用, 经 ui.after 转主线程更新 UI)
+
+        file_transfer.download_files 的边传边校验线程每确认一个文件调用一次。
+        """
+        try:
+            if total <= 0:
+                return
+            if fail > 0:
+                text = f"边传边校验：已确认 {ok}/{total} 个文件（{fail} 个待校验阶段复核）"
+            else:
+                text = f"边传边校验：已确认 {ok}/{total} 个文件"
+            self.ui.after(0, lambda t=text: self.ui.set_verify_online_status(t))
         except Exception:
             pass
 

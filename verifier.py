@@ -1067,6 +1067,7 @@ def verify_csv(
     stop_check=None,
     progress_callback=None,
     target_indices=None,
+    pre_ok_paths: set | None = None,
 ) -> tuple:
     """
     校验 CSV 文件 (多线程) —— 纯校验，不做重试下载
@@ -1157,6 +1158,28 @@ def verify_csv(
     skipped = 0
     stats_lock = threading.Lock()
 
+    # ---- 边传边校验已确认的文件: 直接标记 Y, 跳过磁盘校验 (增量校验) ----
+    # 仅在首轮全量校验时应用 (target_indices 二次校验模式不应用, 缺失文件仍需重检)
+    pre_ok_count = 0
+    if target_indices is None and pre_ok_paths:
+        filtered_items = []
+        for i, r in verify_items:
+            full = r[col_b].strip() if len(r) > col_b else ""
+            if full and full in pre_ok_paths:
+                while len(r) <= col_e:
+                    r.append("")
+                if not r[col_e]:
+                    r[col_e] = "Y"
+                result_map[i] = r
+                pre_ok_count += 1
+            else:
+                filtered_items.append((i, r))
+        if pre_ok_count:
+            verify_items = filtered_items
+            work_total = len(verify_items) + pre_ok_count
+            passed += pre_ok_count
+            log(f"边传边校验已确认 {pre_ok_count} 个文件, 跳过磁盘校验")
+
     # 多线程校验
     verify_row_map = {i: r for i, r in verify_items}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1169,7 +1192,9 @@ def verify_csv(
             )
             futures[future] = idx
 
-        completed_count = [0]
+        completed_count = [pre_ok_count]
+        if pre_ok_count and progress_callback:
+            progress_callback(pre_ok_count, work_total)
         for future in as_completed(futures):
             # 检查是否需要中止
             if stop_check and stop_check():
@@ -1335,6 +1360,7 @@ def run_verification(
     winpe: bool | None = None,
     csv_path: str = "",
     report_zip_out=None,
+    pre_ok_paths: set | None = None,
 ) -> tuple:
     """
     执行完整校验流程
@@ -1390,11 +1416,12 @@ def run_verification(
         elif not winpe:
             log("非 WinPE 环境: 源端未重命名 GTMC_User_Profiles，CSV 路径保持原样")
 
-        # ---- 第一轮: 纯校验 ----
+        # ---- 第一轮: 纯校验 (边传边校验已确认的文件直接标记 Y, 跳过磁盘校验) ----
         passed, failed, skipped, total = verify_csv(
             csv_path, partition_map, log_callback,
             max_workers=max_workers, stop_check=stop_check,
             progress_callback=progress_callback,
+            pre_ok_paths=pre_ok_paths,
         )
 
         # ---- 第二轮: 如果有缺失文件且源设备可达，重试下载 ----

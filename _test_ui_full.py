@@ -505,6 +505,31 @@ def test_transfer_not_done():
     finally:
         t.destroy()
 
+@test("20b. 步骤4 边传边校验状态行存在且可更新")
+def test_verify_online_label():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.next_step()
+        t.set_disk()
+        t.next_step()
+        t.app.go_step(4)
+        t.app.update_idletasks()
+        eq(t.step, 4)
+        check(hasattr(t.app, "tk_label_verify_online"),
+              "步骤4 应存在边传边校验状态行 (tk_label_verify_online)")
+        t.app.set_verify_online_status("边传边校验：已确认 3/5 个文件")
+        t.app.update_idletasks()
+        eq(t.app.tk_label_verify_online.cget("text"), "边传边校验：已确认 3/5 个文件",
+           "set_verify_online_status 应更新标签文本")
+        t.app.hide_transfer_error()
+        t.app.update_idletasks()
+        eq(t.app.tk_label_verify_online.cget("text"), "边传边校验：等待中",
+           "hide_transfer_error 应重置状态行为等待中")
+    finally:
+        t.destroy()
+
 # ============================================================
 # 测试 9: 步骤间跳转保留网卡/磁盘选择
 # ============================================================
@@ -1305,7 +1330,7 @@ def test_auth_code_entry():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  UI 全场景导航测试 (62 项)")
+    print("  UI 全场景导航测试")
     print("=" * 60)
     print()
 
@@ -1329,6 +1354,7 @@ if __name__ == "__main__":
     test_disk_placeholders()
     test_disk_real()
     test_transfer_not_done()
+    test_verify_online_label()
     test_nic_preserved()
     test_disk_preserved()
     test_role_switch()
