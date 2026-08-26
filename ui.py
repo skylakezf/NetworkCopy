@@ -317,12 +317,8 @@ class WinGUI(ttk.Window):
             if step == 0:
                 self.set_button_next("disabled")
             elif step == 1:
-                nic_ok = (self.tk_select_box_mqfzkd6x.get() not in
-                          ("扫描中...", "未检测到网卡", "", "网卡1", "网卡2"))
-                if nic_ok:
-                    self.set_button_next("normal")
-                else:
-                    self.set_button_next("disabled")
+                # 网卡已改为自动检测 (无需手动选择), 角色已选即可进入下一步
+                self.set_button_next("normal")
             # step 2: 由 controller 回调控制(依赖磁盘选择)
         # 更新按钮状态
         if hasattr(self.ctl, '_check_button_state'):
@@ -576,26 +572,7 @@ class WinGUI(ttk.Window):
                                                   wraplength=650, justify=LEFT)
         self.tk_label_auto_nic_detail.pack(fill=X, padx=12, pady=8)
 
-        _tk.Label(self._advanced_nic_frame, text="手动选择网卡",
-                  font=("Microsoft YaHei UI", 9, "bold"),
-                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 4))
-
-        _tk.Label(self._advanced_nic_frame, text="网卡优先级: USB 网卡 > 169.254 网段 > 内置网卡",
-                  font=("Microsoft YaHei UI", 8), fg=C_TEXT_MUTED,
-                  bg=C_WHITE).pack(anchor=W, pady=(0, 8))
-
-        self.tk_select_box_mqfzkd6x = ttk.Combobox(self._advanced_nic_frame, state="readonly",
-                                                    font=("Microsoft YaHei UI", 9))
-        self.tk_select_box_mqfzkd6x['values'] = ("扫描中...",)
-        self.tk_select_box_mqfzkd6x.pack(fill=X, pady=(0, 10))
-
-        self.tk_label_nic_detail = _tk.Label(self._advanced_nic_frame, text="",
-                                             font=("Microsoft YaHei UI", 8),
-                                             fg=C_TEXT_SEC, bg=C_WHITE,
-                                             wraplength=700, justify=LEFT)
-        self.tk_label_nic_detail.pack(fill=X, pady=(0, 12))
-
-        # ---- 初始状态: 两个主内容框架均隐藏 ----
+        # 初始状态: 两个主内容框架均隐藏
         self._export_frame.pack(fill=BOTH, expand=True)
         self._export_frame.pack_forget()
         self._target_info_frame.pack(fill=BOTH, expand=True)

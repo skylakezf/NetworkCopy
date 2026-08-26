@@ -69,7 +69,7 @@ $watchdogJob = Start-Job -ArgumentList $buildTimeout -ScriptBlock {
 $buildTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
 # ---- PyInstaller 参数 ----
-$AppName  = "磁盘拷贝工具"
+$AppName  = "磁盘拷贝工具v3"
 $MainPy   = "main.py"
 
 $HiddenImports = @(

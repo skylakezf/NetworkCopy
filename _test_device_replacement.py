@@ -84,12 +84,11 @@ class T:
         self.app.update_idletasks()
 
     def set_nic(self, name="Test NIC [Realtek]"):
-        cb = self.app.tk_select_box_mqfzkd6x
-        cb.set(name)
-        if name not in cb["values"]:
-            cb["values"] = list(cb["values"]) + [name]
-        if hasattr(self.ctl, '_on_nic_selected'):
-            self.ctl._on_nic_selected()
+        # 网卡已改为全自动检测 (不再有手动选择下拉框)。
+        # 此方法仅用于测试中模拟自动网卡选择结果。
+        self.ctl._auto_nic = (name, "Realtek PCIe GbE Family Controller",
+                              "ethernet0", "1Gbps", 1, "169.254.100.2")
+        self.ctl._nic_list = [self.ctl._auto_nic]
         self.app.update_idletasks()
 
     def set_disk(self, name="磁盘 0 (ST1000DM010)"):

@@ -28,7 +28,7 @@
 - 新增依赖 cryptography（已 pip 安装进 python-3.13.14-embed-amd64，PyInstaller 需 --hidden-import cryptography --collect-data cryptography）
 - 盘符映射是核心难点，需用户手动指定
 - 组网方式（2026-07-28 核实代码更正）：目标设备设静态 IP 169.254.100.1 并运行内置 DHCP 服务器，源设备通过 DHCP 获得 169.254.100.2；传输端口为 9999（不是 443/80）
-- 网卡选择已改为自动（2026-08-02）：发送端 HTTP Server bind 0.0.0.0（无需网卡选择）；接收端 DHCP 在所有有线网卡(Type=6)上广播 OFFER/ACK（多 send socket）；网卡选择下拉框移至步骤 1"高级选项"折叠面板中，仅在需要手动覆盖时使用
+- 网卡全自动检测（2026-08-26 最终形态）：发送端 HTTP Server bind 0.0.0.0；接收端 DHCP 在所有有线网卡(Type=6)上广播 OFFER/ACK（多 send socket）。步骤 1"高级选项"中的手动网卡下拉框已彻底移除（含 `tk_select_box_mqfzkd6x`、`tk_label_nic_detail`、`_on_nic_selected`、`_get_adapter_desc`、`_manual_nic` 字段）；`_check_button_state` 不再依赖网卡选择（修复了发送端开始传输按钮一直被禁用的问题）；所有需要 adapter_desc 的地方走 `_get_adapter_desc_from_auto()`
 - 所有传输端点 (/ping /list /get /batch_get /filelist) 必须携带 ?pwd=<验证码>，否则 403
 - 边传边校验（2026-08-25）：传输前先下载 FullFilelist_DEF.csv（/filelist 端点）→ 每个文件下载完成后入队，由独立线程做"存在+大小"轻量校验（不做 MD5）→ 校验阶段通过 pre_verified.txt 确认清单增量跳过已确认文件，避免全量拷贝后二次读盘校验耗时过长
 - 客户端不校验自签名证书 (CERT_NONE)，安全性由随机验证码保证；如需防 MITM 需改为校验证书

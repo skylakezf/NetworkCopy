@@ -91,10 +91,11 @@ class T:
         self.app.update_idletasks()
 
     def set_nic(self, name="Test NIC [Realtek]"):
-        cb = self.app.tk_select_box_mqfzkd6x
-        cb.set(name)
-        if hasattr(self.ctl, '_on_nic_selected'):
-            self.ctl._on_nic_selected()
+        # 网卡已改为全自动检测 (不再有手动选择下拉框)。
+        # 此方法仅用于测试中模拟自动网卡选择结果。
+        self.ctl._auto_nic = (name, "Realtek PCIe GbE Family Controller",
+                              "ethernet0", "1Gbps", 1, "169.254.100.2")
+        self.ctl._nic_list = [self.ctl._auto_nic]
         self.app.update_idletasks()
 
     def set_disk(self, name="磁盘 0 (ST1000DM010)"):
@@ -151,18 +152,18 @@ def test_initial():
 # 测试 2: 发送端正向导航
 # ============================================================
 
-@test("2. 发送端: 0→1 选角色后 step=1, 上一步启用, 下一步禁用(未选网卡)")
+@test("2. 发送端: 0→1 选角色后 step=1, 上一步启用, 下一步启用(网卡全自动)")
 def test_source_role_select():
     t = make_app()
     try:
         t.select_role("source")
         eq(t.step, 1)
         eq(t.prev_state, "normal")
-        eq(t.next_state, "disabled")
+        eq(t.next_state, "normal", "步骤1 网卡全自动检测, 下一步直接启用")
     finally:
         t.destroy()
 
-@test("3. 发送端: step1 选网卡后下一步启用")
+@test("3. 发送端: step1 模拟自动网卡后下一步启用")
 def test_source_nic_select():
     t = make_app()
     try:
@@ -304,14 +305,14 @@ def test_source_full_backward():
 # 测试 4: 接收端正向导航
 # ============================================================
 
-@test("11. 接收端: 0→1 选角色后 step=1")
+@test("11. 接收端: 0→1 选角色后 step=1, 下一步启用(网卡全自动)")
 def test_target_role_select():
     t = make_app()
     try:
         t.select_role("target")
         eq(t.step, 1)
         eq(t.prev_state, "normal")
-        eq(t.next_state, "disabled")
+        eq(t.next_state, "normal", "步骤1 网卡全自动检测, 下一步直接启用")
     finally:
         t.destroy()
 
@@ -413,33 +414,30 @@ def test_target_full_backward():
 # 测试 6: 网卡状态检查
 # ============================================================
 
-@test("16. 未选网卡时下一步禁用(所有占位值)")
+@test("16. 步骤1 无需网卡选择即可进入下一步 (网卡全自动检测)")
 def test_nic_placeholders():
     t = make_app()
     try:
         t.select_role("source")
         eq(t.step, 1)
-
-        t.app.tk_select_box_mqfzkd6x.set("扫描中...")
-        eq(t.next_state, "disabled", "'扫描中...' 应禁用")
-
-        t.app.tk_select_box_mqfzkd6x.set("未检测到网卡")
-        eq(t.next_state, "disabled", "'未检测到网卡' 应禁用")
-
-        t.app.tk_select_box_mqfzkd6x.set("")
-        eq(t.next_state, "disabled", "'' 应禁用")
-
-        t.app.tk_select_box_mqfzkd6x.set("网卡1")
-        eq(t.next_state, "disabled", "'网卡1' 应禁用")
+        # 网卡为全自动检测, 角色已选即可进入下一步
+        eq(t.next_state, "normal", "步骤1 角色已选即可进入下一步")
+        # 手动选择下拉框已从 UI 移除
+        check(not hasattr(t.app, 'tk_select_box_mqfzkd6x'),
+              "网卡选择下拉框应已从 UI 移除")
+        check(not hasattr(t.app, 'tk_label_nic_detail'),
+              "网卡详情标签应已从 UI 移除")
     finally:
         t.destroy()
 
-@test("17. 真实网卡名启用下一步")
+@test("17. 自动网卡检测信息显示后下一步保持启用")
 def test_nic_real():
     t = make_app()
     try:
         t.select_role("source")
-        t.set_nic("Realtek PCIe GbE Family Controller")
+        # 模拟自动网卡检测回调 (无需手动选择)
+        t.app.update_auto_nic_display("Realtek PCIe GbE Family Controller",
+                                      "169.254.100.2", "1Gbps", 1)
         eq(t.next_state, "normal")
     finally:
         t.destroy()
@@ -534,16 +532,14 @@ def test_verify_online_label():
 # 测试 9: 步骤间跳转保留网卡/磁盘选择
 # ============================================================
 
-@test("21. 回退到 step1 网卡选择保留")
+@test("21. 回退到 step1 下一步保持启用 (网卡全自动)")
 def test_nic_preserved():
     t = make_app()
     try:
         t.select_role("source")
-        t.set_nic("My NIC Adapter")
         t.next_step()  # →2
         t.prev_step()  # →1
-        eq(t.app.tk_select_box_mqfzkd6x.get(), "My NIC Adapter")
-        eq(t.next_state, "normal", "回退后网卡仍选中, 下一步启用")
+        eq(t.next_state, "normal", "回退到步骤1 下一步仍启用")
     finally:
         t.destroy()
 
@@ -577,7 +573,7 @@ def test_role_switch():
         eq(t.ctl._device_type, "目标设备")
         eq(t.step, 1)
         eq(t.prev_state, "normal")
-        eq(t.next_state, "disabled")
+        eq(t.next_state, "normal", "步骤1 网卡全自动检测, 下一步直接启用")
     finally:
         t.destroy()
 
@@ -622,27 +618,27 @@ def test_gostep_0():
     finally:
         t.destroy()
 
-@test("26. go_step(1) 网卡已选时下一步启用")
+@test("26. go_step(1) 下一步启用")
 def test_gostep_1():
     t = make_app()
     try:
         t.select_role("source")
-        t.set_nic()
         t.app.go_step(1)
         eq(t.step, 1)
         eq(t.next_state, "normal")
     finally:
         t.destroy()
 
-@test("27. go_step(1) 网卡未选时下一步禁用")
+@test("27. go_step(1) 不依赖网卡选择 (下拉框已移除)")
 def test_gostep_1_no_nic():
     t = make_app()
     try:
         t.select_role("source")
-        t.app.tk_select_box_mqfzkd6x.set("")
+        check(not hasattr(t.app, 'tk_select_box_mqfzkd6x'),
+              "网卡选择下拉框应已移除")
         t.app.go_step(1)
         eq(t.step, 1)
-        eq(t.next_state, "disabled")
+        eq(t.next_state, "normal", "步骤1 下一步不依赖网卡选择")
     finally:
         t.destroy()
 
@@ -757,18 +753,17 @@ def test_export_hidden_target():
 # 测试 17: step3 开始传输按钮状态
 # ============================================================
 
-@test("34. step3 开始传输按钮启用(网卡+设备已选)")
+@test("34. step3 开始传输按钮启用 (无需网卡选择)")
 def test_transfer_button_enabled():
     t = make_app()
     try:
         t.select_role("source")
-        t.set_nic()
         t.next_step()
         t.set_disk()
         t.next_step()
         eq(t.step, 3)
         eq(str(t.app.tk_button_mqfzl35t.cget("state")), "normal",
-           "开始传输按钮应启用")
+           "开始传输按钮应启用 (不依赖网卡选择)")
     finally:
         t.destroy()
 
@@ -776,17 +771,14 @@ def test_transfer_button_enabled():
 # 测试 18: _on_next_step 在 step1 无网卡时不前进
 # ============================================================
 
-@test("35. step1 未选网卡时 _on_next_step 不前进")
+@test("35. step1 无需网卡选择即可前进到 step2")
 def test_next_blocked_no_nic():
     t = make_app()
     try:
         t.select_role("source")
         eq(t.step, 1)
-        # 按钮禁用，但直接调用 _on_next_step 也应该被拦截
-        # 实际上由按钮禁用保证，这里确认 step 不变
-        saved_step = t.step
         t.next_step()
-        eq(t.step, saved_step, "按钮禁用时不应前进")
+        eq(t.step, 2, "步骤1 无需网卡选择即可进入磁盘映射")
     finally:
         t.destroy()
 
@@ -888,11 +880,15 @@ def test_get_wired_adapters_no_wifi():
     print(f"  PASS test_get_wired_adapters_no_wifi")
 
 def test_auto_nic_init_state():
-    """Controller 初始化后 _auto_nic 和 _manual_nic 应为默认值"""
+    """Controller 初始化后 _auto_nic 为自动检测结果 (异步填充, 无手动选择状态)"""
     app = T()
     try:
-        eq(app.ctl._auto_nic, None, "初始化时 _auto_nic 应为 None")
-        eq(app.ctl._manual_nic, False, "初始化时 _manual_nic 应为 False")
+        # 网卡自动检测为异步线程, 本机有网卡时可能已填充; 均属正常
+        auto = app.ctl._auto_nic
+        check(auto is None or (isinstance(auto, tuple) and len(auto) >= 6),
+              "_auto_nic 应为 None 或自动检测结果元组")
+        check(not hasattr(app.ctl, '_manual_nic'),
+              "_manual_nic 字段应已移除")
         print("  PASS test_auto_nic_init_state")
     finally:
         app.destroy()
@@ -914,23 +910,19 @@ def test_auto_select_wired_nic():
     finally:
         app.destroy()
 
-def test_manual_nic_override():
-    """手动选择网卡后 _manual_nic 置为 True"""
+def test_manual_nic_removed():
+    """网卡手动选择下拉框已移除, 传输流程不依赖手动网卡选择"""
     app = T()
     try:
-        # 等待扫描完成并用 update() 处理包含 after 回调的事件队列
+        # 等待自动扫描完成, 确认 UI 中已无手动选择下拉框
         import time
         time.sleep(1.0)
         app.app.update()
-        vals = list(app.app.tk_select_box_mqfzkd6x['values'])
-        if not vals or vals[0] in ("扫描中...", "未检测到网卡"):
-            print("  SKIP test_manual_nic_override (无可用网卡)")
-            return
-        cb = app.app.tk_select_box_mqfzkd6x
-        cb.set(vals[0])
-        app.ctl._on_nic_selected()
-        eq(app.ctl._manual_nic, True, "手动选择后 _manual_nic 应为 True")
-        print("  PASS test_manual_nic_override")
+        check(not hasattr(app.app, 'tk_select_box_mqfzkd6x'),
+              "网卡手动选择下拉框应已从 UI 移除")
+        check(not hasattr(app.app, 'tk_label_nic_detail'),
+              "网卡详情标签应已从 UI 移除")
+        print("  PASS test_manual_nic_removed")
     finally:
         app.destroy()
 
@@ -1090,8 +1082,8 @@ def test_auto_nic_enables_next_button():
     finally:
         app.destroy()
 
-def test_no_auto_nic_disables_next():
-    """无有线网卡时步骤 1 的下一步按钮应禁用"""
+def test_no_auto_nic_enables_next():
+    """无有线网卡时步骤 1 的下一步按钮仍启用 (网卡全自动, 不阻塞流程)"""
     from nic_scanner import get_wired_adapters
     wired = get_wired_adapters()
     app = T()
@@ -1100,13 +1092,10 @@ def test_no_auto_nic_disables_next():
         app.ctl._on_role_selected("source")
         app.app.update_idletasks()
         eq(app.step, 1)
-        if not wired:
-            # 无有线网卡 → 自动选择失败 → 按钮禁用
-            eq(app.app.tk_button_next.cget("state"), "disabled",
-               "无有线网卡时下一步按钮应禁用")
-            print("  PASS test_no_auto_nic_disables_next")
-        else:
-            print("  SKIP test_no_auto_nic_disables_next (有有线网卡, 不适用)")
+        # 无论是否检测到有线网卡, 下一步均启用 (网卡为全自动检测)
+        eq(str(app.app.tk_button_next.cget("state")), "normal",
+           "步骤1 下一步按钮应启用 (不依赖网卡检测结果)")
+        print("  PASS test_no_auto_nic_enables_next")
     finally:
         app.destroy()
 
@@ -1261,6 +1250,58 @@ def test_network_monitor_lifecycle():
     finally:
         t.destroy()
 
+# ============================================================
+# 测试 21: 网卡全自动检测 — 开始传输按钮状态 (2026-08-26)
+# ============================================================
+
+@test("46. 发送端开始传输按钮启用 (不依赖网卡选择)")
+def test_transfer_btn_no_nic_source():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.next_step()
+        t.set_disk()
+        t.next_step()
+        eq(t.step, 3)
+        # 未 set_nic (无手动网卡) 时按钮也应启用
+        eq(str(t.app.tk_button_mqfzl35t.cget("state")), "normal",
+           "发送端开始传输按钮应启用 (网卡全自动)")
+    finally:
+        t.destroy()
+
+@test("47. 接收端开始传输按钮启用 (不依赖网卡选择)")
+def test_transfer_btn_no_nic_target():
+    t = make_app()
+    try:
+        t.select_role("target")
+        t.next_step()
+        t.set_disk()
+        t.next_step()
+        eq(t.step, 3)
+        eq(str(t.app.tk_button_mqfzl35t.cget("state")), "normal",
+           "接收端开始传输按钮应启用 (网卡全自动)")
+    finally:
+        t.destroy()
+
+@test("48. 传输中开始传输按钮禁用 (回归)")
+def test_transfer_btn_disabled_busy():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.next_step()
+        t.set_disk()
+        t.next_step()
+        t.ctl._transferring = True
+        t.ctl._check_button_state()
+        eq(str(t.app.tk_button_mqfzl35t.cget("state")), "disabled",
+           "传输进行中按钮应禁用")
+        t.ctl._transferring = False
+        t.ctl._check_button_state()
+        eq(str(t.app.tk_button_mqfzl35t.cget("state")), "normal",
+           "传输结束后按钮应恢复启用")
+    finally:
+        t.destroy()
+
 @test("44. 断网时 download_files 的 stop_check 返回 'network_down'")
 def test_stop_check_network_down():
     import control as _ctl_mod
@@ -1384,12 +1425,17 @@ if __name__ == "__main__":
     test_stop_check_network_down()
     test_auth_code_entry()
 
+    # 新增 — 网卡全自动检测: 开始传输按钮状态 (2026-08-26)
+    test_transfer_btn_no_nic_source()
+    test_transfer_btn_no_nic_target()
+    test_transfer_btn_disabled_busy()
+
     # 新增 — 自动网卡 & 高级选项 (2026-08-02)
     test_get_wired_adapters_struct()
     test_get_wired_adapters_no_wifi()
     test_auto_nic_init_state()
     test_auto_select_wired_nic()
-    test_manual_nic_override()
+    test_manual_nic_removed()
     test_get_wired_nic_ips()
     test_get_adapter_desc_from_auto()
     test_auto_nic_display_update()
@@ -1399,7 +1445,7 @@ if __name__ == "__main__":
     test_multisock_dhcp_empty_ips()
     test_dhcp_no_out_ip_attribute()
     test_auto_nic_enables_next_button()
-    test_no_auto_nic_disables_next()
+    test_no_auto_nic_enables_next()
     test_source_setup_network_no_arg()
     test_step1_has_auto_nic_card()
 

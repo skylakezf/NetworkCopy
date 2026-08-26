@@ -60,7 +60,6 @@ class Controller:
         # ---- 网卡 ----
         self._nic_list = []
         self._auto_nic = None      # 自动选择的有线网卡 (display_name, desc, adapter_name, speed_str, index, ip)
-        self._manual_nic = False   # 用户是否手动从高级选项更改过网卡
         self._disks_scanned = False  # 磁盘扫描是否已完成
 
         # ---- 设备类型 ----
@@ -164,10 +163,6 @@ class Controller:
             self.ui.tk_button_prev.config(command=self._on_prev_step)
         if hasattr(self.ui, 'tk_button_next'):
             self.ui.tk_button_next.config(command=self._on_next_step)
-        # 网卡选择
-        self.ui.tk_select_box_mqfzkd6x.bind(
-            "<<ComboboxSelected>>", self._on_nic_selected
-        )
         # 磁盘选择
         self.ui.tk_select_box_mqfzmzbe.bind(
             "<<ComboboxSelected>>", self._on_disk_selected
@@ -220,9 +215,8 @@ class Controller:
     # ==================== 网卡扫描 ====================
 
     def _populate_nics(self):
-        """扫描网卡并填充下拉列表，自动选择最佳有线网卡"""
-        self._log("正在扫描网卡...")
-        self.ui.tk_select_box_mqfzkd6x["values"] = ["扫描中..."]
+        """扫描网卡并自动选择最佳有线网卡 (无需用户手动选择)"""
+        self._log("正在检测有线网卡...")
 
         def _scan():
             try:
@@ -230,16 +224,11 @@ class Controller:
                 # NIC 优先级排序: USB > 169.254 > 内置网卡
                 nics = sorted(nics, key=_nic_priority_key)
                 self._nic_list = nics
-                display_list = [n[0] for n in nics]
-                self.ui.after(0, lambda: self._update_combobox(
-                    self.ui.tk_select_box_mqfzkd6x,
-                    display_list if display_list else ["未检测到网卡"],
-                    f"检测到 {len(display_list)} 个网卡" if display_list else "未检测到可用网卡"
-                ))
                 # 自动选择最佳有线网卡
                 self._auto_select_wired_nic()
             except Exception as e:
-                self.ui.after(0, lambda: self._log(f"网卡扫描失败: {e}"))
+                self._log(f"网卡检测失败: {e}")
+                self.ui.after(0, lambda: self.ui.update_auto_nic_display("", "", "", 0))
 
         threading.Thread(target=_scan, daemon=True).start()
 
@@ -248,7 +237,7 @@ class Controller:
     def _auto_select_wired_nic(self):
         """自动选择最佳有线网卡 (Type == 6)，并更新 UI 显示。
         优先级: 已有 169.254.x.x 地址 > 有其他 IP > 无 IP。
-        仅在用户未手动选择时自动覆盖下拉框。"""
+        网卡已为全自动检测, 不再提供手动选择下拉框。"""
         wired = get_wired_adapters()
         if wired:
             # 优先级: 169.254.x.x > 有 IP > 无 IP
@@ -260,20 +249,15 @@ class Controller:
             vip = nic[5] or "无"
             vspeed = nic[3] or ""
             self._log(f"自动选择有线网卡: {nic[0]} (IP: {vip})")
-            # 同步下拉框（仅当用户未手动更改时）
-            if not self._manual_nic:
-                self.ui.after(0, lambda: self.ui.tk_select_box_mqfzkd6x.set(nic[0]))
-                self.ui.after(0, lambda: self.ui.tk_label_nic_detail.configure(
-                    text=f"描述: {nic[1]}  适配器: {nic[2]}"))
             # 更新步骤 1 的自动检测网卡信息
             self.ui.after(0, lambda: self.ui.update_auto_nic_display(
                 nic[0], nic[5], vspeed, len(wired)))
-            # 若当前在步骤 1，启用「下一步」按钮（自动选择也算已选网卡）
+            # 若当前在步骤 1，启用「下一步」按钮
             self.ui.after(0, lambda: self.ui.set_button_next("normal")
                           if getattr(self.ui, '_step', 0) == 1 else None)
         else:
             self._auto_nic = None
-            self._log("警告: 未检测到有线网卡，请检查网线连接（可在高级选项中手动选择）")
+            self._log("警告: 未检测到有线网卡，请检查网线连接")
             self.ui.after(0, lambda: self.ui.update_auto_nic_display("", "", "", 0))
 
     def _get_wired_nic_ips(self) -> list:
@@ -366,14 +350,8 @@ class Controller:
 
             # 同步"下一步"按钮状态
             if new_step == 1:
-                # 网卡选择页: 若网卡已选则启用
-                nic_selected = self.ui.tk_select_box_mqfzkd6x.get() not in (
-                    "扫描中...", "未检测到网卡", "", "网卡1", "网卡2"
-                )
-                if nic_selected:
-                    self.ui.set_button_next("normal")
-                else:
-                    self.ui.set_button_next("disabled")
+                # 网卡检测页: 网卡为全自动检测, 角色已选即可进入下一步
+                self.ui.set_button_next("normal")
             elif new_step == 2:
                 # 磁盘映射页: 尝试自动选择 → 若仍无效则触发扫描
                 disk = self.ui.tk_select_box_mqfzmzbe.get()
@@ -540,56 +518,6 @@ class Controller:
             self.ui.csv_path_var.set(path)
             self._log(f"已选择 CSV: {path}")
 
-    def _on_nic_selected(self, event=None):
-        """用户从高级选项下拉框手动选择网卡"""
-        nic_display = self.ui.tk_select_box_mqfzkd6x.get()
-        if nic_display in ("扫描中...", "未检测到网卡", ""):
-            return
-
-        self._manual_nic = True  # 标记用户手动更改
-        self._log(f"已手动选择网卡: {nic_display}")
-
-        adapter_desc = self._get_adapter_desc(nic_display)
-        if not adapter_desc:
-            # 即使无法匹配真实网卡(如非 Windows 环境), 只要网卡名有效就启用下一步
-            if self.ui._step == 1:
-                self.ui.set_button_next("normal")
-            return
-
-        # 设备类型已选 → 尝试设置 IP
-        if self._device_type in ("源设备", "目标设备"):
-            self._configure_ip(adapter_desc, self._device_type)
-
-        # 不在此处提前扫描磁盘 (会导致进入步骤 2 时无法自动选择)
-        # 磁盘扫描统一在进入步骤 2 时触发
-
-        # 允许进入下一步 (磁盘选择) — 用 set_button_next 确保 pack 状态正确
-        # 仅在步骤 1 时启用, 防止 after 延迟回调在其他步骤中误启用按钮
-        if self.ui._step == 1:
-            self.ui.set_button_next("normal")
-
-        # 更新 IP 状态显示 + 高级选项内网卡详情
-        if self._device_type == "源设备":
-            self.ui.set_nic_ip_info(
-                f"发送方 (旧设备) — 已选定网卡: {nic_display}\n"
-                "    将自动从接收方 DHCP 获取 IP: 169.254.100.2"
-            )
-        else:
-            self.ui.set_nic_ip_info(
-                f"接收方 (新设备) — 已选定网卡: {nic_display}\n"
-                "    请进入连接页面后点击「寻找旧设备」启动 DHCP\n"
-                "    本机 IP: 169.254.100.1 | 源设备 IP: 169.254.100.2"
-            )
-        # 更新高级选项中的网卡详情
-        adapter_name = ""
-        for nic in self._nic_list:
-            if nic[0] == nic_display:
-                adapter_name = nic[2]
-                break
-        self.ui.tk_label_nic_detail.configure(
-            text=f"描述: {adapter_desc}  适配器: {adapter_name}"
-        )
-
     def _on_device_type_selected(self, event=None):
         dev_type = self._device_type
         if not dev_type:
@@ -620,12 +548,10 @@ class Controller:
         # 设备类型选定后重新评估开始按钮状态
         self._check_button_state()
 
-        # 网卡已选 → 配置网络
-        nic_display = self.ui.tk_select_box_mqfzkd6x.get()
-        if nic_display not in ("扫描中...", "未检测到网卡", "", "网卡1", "网卡2"):
-            adapter_desc = self._get_adapter_desc(nic_display)
-            if adapter_desc:
-                self._configure_ip(adapter_desc, dev_type)
+        # 自动检测到有线网卡 → 预配置网络 (源设备走 DHCP / 目标设备仅记录)
+        adapter_desc = self._get_adapter_desc_from_auto()
+        if adapter_desc:
+            self._configure_ip(adapter_desc, dev_type)
 
         # 扫描磁盘
         self._populate_disks()
@@ -910,17 +836,15 @@ class Controller:
         self._log(f"分区映射: {self._partition_map}")
 
     def _check_button_state(self):
-        """根据网卡、设备类型、当前步骤及传输状态启用/禁用「开始传输」按钮。
+        """根据设备类型、当前步骤及传输状态启用/禁用「开始传输」按钮。
 
+        网卡已改为全自动检测, 按钮状态不再依赖网卡选择。
         仅在步骤 3 (连接页面) 才显示并启用开始传输按钮，
         且传输进行中不重新启用, 防止用户在步骤 2 自动填充后误点跳过连接步骤。
         """
         dev_type = self._device_type
-        nic_selected = self.ui.tk_select_box_mqfzkd6x.get() not in (
-            "扫描中...", "未检测到网卡", "", "网卡1", "网卡2"
-        )
         current_step = getattr(self.ui, '_step', 0)
-        if (nic_selected and dev_type in ("源设备", "目标设备")
+        if (dev_type in ("源设备", "目标设备")
                 and current_step >= 3 and not self._transferring):
             self.ui.tk_button_mqfzl35t.config(state="normal")
         else:
@@ -1090,21 +1014,11 @@ class Controller:
         if self._dhcp_server and self._dhcp_server.is_running():
             self._log("DHCP 服务器已在运行")
             return
-        nic_display = self.ui.tk_select_box_mqfzkd6x.get()
-        if nic_display in ("扫描中...", "未检测到可用网卡", "", "网卡1", "网卡2"):
-            # 尝试回退到自动选择的有线网卡
-            adapter_desc = self._get_adapter_desc_from_auto()
-            if not adapter_desc:
-                self._log("请先选择网卡，再点击「寻找旧电脑」")
-                return
-        else:
-            adapter_desc = self._get_adapter_desc(nic_display)
-            if not adapter_desc:
-                # 再尝试自动网卡
-                adapter_desc = self._get_adapter_desc_from_auto()
-                if not adapter_desc:
-                    self._log("无法识别所选网卡，请重新选择")
-                    return
+        # 网卡为全自动检测, 直接使用自动选择的有线网卡
+        adapter_desc = self._get_adapter_desc_from_auto()
+        if not adapter_desc:
+            self._log("未检测到有线网卡，请检查网线连接后再试")
+            return
         self.ui.tk_button_dhcp.config(state="disabled")
         self.ui.tk_button_dhcp.configure(text="正在搜索...")
         threading.Thread(target=self._setup_target_dhcp, args=(adapter_desc,), daemon=True).start()
@@ -1306,8 +1220,9 @@ class Controller:
         self._log("=" * 50)
 
         # 手动 IP 模式: 先把本机网卡设为该 IP, 再启动服务器
+        # 网卡为全自动检测, 直接使用自动选择的有线网卡
         if manual_ip:
-            adapter_desc = self._get_adapter_desc(self.ui.tk_select_box_mqfzkd6x.get())
+            adapter_desc = self._get_adapter_desc_from_auto()
             if adapter_desc:
                 self._apply_manual_ip(adapter_desc, manual_ip)
             self._log(f"手动 IP 模式: 源设备将绑定 {manual_ip}")
@@ -2335,14 +2250,6 @@ class Controller:
         return max(candidates)[1]  # 取最近修改的一个
 
     # ==================== 工具方法 ====================
-
-    def _get_adapter_desc(self, nic_display: str) -> str:
-        """根据显示名称获取适配器描述"""
-        for nic in self._nic_list:
-            if nic[0] == nic_display:
-                return nic[1]
-        self._log(f"错误: 找不到网卡描述")
-        return ""
 
     def _update_combobox(self, cb, values, log_msg=None):
         """更新 Combobox 并记录日志"""
