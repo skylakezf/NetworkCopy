@@ -747,7 +747,7 @@ class WinGUI(ttk.Window):
                 self._transfer_error_frame.pack(fill=X, pady=(0, 10))
         # 状态标签也变红
         self.tk_label_transfer_status.config(
-            text=" 网络连接已中断——请依次关闭新旧设备上的磁盘拷贝应用程序，检查并确认网线物理连接正常后，再重新启动应用",
+            text="请返回修改验证码",
             fg=C_RED,
             font=("Microsoft YaHei UI", 9, "bold"),
         )

@@ -13,12 +13,17 @@ from tkinter import simpledialog
 import tkinter as tk
 from nic_scanner import scan_nics, get_nic_display_list, get_local_ip, get_wired_adapters
 from disk_scanner import get_disk_list, get_drive_letter_list, get_disk_number, get_partition_count, get_partition_details
-from file_transfer import FileServer, download_files, scan_source_device, TRANSFER_PORT, _allow_sleep
+from file_transfer import FileServer, FileServerHandler, download_files, scan_source_device, TRANSFER_PORT, _allow_sleep
 from verifier import run_verification
 from ip_config import SOURCE_IP, SUBNET_MASK  # 169.254.100.1 (目标设备自身 IP)
 import tls_utils
 import config_transfer
 DHCP_ASSIGNED_IP = "169.254.100.2"  # DHCP 分配给源设备的 IP
+
+# 源端判定"接收端已断开"的空闲超时 (秒):
+# 接收端传输期间每 1 秒上报心跳 (last_activity 持续刷新); 下载完成后到 /report done
+# 之间最长约 30 秒 (边传边校验收尾 join), 取 45 秒留足余量, 避免正常收尾被误判为断开
+SOURCE_IDLE_TIMEOUT = 45.0
 
 # ==================== 用户协议 (EULA) ====================
 EULA_URL = "http://qitv1113.gtmcl.com:3000/eula.html"  # 应用启动后用默认浏览器打开
@@ -1447,21 +1452,38 @@ class Controller:
 
         self._transferring = True
         self._transfer_done = False
+        self._source_done_marked = False
+        self._source_interrupted_marked = False
+        # 重置服务器连接/完成标志: 上次传输可能残留 done/连接状态, 影响新一轮判定
+        FileServerHandler.transfer_done_flag = False
+        FileServerHandler.ever_connected = False
+        FileServerHandler.last_activity = 0.0
         self.ui.tk_button_mqfzl35t.config(text="传输中...", state="disabled")
         # 传输期间霸占全屏, 避免用户误操作电脑
         try:
             self.ui.lock_screen()
         except Exception:
             pass
-        # 源端无完成回调: 轮询检测"接收端已完成(长时间无请求)" 后解除全屏锁定
+        # 源端无完成回调: 轮询检测"接收端已完成(/report done)" 或"已断开(长时间无请求)"
         self._source_done_after = self.ui.after(2000, self._poll_source_done)
 
     def _poll_source_done(self):
-        """源设备: 检测接收端已完成 (显式 /report done 或服务器长时间无新请求) → 解除全屏锁定"""
+        """源设备: 检测接收端已完成 (显式 /report done) 或已断开 (长时间无请求) → 解除全屏锁定"""
         self._source_done_after = None
         try:
             if self._file_server and self._file_server.is_transfer_done():
                 self._source_mark_done()
+                return
+            # 接收端曾连接, 但长时间无任何请求且未显式完成 → 连接已中断
+            # (网络断开 / 接收端程序关闭 / 验证码输入错误), 此时绝不进入"完成页"
+            if (FileServerHandler.ever_connected
+                    and not FileServerHandler.transfer_done_flag
+                    and time.time() - FileServerHandler.last_activity > SOURCE_IDLE_TIMEOUT):
+                if FileServerHandler.auth_failed_flag:
+                    # 验证码错误: 提示后保持服务器运行, 继续等待接收端修正验证码重试
+                    self._source_mark_auth_failed()
+                    return
+                self._source_mark_interrupted()
                 return
             self._source_done_after = self.ui.after(2000, self._poll_source_done)
         except Exception:
@@ -1511,6 +1533,70 @@ class Controller:
         except Exception:
             pass
         self._log("接收端已完成拷贝，进入完成页，可正常关闭窗口")
+
+    def _source_mark_auth_failed(self):
+        """源设备: 接收端输入的验证码有误 → 解除全屏锁定并提示。
+        保持文件服务器运行并继续轮询, 等待接收端修正验证码后重试;
+        绝不进入"传输完成"页, 也不停止服务器 (否则接收端无法重试)。"""
+        if getattr(self, "_source_auth_notified", False):
+            # 已提示过: 仅继续轮询等待接收端修正验证码后重试
+            self._source_done_after = self.ui.after(2000, self._poll_source_done)
+            return
+        self._source_auth_notified = True
+        try:
+            self.ui.unlock_screen()
+        except Exception:
+            pass
+        self._set_status("接收端输入的验证码有误，请在两台设备上确认验证码一致后重试")
+        try:
+            self.ui.show_transfer_error(
+                "接收端输入的验证码有误——请在两台设备上确认验证码一致后重新接收"
+            )
+        except Exception:
+            pass
+        # show_transfer_error 会把传输页状态标签写为"网络连接已中断", 此处修正为验证码错误文案
+        try:
+            self.ui.tk_label_transfer_status.config(
+                text=" 接收端输入的验证码有误，请在两台设备上确认验证码一致后重新接收"
+            )
+        except Exception:
+            pass
+        self._log("接收端输入的验证码有误，已提示；保持服务器运行，等待接收端修正验证码后重试")
+        # 不停止服务器/不进入完成页: 继续轮询, 接收端修正验证码重试后即恢复正常
+        self._source_done_after = self.ui.after(2000, self._poll_source_done)
+
+    def _source_mark_interrupted(self):
+        """源设备: 接收端连接已中断 (断网/接收端程序关闭) → 解除全屏锁定并提示中断。
+        绝不进入"传输完成"页; 停止文件服务器, 传输不再继续。"""
+        if (getattr(self, "_source_done_marked", False)
+                or getattr(self, "_source_interrupted_marked", False)):
+            return
+        self._source_interrupted_marked = True
+        try:
+            self.ui.unlock_screen()
+        except Exception:
+            pass
+        self._set_progress(0)
+        self._set_status("与接收端的连接已中断，传输未完成")
+        try:
+            self.ui.show_transfer_error(
+                "与接收端的连接已中断——请依次关闭新旧设备上的磁盘拷贝应用程序，检查并确认网线物理连接正常后，再重新启动应用"
+            )
+        except Exception:
+            pass
+        # 恢复"重新启动传输"按钮
+        try:
+            self.ui.tk_button_mqfzl35t.config(text="重新启动传输", state="normal")
+        except Exception:
+            pass
+        # 停止文件服务器: 不再继续等待
+        try:
+            if self._file_server:
+                self._file_server.stop()
+                self._file_server = None
+        except Exception:
+            pass
+        self._log("与接收端的连接已中断，传输未完成，请检查网线后重新启动应用")
 
     def _on_source_done_close(self):
         """发送端完成页「完成并关闭」/ 底部「完成」: 清理后台并退出程序"""
@@ -1897,9 +1983,6 @@ class Controller:
             self.ui.unlock_screen()
         except Exception:
             pass
-        # 通知源端传输结束: 发送端据此解除全屏锁定并标记完成, 可正常关闭窗口
-        self._report_to_source({"done": True})
-
         # 传输过程中网络断开: 停止等待并提示用户
         if self._network_down:
             self._network_down = False
@@ -1948,11 +2031,28 @@ class Controller:
                 self._tgt_server = None
             return
 
-        if success:
-            self._log("\n传输成功！")
-        else:
-            self._log(f"\n传输完成 (有 {len(errors) if errors else 0} 个错误)")
+        # 传输中途失败 (部分文件未传完, 网络中断等): 不进入完成/配置导入流程
+        if not success:
+            self._log("\n传输未完成: 网络中断或部分文件传输失败")
+            self._reset_progress("传输中断")
+            self.ui.hide_config_detect()
+            self.ui.set_button_next("disabled")
+            self.ui.set_button_prev("normal", text="< 返回")
+            self.ui.show_transfer_error(
+                "传输未完成——请检查网络连接是否中断，确认后重新接收"
+            )
+            self.ui.tk_button_mqfzl35t.config(text="重新接收", state="normal")
+            if hasattr(self, "_dhcp_server") and self._dhcp_server:
+                self._dhcp_server.stop()
+                self._dhcp_server = None
+            if hasattr(self, "_tgt_server") and self._tgt_server:
+                self._tgt_server.stop()
+                self._tgt_server = None
+            return
 
+        # 传输成功: 通知源端 (发送端据此解除全屏锁定并进入完成页)
+        self._report_to_source({"done": True})
+        self._log("\n传输成功！")
         self._transfer_done = True
         self.ui.hide_transfer_error()
         # 边传边校验: 传输阶段结束后展示最终确认状态 (hide_transfer_error 已重置该标签)

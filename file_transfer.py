@@ -143,6 +143,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
     # ---- 接收端进度/完成上报 (POST /report) ----
     status_callback = None   # control 设置: 收到 /report 时回调 (参数: payload dict, 在请求线程中)
     transfer_done_flag = False  # 接收端显式通知"传输完成"
+    auth_failed_flag = False    # 曾收到验证码错误的请求 (接收端输入了错误验证码)
 
     @classmethod
     def _is_authorized(cls, params: dict) -> bool:
@@ -254,11 +255,13 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
             # ---- 鉴权: 必须携带正确的 pwd ----
             if not FileServerHandler._is_authorized(params):
+                FileServerHandler.auth_failed_flag = True
                 if FileServerHandler.log_callback:
                     FileServerHandler.log_callback(
                         f"[诊断] 拒绝未授权请求: path={path} (缺少或错误的 ?pwd= 验证码)")
                 self._send_json({"error": "未授权: 验证码错误"}, 403)
                 return
+            FileServerHandler.auth_failed_flag = False
 
             if path == "/list":
                 self._handle_list(params)
@@ -491,11 +494,13 @@ class FileServerHandler(BaseHTTPRequestHandler):
             path, params = self._parse_query(self.path)
             # ---- 鉴权: 必须携带正确的 pwd ----
             if not FileServerHandler._is_authorized(params):
+                FileServerHandler.auth_failed_flag = True
                 if FileServerHandler.log_callback:
                     FileServerHandler.log_callback(
                         f"[诊断] 拒绝未授权请求: path={path} (缺少或错误的 ?pwd= 验证码)")
                 self._send_json({"error": "未授权: 验证码错误"}, 403)
                 return
+            FileServerHandler.auth_failed_flag = False
             if path == "/batch_get":
                 self._handle_batch_get()
             elif path == "/report":
@@ -796,18 +801,14 @@ class FileServer:
             self.log_callback("文件服务器已停止")
 
     def is_transfer_done(self, idle_seconds: float = 15.0) -> bool:
-        """源端判定传输是否完成: 接收端显式通知 /report done 优先;
-        否则以空闲检测兜底 (曾有客户端请求, 当前无请求, 距最后请求超 idle_seconds)"""
+        """源端判定传输是否完成: 仅当接收端显式通知 /report done。
+
+        历史实现含"空闲超时兜底"(曾有请求、当前无请求、距最后请求超 idle_seconds)，
+        但该兜底在"传输过程中网络断开"时同样成立——接收端断开后不再发任何请求，
+        导致源端把断网误判为"传输完成"而进入完成页。现改为只认显式 done;
+        接收端断开由 control 层依据 ever_connected / last_activity 判定并提示"连接中断"。"""
         try:
-            if FileServerHandler.transfer_done_flag:
-                return True
-            if not FileServerHandler.ever_connected:
-                return False
-            if FileServerHandler.active_requests > 0:
-                return False
-            if time.time() - FileServerHandler.last_activity < idle_seconds:
-                return False
-            return True
+            return bool(FileServerHandler.transfer_done_flag)
         except Exception:
             return False
 
