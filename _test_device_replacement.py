@@ -4,6 +4,8 @@
 """
 import sys, os, threading, traceback, tempfile, shutil, io, json
 
+# 测试环境: 关闭"启动时用默认浏览器打开 EULA 页面"
+os.environ["NETCOPY_SKIP_EULA_BROWSER"] = "1"
 os.chdir(r'c:\Users\Xinyi\Desktop\网络拷贝\NetworkzCopy')
 sys.path.insert(0, '.')
 sys.path.insert(0, os.path.join(os.getcwd(), 'python-3.13.14-embed-amd64', 'Lib', 'site-packages'))
@@ -58,6 +60,9 @@ class T:
         self.ctl = Controller()
         self.ctl.init(self.app)
         self.app.ctl = self.ctl
+        # 协议确认 (EULA): 测试默认勾选, 激活发送方/接收方按钮
+        self.app._eula_var.set(True)
+        self.app._on_eula_toggle()
         self.app.update_idletasks()
 
     @property
@@ -250,25 +255,23 @@ def test_source_compress_fail():
 # PART B: 接收端 — 下载 → 配置检测 → 使用/跳过
 # ============================================================
 
-@test("B1. 接收端下载完成→自动跳转 step5 (无配置文件)")
+@test("B1. 接收端下载完成→自动跳转 step4 (无配置文件)")
 def test_target_download_no_config_auto_jump():
-    """无配置文件时自动跳到 step5"""
+    """无配置文件时自动跳到 step4"""
     t = T()
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
+        t.next_step()  # →2 连接页
+        t.go_step(3)  # →3 传输页
         t.ctl._transfer_done = True
-        t.go_step(4)
 
         # mock 无配置文件
         _orig = config_transfer.get_config_from_ini
         config_transfer.get_config_from_ini = lambda: (None, None)
         try:
             t.ctl._on_download_complete(True, 5, 1024*1024, [])
-            eq(t.step, 5, "无配置文件时应自动跳到step5")
+            eq(t.step, 4, "无配置文件时应自动跳到step4")
             # 配置检测区域应隐藏
             try:
                 t.app._config_detect_frame.pack_info()
@@ -280,17 +283,15 @@ def test_target_download_no_config_auto_jump():
     finally:
         t.destroy()
 
-@test("B2. 接收端下载完成→停留 step4 (有配置文件)")
+@test("B2. 接收端下载完成→自动使用检测到的配置并跳 step4")
 def test_target_download_with_config_stay_step4():
-    """有配置文件时停留在 step4 等待用户确认"""
+    """检测到 systemconfig.ini → 自动导入 (无需确认), 直接进入 step4"""
     t = T()
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
-        t.go_step(4)
+        t.next_step()  # →2 连接页
+        t.go_step(3)  # →3 传输页
         t.ctl._transfer_done = True
 
         _orig = config_transfer.get_config_from_ini
@@ -299,34 +300,35 @@ def test_target_download_with_config_stay_step4():
         )
         try:
             t.ctl._on_download_complete(True, 5, 1024*1024, [])
-            eq(t.step, 4, "有配置文件时应停留在step4")
+            t.app.update_idletasks()
+            # 检测到配置 → 后台自动导入, 停留在传输页(step3), 校验完成后统一进总结页
+            eq(t.step, 3, "检测到配置时后台自动导入, 不立即跳转")
+            check(getattr(t.ctl, '_auto_import_active', False),
+                  "应处于自动导入状态")
 
-            # 验证配置检测区域已展示
+            # 配置检测确认区应保持隐藏 (自动导入, 无需确认)
             try:
-                info = t.app._config_detect_frame.pack_info()
-                check(info, "配置检测区域应已 pack")
+                t.app._config_detect_frame.pack_info()
+                check(False, "自动导入后检测区域应隐藏")
             except Exception:
-                check(False, "配置检测区域未 pack")
+                pass
 
-            # 验证"使用此配置"和"跳过"按钮存在
-            check(t.app.tk_button_use_config.winfo_ismapped(), "'使用此配置'按钮应可见")
-            check(t.app.tk_button_skip_config.winfo_ismapped(), "'跳过'按钮应可见")
+            # 自动导入中: 下一步保持禁用 (等待导入/校验完成统一进总结页)
+            eq(t.next_state, "disabled", "自动导入中下一步应禁用")
         finally:
             config_transfer.get_config_from_ini = _orig
     finally:
         t.destroy()
 
-@test("B3. 接收端点'使用此配置'→跳 step5 并选中配置文件夹")
+@test("B3. 自动导入后 step4 已选中检测到的配置文件夹")
 def test_target_use_detected_config():
-    """确认使用配置后跳 step5, 并自动选中对应文件夹"""
+    """自动导入后, step4 应自动选中检测到的配置文件夹"""
     t = T()
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
-        t.go_step(4)
+        t.next_step()  # →2 连接页
+        t.go_step(3)  # →3 传输页
         t.ctl._transfer_done = True
 
         _orig = config_transfer.get_config_from_ini
@@ -335,38 +337,40 @@ def test_target_use_detected_config():
         )
         try:
             t.ctl._on_download_complete(True, 5, 1024*1024, [])
-            eq(t.step, 4)
-
-            # 点击"使用此配置"
-            t.ctl._on_use_detected_config()
             t.app.update_idletasks()
-            eq(t.step, 5, "确认配置后应跳到step5")
+            # 检测到配置 → 后台自动导入, 停留传输页(step3)
+            eq(t.step, 3, "检测到配置时后台自动导入, 不立即跳转")
+            check(getattr(t.ctl, '_auto_import_active', False),
+                  "应处于自动导入状态")
 
-            # 配置检测区域应已隐藏
+            # 下拉框应自动选中检测到的配置 (含日期)
+            selected = t.app.tk_combo_config_folder.get()
+            check("2026-08-03" in selected,
+                  f"下拉框应自动选中检测到的配置: {selected}")
+
+            # 配置检测确认区应已隐藏 (自动导入, 无需确认)
             try:
                 t.app._config_detect_frame.pack_info()
                 check(False, "检测区域应已隐藏")
             except Exception:
                 pass
 
-            # step5 的下一步按钮应为"校验文件 >"
-            eq(t.next_text, "校验文件 >", "step5 下一步应为'校验文件 >'")
+            # 自动导入中: 下一步保持禁用 (等待导入/校验完成统一进总结页)
+            eq(t.next_state, "disabled", "自动导入中下一步应禁用")
         finally:
             config_transfer.get_config_from_ini = _orig
     finally:
         t.destroy()
 
-@test("B4. 接收端点'跳过'→跳 step5 不自动选中")
+@test("B4. 有配置文件时不再显示确认区(自动导入, 无跳过按钮)")
 def test_target_skip_detected_config():
-    """跳过配置检测后跳 step5"""
+    """自动导入: 检测到配置后不再显示'使用此配置/跳过'确认区"""
     t = T()
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
-        t.go_step(4)
+        t.next_step()  # →2 连接页
+        t.go_step(3)  # →3 传输页
         t.ctl._transfer_done = True
 
         _orig = config_transfer.get_config_from_ini
@@ -375,12 +379,21 @@ def test_target_skip_detected_config():
         )
         try:
             t.ctl._on_download_complete(True, 5, 1024*1024, [])
-            eq(t.step, 4)
-
-            t.ctl._on_skip_detected_config()
             t.app.update_idletasks()
-            eq(t.step, 5, "跳过配置后应跳到step5")
-            eq(t.next_text, "校验文件 >")
+            eq(t.step, 3, "检测到配置时后台自动导入, 不立即跳转")
+            check(getattr(t.ctl, '_auto_import_active', False),
+                  "应处于自动导入状态")
+
+            # 确认区与两个确认按钮均不应显示
+            try:
+                t.app._config_detect_frame.pack_info()
+                check(False, "配置检测区域应隐藏")
+            except Exception:
+                pass
+            check(not t.app.tk_button_use_config.winfo_ismapped(),
+                  "'使用此配置'按钮不应显示")
+            check(not t.app.tk_button_skip_config.winfo_ismapped(),
+                  "'跳过'按钮不应显示")
         finally:
             config_transfer.get_config_from_ini = _orig
     finally:
@@ -391,24 +404,22 @@ def test_target_skip_detected_config():
 # PART C: 接收端 — 配置导入流程 (step 5)
 # ============================================================
 
-@test("C1. step5 导入页面控件状态")
+@test("C1. step4 导入页面控件状态")
 def test_step5_import_page_controls():
-    """验证 step5 页面控件初始状态"""
+    """验证 step4 页面控件初始状态"""
     t = T()
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
-        t.go_step(4)
+        t.next_step()  # →2 连接页
+        t.go_step(3)  # →3 传输页
         t.ctl._transfer_done = True
 
         _orig = config_transfer.get_config_from_ini
         config_transfer.get_config_from_ini = lambda: (None, None)
         try:
             t.ctl._on_download_complete(True, 5, 1024*1024, [])
-            eq(t.step, 5)
+            eq(t.step, 4)
 
             # 验证导入页面控件存在
             check(hasattr(t.app, 'tk_button_import_config'), "应有导入按钮")
@@ -432,61 +443,56 @@ def test_step5_import_page_controls():
     finally:
         t.destroy()
 
-@test("C2. 跳过导入→跳 step6")
+@test("C2. 跳过导入 → 停留在 step4 (最后一步)")
 def test_skip_import_to_step6():
-    """接收端 step5 跳过导入后跳 step6"""
+    """接收端 step4 跳过导入后停留在 step4 (校验已自动后台执行)"""
     t = T()
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
-        t.go_step(4)
+        t.next_step()  # →2 连接页
+        t.go_step(3)  # →3 传输页
         t.ctl._transfer_done = True
 
         _orig = config_transfer.get_config_from_ini
         config_transfer.get_config_from_ini = lambda: (None, None)
         try:
             t.ctl._on_download_complete(True, 5, 1024*1024, [])
-            eq(t.step, 5)
+            eq(t.step, 4)
 
             t.ctl._on_skip_import()
             t.app.update_idletasks()
-            eq(t.step, 6, "跳过导入后应跳到step6")
-            eq(t.next_state, "normal", "step6 下一步=跳过校验")
-            eq(t.next_text, "跳过校验 >")
-            eq(t.prev_state, "normal", "step6 上一步应启用")
+            eq(t.step, 4, "跳过导入后停留在步骤4")
+            eq(t.next_state, "normal", "跳过导入后进入总结页, 下一步为'完成'")
+            eq(t.next_text, "完成", "总结页下一步应为'完成'")
+            eq(t.prev_state, "normal", "上一步应启用")
         finally:
             config_transfer.get_config_from_ini = _orig
     finally:
         t.destroy()
 
-@test("C2b. 配置导入完成后自动跳转 step6 且禁用跳过")
+@test("C2b. 配置导入完成后停留在 step4 且禁用跳过")
 def test_import_done_auto_jump_step6():
-    """导入成功 → 自动跳到校验页(step6) + 跳过按钮禁用 + _on_skip_import 防护"""
+    """导入成功 → 停留在 step4 (最后一步) + 跳过按钮禁用 + _on_skip_import 防护"""
     t = T()
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
-        t.go_step(5)
+        t.next_step()  # →2 连接页
+        t.go_step(4)  # →4 导入配置页
         t.ctl._config_import_done = False
 
         # 模拟导入成功
         t.ctl._on_import_done(True)
         t.app.update_idletasks()
-        # 自动跳转 (300ms after) 后应到达 step6
-        eq(t.step, 6, "导入成功后应自动跳转到step6")
-        eq(t.next_state, "normal", "step6 下一步=跳过校验")
+        eq(t.step, 4, "导入成功后停留在步骤4 (校验已自动后台执行)")
+        eq(t.next_state, "disabled", "最后一步无下一步")
         eq(str(t.app.tk_button_skip_import.cget("state")), "disabled",
            "配置已导入, 导入页跳过按钮应禁用")
 
         # 已导入后调用 _on_skip_import 不应再进入校验跳过逻辑 (防护)
         t.ctl._on_skip_import()
-        eq(t.step, 6, "配置已导入, 跳过导入应被阻止")
+        eq(t.step, 4, "配置已导入, 跳过导入应被阻止")
     finally:
         t.destroy()
 
@@ -498,15 +504,13 @@ def test_import_failed_no_auto_jump():
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
-        t.go_step(5)
+        t.next_step()  # →2 连接页
+        t.go_step(4)  # →4 导入配置页
         t.ctl._config_import_done = False
 
         t.ctl._on_import_done(False)
         t.app.update_idletasks()
-        eq(t.step, 5, "导入失败不应自动跳转")
+        eq(t.step, 4, "导入失败不应自动跳转")
         eq(str(t.app.tk_button_skip_import.cget("state")), "normal",
            "导入失败跳过按钮应可用")
     finally:
@@ -538,15 +542,13 @@ def test_dhcp_button_disabled_60s():
 
 @test("C2e. 网络断开恢复回验证码页: 禁用下一步, 激活重新接收")
 def test_network_down_back_to_step3():
-    """网络断开后用户回到验证码页(step3): 下一步禁用 + 重新接收按钮激活"""
+    """网络断开后用户回到验证码页(step2): 下一步禁用 + 重新接收按钮激活"""
     t = T()
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()  # →2
-        t.set_disk()
-        t.next_step()  # →3
-        t.app.go_step(4)  # →传输页
+        t.next_step()  # →2 连接页
+        t.go_step(3)  # →3 传输页
 
         # 模拟传输完成(网络断开场景): _transferring=False, 未完成
         t.ctl._transferring = False
@@ -557,7 +559,7 @@ def test_network_down_back_to_step3():
         t.ctl._on_prev_step()
         t.app.update_idletasks()
 
-        eq(t.step, 3, "应回到验证码页")
+        eq(t.step, 2, "应回到验证码页")
         eq(t.next_state, "disabled", "验证码页下一步应禁用")
         eq(str(t.app.tk_button_mqfzl35t.cget("state")), "normal",
            "验证码页重新接收按钮应激活")
@@ -567,30 +569,26 @@ def test_network_down_back_to_step3():
         t.destroy()
 
 
-@test("C3. step6 回退到 step5 后按钮文字恢复")
+@test("C3. step4 回退到 step3 后下一步文字恢复")
 def test_back_from_step6_to_step5():
-    """从 step6 回退到 step5 后, 下一步文字为'校验文件 >'"""
+    """从 step4 回退到 step3 后, 下一步文字为'导入配置 >'"""
     t = T()
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
-        t.go_step(4)
+        t.next_step()  # →2 连接页
+        t.go_step(3)  # →3 传输页
         t.ctl._transfer_done = True
 
         _orig = config_transfer.get_config_from_ini
         config_transfer.get_config_from_ini = lambda: (None, None)
         try:
             t.ctl._on_download_complete(True, 5, 1024*1024, [])
-            eq(t.step, 5)
-            t.ctl._on_skip_import()
-            eq(t.step, 6)
+            eq(t.step, 4)
 
             t.prev_step()
-            eq(t.step, 5, "回退后应在step5")
-            eq(t.next_text, "校验文件 >", "回退到step5后下一步文字应恢复")
+            eq(t.step, 3, "回退后应在step3")
+            eq(t.next_text, "查看总结 >", "回退到step3后下一步文字应恢复")
         finally:
             config_transfer.get_config_from_ini = _orig
     finally:
@@ -746,57 +744,31 @@ def test_multipart_format():
 # PART E: 全设备更换 E2E 流程 (发送端 + 接收端串联)
 # ============================================================
 
-@test("E1. 发送端完整流程: step0→1→2→3→4→6 (跳过5)")
+@test("E1. 发送端完整流程: step0→1→2→3 (无步骤4/5)")
 def test_source_full_flow():
-    """发送端完整导航流程"""
+    """发送端完整导航流程 (校验页已取消, 传输完成即结束)"""
     t = T()
     try:
         # step0→1: 选角色
         t.select_role("source")
         eq(t.step, 1)
-        # 自动网卡扫描可能已完成 → 未选时禁用, 已自动选中时启用 (环境相关)
-        eq(t.next_state, "normal" if getattr(t.ctl, '_auto_nic', None) else "disabled",
-           "step1 按钮状态取决于自动网卡是否已选中")
+        eq(t.next_state, "normal", "步骤1 网卡全自动, 角色已选即可下一步")
         eq(t.next_text, "下一步 >")
 
-        # step1: 选网卡
+        # step1→2: 连接页 (下一步禁用, 用开始传输)
         t.set_nic()
         eq(t.next_state, "normal")
         t.next_step()
         eq(t.step, 2)
+        eq(t.next_state, "disabled", "step2 连接页下一步禁用")
 
-        # step2: 选磁盘
-        eq(t.next_state, "normal" if getattr(t.ctl, '_auto_selected_disk', None) else "disabled",
-           "step2 按钮状态取决于自动磁盘选择")
-        t.set_disk()
-        eq(t.next_state, "normal")
-        t.next_step()
-        eq(t.step, 3)
-
-        # step3: 传输页 (禁用直到完成)
-        eq(t.next_state, "disabled", "step3 传输未完成应禁用")
+        # step2→3: 传输页 (传输完成即结束)
         t.ctl._transfer_done = True
-        t.go_step(4)
-
-        # step4: 传输完成
-        eq(t.step, 4)
-        eq(t.next_text, "校验文件 >")
-        eq(t.next_state, "normal")
-        t.next_step()
-
-        # step6: 发送端跳过 step5
-        eq(t.step, 6, "发送端应跳过step5直达step6")
-        eq(t.next_state, "normal")
-        eq(t.next_text, "跳过校验 >")
-        eq(t.prev_state, "normal")
-
-        # step6→4 回退
-        t.prev_step()
-        eq(t.step, 4, "发送端回退应跳过step5")
-
-        # step4→3→2→1→0
-        t.prev_step()
+        t.go_step(3)
         eq(t.step, 3)
+        eq(t.next_state, "disabled", "发送端传输完成即结束")
+
+        # step3→2→1→0 回退
         t.prev_step()
         eq(t.step, 2)
         t.prev_step()
@@ -806,9 +778,9 @@ def test_source_full_flow():
     finally:
         t.destroy()
 
-@test("E2. 接收端完整流程: step0→1→2→3→4→5→6")
+@test("E2. 接收端完整流程: step0→1→2→3→4 (最后一步)")
 def test_target_full_flow():
-    """接收端完整导航流程(含 step5 配置导入)"""
+    """接收端完整导航流程(step4 配置导入为最后一步)"""
     t = T()
     try:
         # step0→1
@@ -816,47 +788,30 @@ def test_target_full_flow():
         eq(t.step, 1)
         eq(t.next_text, "下一步 >")
 
-        # step1→2
+        # step1→2: 连接页 (下一步禁用, 用开始接收)
         t.set_nic()
         eq(t.next_state, "normal")
         t.next_step()
         eq(t.step, 2)
+        eq(t.next_state, "disabled", "step2 连接页下一步禁用")
 
-        # step2→3
-        t.set_disk()
-        eq(t.next_state, "normal")
-        t.next_step()
-        eq(t.step, 3)
-
-        # step3→4 (传输完成)
-        eq(t.next_state, "disabled")
+        # step2→3: 传输页 (传输完成后下一步为'查看总结 >')
         t.ctl._transfer_done = True
-        t.go_step(4)
-        eq(t.step, 4)
-        eq(t.next_text, "导入配置 >", "step4 下一步应为'导入配置 >'")
+        t.go_step(3)
+        eq(t.step, 3)
+        eq(t.next_text, "查看总结 >", "step3 下一步应为'查看总结 >'")
         eq(t.next_state, "normal")
 
-        # step4→5
+        # step3→4: 总结页
         t.next_step()
-        eq(t.step, 5, "接收端应进入 step5")
-        eq(t.next_text, "校验文件 >")
-        eq(t.next_state, "normal")
+        eq(t.step, 4, "接收端应进入 step4")
+        eq(t.next_state, "normal", "step4 为总结页, 下一步为'完成'")
+        eq(t.next_text, "完成", "总结页下一步应为'完成'")
 
-        # step5→6
-        t.next_step()
-        eq(t.step, 6)
-        eq(t.next_state, "normal")
-        eq(t.next_text, "跳过校验 >")
-
-        # step6→5→4→3→2→1→0
-        t.prev_step()
-        eq(t.step, 5)
-        eq(t.next_text, "校验文件 >")
-        t.prev_step()
-        eq(t.step, 4)
-        eq(t.next_text, "导入配置 >")
+        # step4→3→2→1→0
         t.prev_step()
         eq(t.step, 3)
+        eq(t.next_text, "查看总结 >")
         t.prev_step()
         eq(t.step, 2)
         t.prev_step()
@@ -891,30 +846,25 @@ def test_role_switch_consistency():
         eq(t.ctl._device_type, "源设备")
         eq(t.step, 1)
 
-        # 验证发送端无"导入配置 >"按钮文字
+        # 验证发送端无"导入配置 >"按钮文字 (传输完成即结束, 无步骤4/5)
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
+        t.next_step()  # →2 连接页
         t.ctl._transfer_done = True
-        t.go_step(4)
-        eq(t.next_text, "校验文件 >", "发送端 step4 不应显示'导入配置'")
-        t.next_step()
-        eq(t.step, 6, "发送端应跳过 step5")
+        t.go_step(3)  # →3 传输页
+        eq(t.next_state, "disabled", "发送端传输完成即结束, 无后续步骤")
+        eq(t.next_text, "下一步 >", "发送端 step3 不应显示'导入配置'")
     finally:
         t.destroy()
 
-@test("E4. 配置检测区域不在 step0/1/2/3/5/6 中显示")
+@test("E4. 配置检测确认区不再显示(自动导入)")
 def test_config_detect_hidden_on_other_steps():
-    """配置检测区域仅应在 step4 显示"""
+    """自动导入: 配置检测确认区在任意步骤均不显示"""
     t = T()
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
-        t.go_step(4)
+        t.next_step()  # →2 连接页
+        t.go_step(3)  # →3 传输页
         t.ctl._transfer_done = True
 
         _orig = config_transfer.get_config_from_ini
@@ -923,45 +873,35 @@ def test_config_detect_hidden_on_other_steps():
         )
         try:
             t.ctl._on_download_complete(True, 5, 1024*1024, [])
-            # step4: 应可见
-            try:
-                t.app._config_detect_frame.pack_info()
-            except Exception:
-                check(False, "step4 配置检测区域应可见")
+            t.app.update_idletasks()
+            # 检测到配置 → 后台自动导入, 停留传输页(step3)
+            eq(t.step, 3, "检测到配置时后台自动导入, 不立即跳转")
+            check(getattr(t.ctl, '_auto_import_active', False),
+                  "应处于自动导入状态")
 
-            # 跳 step5: 应隐藏
-            t.ctl._on_use_detected_config()
-            eq(t.step, 5)
+            # 确认区应始终隐藏 (自动导入无需确认)
             try:
                 t.app._config_detect_frame.pack_info()
-                check(False, "step5 配置检测区域应隐藏")
+                check(False, "配置检测确认区应隐藏")
             except Exception:
                 pass  # 正确: 未 pack
 
-            # step6: 应隐藏
-            t.next_step()
-            eq(t.step, 6)
-            try:
-                t.app._config_detect_frame.pack_info()
-                check(False, "step6 配置检测区域应隐藏")
-            except Exception:
-                pass
+            # 自动导入中: 下一步保持禁用 (等待导入/校验完成统一进总结页)
+            eq(t.next_state, "disabled", "自动导入中下一步应禁用")
         finally:
             config_transfer.get_config_from_ini = _orig
     finally:
         t.destroy()
 
-@test("E5. 自动检测配置后再手动选择其他文件夹")
+@test("E5. 自动导入后仍可手动选择其他配置文件夹")
 def test_detected_config_then_manual_select():
-    """检测到配置后, 用户仍可在 step5 中选择其他文件夹"""
+    """自动导入后, 用户仍可在 step4 中手动切换其他文件夹"""
     t = T()
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
-        t.go_step(4)
+        t.next_step()  # →2 连接页
+        t.go_step(3)  # →3 传输页
         t.ctl._transfer_done = True
 
         _orig = config_transfer.get_config_from_ini
@@ -970,11 +910,11 @@ def test_detected_config_then_manual_select():
         )
         try:
             t.ctl._on_download_complete(True, 5, 1024*1024, [])
-            eq(t.step, 4)
-
-            # 点击"使用此配置"
-            t.ctl._on_use_detected_config()
-            eq(t.step, 5)
+            t.app.update_idletasks()
+            # 自动导入: 检测到配置后停留传输页(step3)
+            eq(t.step, 3, "检测到配置时后台自动导入, 不立即跳转")
+            check(getattr(t.ctl, '_auto_import_active', False),
+                  "应处于自动导入状态")
 
             # 验证 _config_folders 不为空
             check(len(t.ctl._config_folders) > 0, "应有配置文件夹列表")
@@ -983,9 +923,16 @@ def test_detected_config_then_manual_select():
             vals = list(t.app.tk_combo_config_folder["values"])
             check(len(vals) > 0, f"下拉框应有选项, 实际={vals}")
 
-            # 验证已检测到的配置路径被选中
+            # 验证已自动选中的检测到的配置路径
             selected = t.app.tk_combo_config_folder.get()
             check("2026-08-03" in selected, f"选中的选项应包含日期: {selected}")
+
+            # 用户仍可手动切换为其他选项
+            if len(vals) > 1:
+                other = next((v for v in vals if "2026-08-03" not in str(v)), None)
+                if other is not None:
+                    t.app.tk_combo_config_folder.set(other)
+                    check(True, "可手动切换其他配置文件夹")
         finally:
             config_transfer.get_config_from_ini = _orig
     finally:
@@ -1003,37 +950,34 @@ def test_import_button_disabled_on_click():
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
-        t.go_step(4)
+        t.next_step()  # →2 连接页
+        t.go_step(3)  # →3 传输页
         t.ctl._transfer_done = True
 
         _orig = config_transfer.get_config_from_ini
         config_transfer.get_config_from_ini = lambda: (None, None)
         try:
             t.ctl._on_download_complete(True, 5, 1024*1024, [])
-            eq(t.step, 5)
+            eq(t.step, 4)
 
-            # 确保下拉框有选中项
-            combo_vals = list(t.app.tk_combo_config_folder["values"])
-            for v in combo_vals:
-                if v not in ("未检测到配置备份",):
-                    t.app.tk_combo_config_folder.set(v)
-                    t.app.update_idletasks()
-                    break
+            # 构造有效配置目录, 使手动导入走完校验流程 (验证"点击即禁用")
+            cfg_dir = tempfile.mkdtemp(prefix="cfg_")
+            _orig_import = config_transfer.import_config
+            try:
+                t.ctl._config_folders = [("2026-08-03 22:57:42", cfg_dir)]
+                t.app.tk_combo_config_folder["values"] = ["2026-08-03 22:57:42"]
+                t.app.tk_combo_config_folder.current(0)
+                config_transfer.import_config = lambda folder, log_callback=None: (True, [("x", "导入成功", "")])
 
-            # 模拟导入开始
-            t.app.tk_button_import_config.invoke()
-            t.app.update_idletasks()
-
-            # 检查按钮状态 (invoke 触发了异步线程, 但状态应立即变化)
-            # 直接调用 _on_import_config 来验证
-            t.ctl._on_import_config()
-            eq(str(t.app.tk_button_import_config.cget("state")), "disabled",
-               "导入中按钮应禁用")
-            eq(str(t.app.tk_button_skip_import.cget("state")), "disabled",
-               "导入中跳过按钮也应禁用")
+                # 点击导入 → 校验通过后应立即禁用 (防重复导入)
+                t.ctl._on_import_config()
+                eq(str(t.app.tk_button_import_config.cget("state")), "disabled",
+                   "导入中按钮应禁用")
+                eq(str(t.app.tk_button_skip_import.cget("state")), "disabled",
+                   "导入中跳过按钮也应禁用")
+            finally:
+                config_transfer.import_config = _orig_import
+                shutil.rmtree(cfg_dir, ignore_errors=True)
         finally:
             config_transfer.get_config_from_ini = _orig
     finally:
@@ -1054,28 +998,25 @@ def test_export_button_disabled_immediately():
 
 @test("F3. 多次回退前进不丢步")
 def test_multiple_back_forward():
-    """反复回退前进步骤数应保持正确"""
+    """反复回退前进步骤数应保持正确 (step3↔step4)"""
     t = T()
     try:
-        t.select_role("source")
+        t.select_role("target")
         t.set_nic()
-        t.next_step()  # →2
-        t.set_disk()
-        t.next_step()  # →3
+        t.next_step()  # →2 连接页
         t.ctl._transfer_done = True
-        t.go_step(4)
-        t.next_step()  # →6
-        eq(t.step, 6)
+        t.go_step(3)  # →3 传输页
+        t.next_step()  # →4 导入配置
+        eq(t.step, 4)
 
         # 反复操作 10 次
         for i in range(10):
             t.prev_step()
-            eq(t.step, 4, f"第{i+1}次回退应在step4")
+            eq(t.step, 3, f"第{i+1}次回退应在step3")
             t.next_step()
-            eq(t.step, 6, f"第{i+1}次前进应在step6")
+            eq(t.step, 4, f"第{i+1}次前进应在step4")
 
         # 最终回到 step0
-        t.prev_step()  # →4
         t.prev_step()  # →3
         t.prev_step()  # →2
         t.prev_step()  # →1

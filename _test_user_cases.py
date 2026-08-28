@@ -16,6 +16,8 @@
 """
 import sys, os, threading, traceback, time as _time
 
+# 测试环境: 关闭"启动时用默认浏览器打开 EULA 页面"
+os.environ["NETCOPY_SKIP_EULA_BROWSER"] = "1"
 os.chdir(r'c:\Users\Xinyi\Desktop\网络拷贝\NetworkzCopy')
 sys.path.insert(0, '.')
 sys.path.insert(0, os.path.join(os.getcwd(), 'python-3.13.14-embed-amd64', 'Lib', 'site-packages'))
@@ -71,6 +73,9 @@ class T:
         self.ctl = Controller()
         self.ctl.init(self.app)
         self.app.ctl = self.ctl
+        # 协议确认 (EULA): 测试默认勾选, 激活发送方/接收方按钮
+        self.app._eula_var.set(True)
+        self.app._on_eula_toggle()
         self.app.update_idletasks()
 
     @property
@@ -248,7 +253,7 @@ def test_export_done_no_prompt():
         tkinter.messagebox.askyesno = _orig
         t.destroy()
 
-@test("TC-02d. 接收端传输完成无配置 → 自动到导入页并显示'未检测到配置备份'")
+@test("TC-02d. 接收端传输完成无配置 → 自动到总结页并提示'未检测到配置备份'")
 def test_no_config_auto_step5():
     t = make_app()
     import config_transfer
@@ -257,20 +262,21 @@ def test_no_config_auto_step5():
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
+        t.next_step()  # →2 连接页
         t.ctl._transfer_done = True
-        t.app.go_step(4)
+        t.app.go_step(3)  # →3 传输页
         # 模拟无配置: systemconfig.ini 无记录 + 未检测到备份文件夹
         config_transfer.get_config_from_ini = lambda: (None, None)
         config_transfer.find_config_folders = lambda: []
         t.ctl._on_download_complete(True, 10, 1024 * 1024, [])
-        eq(t.step, 5, "无配置时应自动跳转到步骤5导入页")
-        values = list(t.app.tk_combo_config_folder["values"])
-        check("未检测到配置备份" in values, f"下拉应显示'未检测到配置备份', 实际={values}")
-        check("未在 F:\\Appl\\" in t.app.tk_label_config_status.cget("text"),
-              "状态文字应提示未检测到配置备份")
+        eq(t.step, 4, "无配置时应自动跳转到步骤4传输总结页")
+        # 自动模式: 手动导入控件 (下拉框/浏览/导入/跳过) 隐藏
+        check(not t.app._summary_manual_frame.winfo_ismapped(),
+              "自动模式下手动导入控件应隐藏")
+        # 导入明细区提示未检测到配置备份
+        text = t.app.tk_summary_import_items.get("1.0", "end")
+        check("未检测到系统配置备份" in text,
+              f"明细应提示未检测到配置备份, 实际={text!r}")
     finally:
         config_transfer.get_config_from_ini = _orig_ini
         config_transfer.find_config_folders = _orig_find
@@ -287,28 +293,26 @@ def test_network_lost_ui():
         t.select_role("target")
         t.ctl._on_network_lost_ui()
         t.app.update_idletasks()
-        check("网络连接已断开" in t.app.tk_label_transfer_error.cget("text"),
-              "错误条应含'网络连接已断开'")
+        check("网络连接已中断" in t.app.tk_label_transfer_error.cget("text"),
+              "错误条应含'网络连接已中断'")
         eq(t.start_text, "重新接收", "按钮应变为'重新接收'")
         eq(t.start_state, "normal", "重新接收按钮应可点击")
     finally:
         t.destroy()
 
-@test("TC-03b. 断网后回到步骤3: 下一步禁用 + 重新接收激活")
+@test("TC-03b. 断网后回到步骤2: 下一步禁用 + 重新接收激活")
 def test_network_down_back_to_step3():
     t = make_app()
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
+        t.next_step()  # →2 连接页
         # 模拟断网失败后的状态: 不在传输中, 未完成
         t.ctl._transferring = False
         t.ctl._transfer_done = False
-        t.app.go_step(4)
-        t.prev_step()  # → step3
-        eq(t.step, 3, "应回到步骤3连接页")
+        t.app.go_step(3)  # →3 传输页
+        t.prev_step()  # →2 连接页
+        eq(t.step, 2, "应回到步骤2连接页")
         eq(t.next_state, "disabled", "连接页'下一步'应禁用")
         eq(t.start_text, "重新接收", "按钮应为'重新接收'")
         eq(t.start_state, "normal", "'重新接收'应可点击")
@@ -324,9 +328,7 @@ def test_retry_reuse_auth_code():
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
+        t.next_step()  # →2 连接页
         # 预填验证码输入框
         t.app.tk_entry_code.delete(0, "end")
         t.app.tk_entry_code.insert(0, "ABCD")
@@ -546,22 +548,20 @@ def test_conflict_dialog_overwrite():
 # TC-07 跳过导入配置
 # ============================================================
 
-@test("TC-07. 跳过导入 → 进入步骤6, 下一步为'跳过校验 >'")
+@test("TC-07. 跳过导入 → 停留在步骤4 (最后一步), 下一步为'完成'")
 def test_skip_import():
     t = make_app()
     try:
         t.select_role("target")
         t.set_nic()
-        t.next_step()
-        t.set_disk()
-        t.next_step()
+        t.next_step()  # →2 连接页
         t.ctl._transfer_done = True
-        t.app.go_step(4)
-        t.next_step()  # →5
-        eq(t.step, 5)
+        t.app.go_step(3)  # →3 传输页
+        t.next_step()  # →4 传输总结
+        eq(t.step, 4)
         t.ctl._on_skip_import()
-        eq(t.step, 6, "跳过导入应进入步骤6校验页")
-        eq(t.next_text, "跳过校验 >")
+        eq(t.step, 4, "跳过导入后停留在步骤4 (校验已自动后台执行)")
+        eq(t.next_text, "完成", "跳过导入后下一步为'完成'")
         eq(t.next_state, "normal")
     finally:
         t.destroy()
@@ -674,7 +674,7 @@ def test_shutdown_idempotent():
     finally:
         t.destroy()
 
-@test("TC-10b. 校验页未完成校验直接关闭 → 发送跳过校验信息")
+@test("TC-10b. 传输完成但校验未完成直接关闭 → 发送跳过校验信息")
 def test_send_skip_on_close():
     import verifier as _v
     import config_transfer as _ct
@@ -685,8 +685,8 @@ def test_send_skip_on_close():
     try:
         t.select_role("target")
         t.ctl._partition_map = {"F": "F:\\"}
-        t.app.go_step(6)  # 处于校验页
-        t.ctl._verify_done = False
+        t.ctl._transfer_done = True   # 传输已完成
+        t.ctl._verify_done = False    # 校验未完成
         t.ctl._send_skip_verify_done = False
         def _fake_create(log_callback=None, save_dir=""):
             calls["create"] = True
@@ -705,7 +705,7 @@ def test_send_skip_on_close():
         _ct.upload_zip_to_server = _orig_upload
         t.destroy()
 
-@test("TC-10c. 非校验页关闭不发送跳过信息")
+@test("TC-10c. 传输未完成关闭不发送跳过信息")
 def test_send_skip_on_close_guard():
     import verifier as _v
     t = make_app()
@@ -713,13 +713,13 @@ def test_send_skip_on_close_guard():
     called = {"n": 0}
     try:
         t.select_role("target")
-        t.app.go_step(3)  # 不在校验页
+        t.ctl._transfer_done = False  # 传输未完成
         def _fake_create(log_callback=None, save_dir=""):
             called["n"] += 1
             return True, "x.zip"
         _v.create_unverifi_zip = _fake_create
         t.ctl._send_skip_verify_on_close()
-        eq(called["n"], 0, "非校验页关闭不应创建空包")
+        eq(called["n"], 0, "传输未完成关闭不应创建空包")
     finally:
         _v.create_unverifi_zip = _orig_create
         t.destroy()
@@ -732,7 +732,7 @@ def test_send_skip_on_close_verify_done():
     called = {"n": 0}
     try:
         t.select_role("target")
-        t.app.go_step(6)
+        t.ctl._transfer_done = True
         t.ctl._verify_done = True  # 已校验完成
         def _fake_create(log_callback=None, save_dir=""):
             called["n"] += 1

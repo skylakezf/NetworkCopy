@@ -117,6 +117,11 @@ foreach ($cd in $CollectData) {
 }
 $PyArgs += "--add-data"
 $PyArgs += "certs;certs"        # 在 .NET 字符串中分号不会被当成语句分隔符
+# EULA 协议页面 (本地回退: 远程 qitv1113.gtmcl.com:3000/eula.html 不可达时打开打包版)
+if (Test-Path -LiteralPath "$PSScriptRoot\eula.html") {
+    $PyArgs += "--add-data"
+    $PyArgs += "eula.html;."
+}
 $PyArgs += $MainPy
 
 # ---- 打印参数（调试用） ----

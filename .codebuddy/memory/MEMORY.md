@@ -32,5 +32,7 @@
 - 所有传输端点 (/ping /list /get /batch_get /filelist) 必须携带 ?pwd=<验证码>，否则 403
 - 边传边校验（2026-08-25）：传输前先下载 FullFilelist_DEF.csv（/filelist 端点）→ 每个文件下载完成后入队，由独立线程做"存在+大小"轻量校验（不做 MD5）→ 校验阶段通过 pre_verified.txt 确认清单增量跳过已确认文件，避免全量拷贝后二次读盘校验耗时过长
 - 客户端不校验自签名证书 (CERT_NONE)，安全性由随机验证码保证；如需防 MITM 需改为校验证书
+- **tkinter 线程约束（2026-08-26 实证）**：本嵌入式 Python 3.13.14 的 tkinter 禁止后台线程调用任何 tk 接口——连 `self.ui.after(...)`、`StringVar.get()` 都会抛 `RuntimeError: main thread is not in main loop`。后台线程更新 UI 必须走"线程安全队列 put + 主线程 `after` 轮询 drain"模式（参考 control.py `_verify_ui_q` + `_poll_verify_ui`），任何"后台线程直接调 after/config"的方案都会静默崩溃或死锁
+- 校验流程（2026-08-26 重构）：校验页已移除，总步骤 7→6（0角色→1网卡→2磁盘→3连接→4传输→5导入配置[仅接收端,最后一步]）。传输完成 `_on_download_complete` → `_start_auto_verification()` 后台自动校验（增量确认+报告打包+自动上传），进度/日志经 UI 队列渲染到传输页。`_upload_verifier_report` 记录 `_verify_upload_thread` 供轮询判断存活
 - 已知重大问题（2026-07-28 审查，尚未修复）：control.py 未向 FileServer/download_files/scan_source_device 传 auth_code 与 cert_paths，主流程实际跑不通；_send_json 缺 Content-Length 导致 HTTP/1.1 keep-alive 下 JSON 端点挂起；_download_batch except 分支对 4 元组按 3 值解包；verifier 重试下载走明文 http 且无 pwd；run_verification 未传 server_ip/gtmc_new_name。详见 2026-07-28.md
 - 已修复（2026-07-29）：Windows 路径拼接 bug — .rstrip("\\") 后再 os.path.join 得到的是相对盘符路径（如 "J:foo" 而非 "J:\\foo"），导致文件写入当前工作目录。修复了 file_transfer.py:990 和 verifier.py:216/219/303 四处，rstrip 后补回 "\\"。

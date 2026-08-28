@@ -135,6 +135,15 @@ class FileServerHandler(BaseHTTPRequestHandler):
     suppress_access_log = False  # 批量传输时禁用逐条 HTTP 日志
     auth_code = ""       # 随机验证码: 所有请求必须携带 ?pwd= 且匹配
 
+    # ---- 请求活动统计 (供源端判定"接收端已完成"以解除全屏锁定) ----
+    active_requests = 0    # 当前正在处理的请求数
+    ever_connected = False  # 是否曾有客户端请求
+    last_activity = 0.0    # 最后请求时间戳
+
+    # ---- 接收端进度/完成上报 (POST /report) ----
+    status_callback = None   # control 设置: 收到 /report 时回调 (参数: payload dict, 在请求线程中)
+    transfer_done_flag = False  # 接收端显式通知"传输完成"
+
     @classmethod
     def _is_authorized(cls, params: dict) -> bool:
         """校验请求中的 pwd 参数是否匹配验证码 (常量时间比较)"""
@@ -236,6 +245,9 @@ class FileServerHandler(BaseHTTPRequestHandler):
         return full
 
     def do_GET(self):
+        FileServerHandler.active_requests += 1
+        FileServerHandler.ever_connected = True
+        FileServerHandler.last_activity = time.time()
         try:
             # 解析路径和参数
             path, params = self._parse_query(self.path)
@@ -263,6 +275,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(e)}, 500)
             except:
                 pass
+        finally:
+            FileServerHandler.active_requests -= 1
 
     def _handle_filelist(self, params):
         """返回源端最新 FullFilelist_DEF.csv 内容 (供接收端提前下载清单, 用于边传边校验)"""
@@ -470,6 +484,9 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
     # ---- 小文件批量下载 ----
     def do_POST(self):
+        FileServerHandler.active_requests += 1
+        FileServerHandler.ever_connected = True
+        FileServerHandler.last_activity = time.time()
         try:
             path, params = self._parse_query(self.path)
             # ---- 鉴权: 必须携带正确的 pwd ----
@@ -481,6 +498,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 return
             if path == "/batch_get":
                 self._handle_batch_get()
+            elif path == "/report":
+                self._handle_report()
             else:
                 self._send_json({"error": "未知端点"}, 404)
         except Exception as e:
@@ -488,6 +507,34 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(e)}, 500)
             except:
                 pass
+        finally:
+            FileServerHandler.active_requests -= 1
+
+    def _handle_report(self):
+        """接收端进度/完成上报 (POST /report?pwd=xxx, body JSON):
+        {"done": bool, "files_done":.., "files_total":..,
+         "bytes_done":.., "bytes_total":.., "status": "..."}
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = b""
+            if length > 0:
+                body = self.rfile.read(length)
+            data = json.loads(body.decode("utf-8", errors="replace")) if body else {}
+        except Exception:
+            self._send_json({"error": "body 解析失败"}, 400)
+            return
+        if data.get("done"):
+            FileServerHandler.transfer_done_flag = True
+        FileServerHandler.ever_connected = True
+        FileServerHandler.last_activity = time.time()
+        cb = FileServerHandler.status_callback
+        if cb:
+            try:
+                cb(data)
+            except Exception:
+                pass
+        self._send_json({"status": "ok"})
 
     def _handle_batch_get(self):
         """一次 POST 请求下发多个小文件，减少小文件的 HTTP 往返开销"""
@@ -668,18 +715,21 @@ class FileServer:
     """文件服务器包装类 (纯 TLS, 明文 HTTP 已禁用)"""
 
     def __init__(self, partition_map: dict, log_callback=None,
-                 auth_code: str = "", cert_paths: tuple = None, redirect_ip: str = ""):
+                 auth_code: str = "", cert_paths: tuple = None, redirect_ip: str = "",
+                 status_callback=None):
         """
         partition_map: {"D": "I:", "E": "J:", "F": "K:"} 正常盘符→PE盘符
         auth_code:     随机验证码, 客户端请求必须携带
         cert_paths:    (cert_path, key_path) 自签名证书
         redirect_ip:   保留参数 (原明文重定向目标, 现已禁用明文, 不再使用)
+        status_callback: 接收端 /report 上报时回调 (参数: payload dict)
         """
         self.partition_map = partition_map
         self.log_callback = log_callback
         self.auth_code = auth_code
         self.cert_paths = cert_paths
         self.redirect_ip = redirect_ip
+        self.status_callback = status_callback
         self._server = None
         self._thread = None
         self._redirect_server = None
@@ -691,6 +741,7 @@ class FileServer:
         FileServerHandler.log_callback = self.log_callback
         FileServerHandler.suppress_access_log = True  # 批量传输时禁止逐条 HTTP 访问日志
         FileServerHandler.auth_code = self.auth_code
+        FileServerHandler.status_callback = self.status_callback
 
         self._server = ThreadingFileServer(("0.0.0.0", TRANSFER_PORT), FileServerHandler)
         if self.cert_paths:
@@ -743,6 +794,22 @@ class FileServer:
         _allow_sleep()  # 传输结束, 恢复系统正常休眠策略
         if self.log_callback:
             self.log_callback("文件服务器已停止")
+
+    def is_transfer_done(self, idle_seconds: float = 15.0) -> bool:
+        """源端判定传输是否完成: 接收端显式通知 /report done 优先;
+        否则以空闲检测兜底 (曾有客户端请求, 当前无请求, 距最后请求超 idle_seconds)"""
+        try:
+            if FileServerHandler.transfer_done_flag:
+                return True
+            if not FileServerHandler.ever_connected:
+                return False
+            if FileServerHandler.active_requests > 0:
+                return False
+            if time.time() - FileServerHandler.last_activity < idle_seconds:
+                return False
+            return True
+        except Exception:
+            return False
 
 
 # ===================== 文件下载客户端 (目标设备) =====================
@@ -865,6 +932,27 @@ def _close_all_thread_connections():
             except Exception:
                 pass
         conns.clear()
+
+
+def post_report(host: str, port: int, auth_code: str, payload: dict):
+    """接收端向源端上报进度/完成 (HTTPS POST /report?pwd=xxx)。
+    由调用方放入后台线程执行; 任何失败静默忽略 (不影响传输本身)。
+    """
+    try:
+        conn = _get_thread_connection(host, port)
+        url_path = f"/report?pwd={urllib.parse.quote(auth_code)}"
+        body = json.dumps(payload).encode("utf-8")
+        conn.request(
+            "POST", url_path, body=body,
+            headers={"Content-Type": "application/json", "Connection": "keep-alive"},
+        )
+        resp = conn.getresponse()
+        resp.read()
+    except Exception:
+        try:
+            _invalidate_thread_connection(host, port)
+        except Exception:
+            pass
 
 
 def _download_single_file(
@@ -1649,13 +1737,13 @@ def _download_files_inner(
     verified_stats = {"ok": 0, "fail": 0}
     total_queued = [0]  # 已放入校验队列的文件总数 (供 UI 进度回调)
     pre_ok_lock = threading.Lock()
-    pre_ok_paths = set()  # 源盘符完整路径集合 (如 "D:\\foo\\bar.txt"), 供校验阶段增量跳过
+    pre_ok_paths = {}  # 源盘符完整路径→文件大小 (如 {"D:\\foo\\bar.txt": 12345}), 供校验阶段增量跳过+大小复核
 
-    def _pre_ok_add(normal_partition, rel_path):
-        """断点续传跳过的文件: 已确认存在+大小正确, 直接记入已确认集合"""
+    def _pre_ok_add(normal_partition, rel_path, fsize):
+        """断点续传跳过的文件: 已确认存在+大小正确, 直接记入已确认集合(含大小)"""
         if verify_after_transfer:
             with pre_ok_lock:
-                pre_ok_paths.add(f"{normal_partition}:\\{rel_path.replace('/', '\\')}")
+                pre_ok_paths[f"{normal_partition}:\\{rel_path.replace('/', '\\')}"] = fsize
 
     def _save_pre_verified():
         """把边传边校验已确认文件清单写入磁盘 (供校验阶段增量跳过磁盘校验)"""
@@ -1673,7 +1761,9 @@ def _download_files_inner(
             os.makedirs(save_dir, exist_ok=True)
             pre_file = os.path.join(save_dir, "pre_verified.txt")
             with open(pre_file, "w", encoding="utf-8") as f:
-                f.write("\n".join(sorted(pre_ok_paths)))
+                f.write("\n".join(
+                    f"{p}|{s}" for p, s in sorted(pre_ok_paths.items())
+                ))
             pre_verified_out[0] = pre_file
             log(f"已保存边传边校验确认清单: {pre_file} ({len(pre_ok_paths)} 个文件)")
         except Exception as e:
@@ -1699,7 +1789,7 @@ def _download_files_inner(
                     if ok:
                         with pre_ok_lock:
                             verified_stats["ok"] += 1
-                            pre_ok_paths.add(f"{normal_partition}:\\{rel_path.replace('/', '\\')}")
+                            pre_ok_paths[f"{normal_partition}:\\{rel_path.replace('/', '\\')}"] = fsize
                     else:
                         verified_stats["fail"] += 1
                         log(f"  [X] 边传边校验失败: {rel_path} (期望 {fsize} 字节)")
@@ -1743,7 +1833,7 @@ def _download_files_inner(
                             pass
                     skipped_files += 1
                     skipped_bytes += fsize
-                    _pre_ok_add(task[0], task[1])  # 已存在且大小正确 → 记入已确认
+                    _pre_ok_add(task[0], task[1], task[2])  # 已存在且大小正确 → 记入已确认(含大小)
                     continue
             remaining_tasks.append(task)
         if skipped_files > 0:

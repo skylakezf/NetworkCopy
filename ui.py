@@ -39,7 +39,10 @@ class WinGUI(ttk.Window):
         self._auth_vcmd = (self.register(self._auth_validate), "%P")
         self._build_layout()
         self._step = 0
-        self._total_steps = 7  # 0=角色 1=网卡 2=磁盘 3=连接 4=传输 5=导入配置 6=校验
+        # 说明: 磁盘选择/分区映射已移入"高级设置(步骤1)"的高级选项面板, 仅在 PE 环境需要
+        self._total_steps = 5  # 0=角色 1=高级设置 2=连接 3=传输 4=传输总结(最后一步, 仅接收端)
+        # 说明: 数据校验不再有独立页面 — 传输完成后自动在后台执行
+        #        (边传边校验清单增量确认 + 报告打包 + 自动上传)
         self._device_type = None  # "source" or "target"
         self._role_display = "未选择"
 
@@ -94,14 +97,13 @@ class WinGUI(ttk.Window):
         # 初始化 CSV 路径变量 (必须在 _build_step5_verify 之前)
         self.csv_path_var = _tk.StringVar()
 
-        # 构建各步骤页面
+        # 构建各步骤页面 (磁盘选择/映射已移入步骤1高级选项, 不再有独立磁盘页)
         self._build_step0_role()
         self._build_step1_nic()
-        self._build_step2_disk()
         self._build_step3_connect()
         self._build_step4_transfer()
         self._build_step5_config_import()
-        self._build_step6_verify()
+        self._build_step6_source_done()
 
         # 初始显示步骤 0
         self._show_step(0)
@@ -124,7 +126,7 @@ class WinGUI(ttk.Window):
             ("1", "选择设备类型", "旧设备 (发送方) 或新设备 (接收方)"),
             ("2", "高级设置", "磁盘选择 · 分区映射 · IP 配置"),
             ("3", "连接并开始传输", "启动服务并输入验证码"),
-            ("4", "传输 & 数据校验", "文件传输 · 配置导入 · 完整性校验"),
+            ("4", "传输总结", "配置导入 · 文件校验 · 完成"),
         ]
         for num, title, desc in steps:
             item = self._build_step_item(side, num, title, desc)
@@ -164,17 +166,16 @@ class WinGUI(ttk.Window):
         }
 
     def _update_step_indicator(self, current: int):
-        map_ui_to_side = {0: 0, 1: 0, 2: 1, 3: 2, 4: 3, 5: 3, 6: 3}
+        map_ui_to_side = {0: 0, 1: 1, 2: 2, 3: 3, 4: 3, 5: 3}
         side_current = map_ui_to_side.get(current, 0)
 
         desc_map = {
             0: ("选择发送方或接收方", "请选择[旧设备(发送方)]或[新设备(接收方)]"),
-            1: ("已选择直连网卡", "请选择设备类型"),
-            2: ("高级设置 — 磁盘 / 分区 / IP", "确认磁盘和分区映射，查看网络配置"),
-            3: ("准备连接", "启动服务，输入验证码并开始传输"),
-            4: ("传输进度", "文件正在传输中..."),
-            5: ("导入系统配置", "将旧设备的配置导入新设备"),
-            6: ("数据校验", "校验已传输文件的完整性"),
+            1: ("高级设置 — 磁盘 / 分区 / IP", "磁盘选择(仅PE) · 分区映射 · 网络配置"),
+            2: ("准备连接", "启动服务，输入验证码并开始传输"),
+            3: ("传输进度 / 数据校验", "文件传输中，完成后自动校验并上传报告"),
+            4: ("传输总结", "配置导入结果 · 文件校验结果"),
+            5: ("传输完成", "接收端已完成数据拷贝，可安全关闭"),
         }
 
         for i, item in enumerate(self._step_items):
@@ -191,7 +192,7 @@ class WinGUI(ttk.Window):
                                  else "已完成")
                     desc.configure(text=role_text, fg=C_GREEN)
                 elif i == 1:
-                    desc.configure(text="已配置分区盘符映射", fg=C_GREEN)
+                    desc.configure(text="已确认磁盘与分区映射", fg=C_GREEN)
                 else:
                     desc.configure(text="传输服务已启动", fg=C_GREEN)
 
@@ -271,13 +272,13 @@ class WinGUI(ttk.Window):
 
     def go_step(self, step: int):
         self._show_step(step)
-        # 上一步按钮: step 0 禁用, 其他步骤启用
-        if step == 0:
+        # 上一步按钮: step 0 与发送端完成页(step 5)禁用, 其他步骤启用
+        if step == 0 or step == 5:
             self.set_button_prev("disabled")
         else:
             self.set_button_prev("normal")
-        # 步骤 3: 根据设备类型显式显示对应子面板 (解决 pack_forget 后子面板丢失问题)
-        if step == 3:
+        # 步骤 2: 根据设备类型显式显示对应子面板 (解决 pack_forget 后子面板丢失问题)
+        if step == 2:
             ctl_type = getattr(getattr(self, 'ctl', None), '_device_type', '')
             if ctl_type == "目标设备" or self._device_type == "target":
                 self.show_tgt_connect()
@@ -286,9 +287,9 @@ class WinGUI(ttk.Window):
             self.show_start_button()
         else:
             self.hide_start_button()
-        # 步骤 4: 发送端传输页 — 重新断言验证码横幅可见
+        # 步骤 3: 发送端传输页 — 重新断言验证码横幅可见
         # (页面 pack_forget 切换后可能丢失横幅显示, 这里按需重新 pack)
-        if step == 4:
+        if step == 3:
             ctl_type = getattr(getattr(self, 'ctl', None), '_device_type', '')
             if ctl_type == "源设备" or self._device_type == "source":
                 code = getattr(getattr(self, 'ctl', None), '_auth_code', '') or ''
@@ -296,30 +297,31 @@ class WinGUI(ttk.Window):
         # 根据步骤设置「下一步」按钮默认状态
         transfer_done = getattr(getattr(self, 'ctl', None), '_transfer_done', False)
         is_target = getattr(getattr(self, 'ctl', None), '_device_type', '') == "目标设备"
-        if step == 3:
+        if step == 2:
             self.set_button_next("disabled")
-        elif step == 6:  # step 6 (校验) 是最后一步: 下一步 = 跳过校验
-            self.set_button_next("normal", text="跳过校验 >")
-        elif step >= self._total_steps - 1:  # 越界保护
-            self.set_button_next("disabled")
-        elif step == 4:
-            if transfer_done:
-                if is_target:
-                    self.set_button_next("normal", text="导入配置 >")  # → step 5
-                else:
-                    self.set_button_next("normal", text="校验文件 >")  # → step 6 (跳过导入)
+        elif step >= self._total_steps - 1:
+            # 最后一步: step4 接收端总结页 / step5 发送端完成页 → 下一步 = 完成; 越界保护
+            if (is_target and step == 4) or step == 5:
+                self.set_button_next("normal", text="完成")
             else:
                 self.set_button_next("disabled")
-        elif step == 5:
-            self.set_button_next("normal", text="校验文件 >")
+        elif step == 3:
+            if transfer_done:
+                if is_target:
+                    self.set_button_next("normal", text="查看总结 >")  # → step 4
+                else:
+                    # 发送端: 传输完成即结束, 校验自动在后台进行 (无校验页面)
+                    self.set_button_next("disabled")
+            else:
+                self.set_button_next("disabled")
         else:
-            # step 0/1/2: 显式管理按钮状态, 避免仅依赖回调
+            # step 0/1: 显式管理按钮状态, 避免仅依赖回调
             if step == 0:
                 self.set_button_next("disabled")
             elif step == 1:
                 # 网卡已改为自动检测 (无需手动选择), 角色已选即可进入下一步
                 self.set_button_next("normal")
-            # step 2: 由 controller 回调控制(依赖磁盘选择)
+            # step 2 已在上方统一处理
         # 更新按钮状态
         if hasattr(self.ctl, '_check_button_state'):
             self.ctl._check_button_state()
@@ -374,7 +376,8 @@ class WinGUI(ttk.Window):
                   fg=C_TEXT_MUTED, bg=C_WHITE).pack(pady=(6, 14))
         self.tk_btn_source = ttk.Button(old_card, text="选择发送方",
                                         command=lambda: self._on_select_role("source"),
-                                        bootstyle="primary", takefocus=False, width=14)
+                                        bootstyle="primary", takefocus=False, width=14,
+                                        state=DISABLED)
         self.tk_btn_source.pack()
 
         # 接收方卡片
@@ -396,13 +399,41 @@ class WinGUI(ttk.Window):
                   fg=C_TEXT_MUTED, bg=C_WHITE).pack(pady=(6, 14))
         self.tk_btn_target = ttk.Button(new_card, text="选择接收方",
                                         command=lambda: self._on_select_role("target"),
-                                        bootstyle="primary", takefocus=False, width=14)
+                                        bootstyle="primary", takefocus=False, width=14,
+                                        state=DISABLED)
         self.tk_btn_target.pack()
 
         for card in (old_card, new_card):
             _bind_card_hover(card, "#f5f5f5")
 
+        # 协议确认勾选 (EULA): 未勾选前禁用"发送方/接收方"按钮
+        eula_row = _tk.Frame(inner, bg=C_WHITE)
+        eula_row.pack(pady=(28, 0))
+        self._eula_var = _tk.BooleanVar(value=False)
+        self.tk_check_eula = ttk.Checkbutton(
+            eula_row,
+            text="我已阅读并理解《使用须知》",
+            variable=self._eula_var,
+            command=self._on_eula_toggle,
+            takefocus=False,
+        )
+        self.tk_check_eula.pack()
+
+    def _on_eula_toggle(self):
+        """协议勾选状态变更: 勾选后激活「发送方/接收方」按钮, 取消则重新禁用"""
+        agreed = bool(self._eula_var.get())
+        try:
+            self.tk_btn_source.configure(state=NORMAL if agreed else DISABLED)
+            self.tk_btn_target.configure(state=NORMAL if agreed else DISABLED)
+        except Exception:
+            pass
+        if hasattr(self, 'ctl') and hasattr(self.ctl, '_on_eula_toggle'):
+            self.ctl._on_eula_toggle(agreed)
+
     def _on_select_role(self, role: str):
+        # 未勾选协议确认框时不允许选择角色 (防止点击卡片绕过按钮禁用)
+        if not getattr(self, '_eula_var', None) or not self._eula_var.get():
+            return
         self._device_type = role
         self._role_display = "旧设备 (发送方)" if role == "source" else "新设备 (接收方)"
         if hasattr(self, 'tk_label_role'):
@@ -532,14 +563,26 @@ class WinGUI(ttk.Window):
         self.tk_select_box_discover.set("等待 旧电脑 响应...")
         self.tk_select_box_discover.pack(fill=X, pady=(0, 6))
 
-        # ---- 高级: 手动 IP ----
+        # ---- 接收端选项行: 手动导入系统配置 + 高级手动 IP 并排 (统一 Y 轴, 避免按钮臃肿) ----
+        self._target_opt_row = _tk.Frame(self._target_info_frame, bg=C_WHITE)
+
+        # 手动配置导入模式: 勾选后传输完成不自动导入配置, 由用户在总结页手动操作
+        self.tk_var_manual_import = _tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self._target_opt_row, text="手动导入系统配置（传输完成后不自动导入）",
+            variable=self.tk_var_manual_import,
+            bootstyle="secondary",
+        ).pack(side=LEFT, padx=(0, 24))
+
+        # 高级: 手动输入 IP 地址 (勾选后展开下方 IP 输入行)
         self.tk_var_advanced = _tk.BooleanVar(value=False)
         self.tk_check_advanced = ttk.Checkbutton(
-            self._target_info_frame, text="高级: 手动输入 IP 地址",
+            self._target_opt_row, text="高级: 手动输入 IP 地址",
             variable=self.tk_var_advanced,
             bootstyle="secondary",
             command=self._toggle_advanced_ip
         )
+        self.tk_check_advanced.pack(side=LEFT)
 
         self._advanced_frame = _tk.Frame(self._target_info_frame, bg=C_SIDEBAR_BG, padx=10, pady=8)
 
@@ -560,6 +603,10 @@ class WinGUI(ttk.Window):
         # 高级选项内容面板 (默认隐藏)
         self._advanced_nic_frame = _tk.Frame(inner, bg=C_WHITE)
 
+        # 运行环境标志: winpe / normal (正常系统盘符一一对应, 仅 WinPE 需手动映射)
+        self.winpe_var = _tk.StringVar(
+            value="winpe" if __import__('os').path.exists("X:\\Windows\\System32") else "normal")
+
         # 高级选项内：自动检测网卡详情卡片 (绿色背景)
         self._auto_nic_frame = _tk.Frame(self._advanced_nic_frame, bg="#E8F5E9",
                                          bd=1, relief=SOLID)
@@ -572,62 +619,48 @@ class WinGUI(ttk.Window):
                                                   wraplength=650, justify=LEFT)
         self.tk_label_auto_nic_detail.pack(fill=X, padx=12, pady=8)
 
-        # 初始状态: 两个主内容框架均隐藏
-        self._export_frame.pack(fill=BOTH, expand=True)
-        self._export_frame.pack_forget()
-        self._target_info_frame.pack(fill=BOTH, expand=True)
-        self._target_info_frame.pack_forget()
+        # ---- 磁盘选择与分区映射 (仅 WinPE 环境需要; 正常系统盘符一一对应) ----
+        disk_section = _tk.Frame(self._advanced_nic_frame, bg=C_WHITE)
+        disk_section.pack(fill=X, pady=(0, 12))
 
-        # 兼容旧控件 (隐藏)
-        self.tk_select_box_mqg0hm2h = ttk.Combobox(page, state="readonly")
-        self.winpe_var = _tk.StringVar(
-            value="winpe" if __import__('os').path.exists("X:\\Windows\\System32") else "normal")
+        _tk.Label(disk_section, text="磁盘选择与分区映射",
+                  font=("Microsoft YaHei UI", 10, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 2))
 
-    # ==================== 步骤 2: 选择磁盘 ====================
-
-    def _build_step2_disk(self):
-        page = _tk.Frame(self._content_frame, bg=C_WHITE)
-        self._pages[2] = page
-
-        inner = _tk.Frame(page, bg=C_WHITE)
-        inner.pack(fill=BOTH, expand=True, padx=40, pady=28)
-
-        _tk.Label(inner, text="选择磁盘",
-                  font=("Microsoft YaHei UI", 14, "bold"),
-                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 4))
-
-        _tk.Label(inner, text="识别物理磁盘并配置分区盘符映射",
-                  font=("Microsoft YaHei UI", 9), fg=C_TEXT_SEC,
-                  wraplength=700, justify=LEFT, bg=C_WHITE).pack(anchor=W, pady=(0, 12))
+        _tk.Label(disk_section,
+                  text="正常系统下 D / E / F 盘符自动一一对应，无需映射。\n"
+                       "仅在 WinPE 环境需要选择物理磁盘并确认分区盘符映射。",
+                  font=("Microsoft YaHei UI", 8), fg=C_TEXT_MUTED,
+                  wraplength=650, justify=LEFT, bg=C_WHITE).pack(anchor=W, pady=(0, 6))
 
         # 磁盘选择
-        self.tk_select_box_mqfzmzbe = ttk.Combobox(inner, state="readonly",
+        self.tk_select_box_mqfzmzbe = ttk.Combobox(disk_section, state="readonly",
                                                     font=("Microsoft YaHei UI", 9))
         self.tk_select_box_mqfzmzbe['values'] = ("请先选择设备类型",)
         self.tk_select_box_mqfzmzbe.pack(fill=X, pady=(0, 4))
 
-        self.tk_label_auto_disk = _tk.Label(inner, text="",
+        self.tk_label_auto_disk = _tk.Label(disk_section, text="",
                                             font=("Microsoft YaHei UI", 8, "italic"),
                                             fg=C_TEXT_MUTED, bg=C_WHITE)
-        self.tk_label_auto_disk.pack(anchor=W, pady=(0, 14))
+        self.tk_label_auto_disk.pack(anchor=W, pady=(0, 8))
 
         # 分区盘符映射 (高级选项, 默认隐藏)
         self.tk_show_partition_map = _tk.BooleanVar(value=False)
         self.tk_cb_partition_map = ttk.Checkbutton(
-            inner,
+            disk_section,
             text="分区盘符映射 (高级)",
             variable=self.tk_show_partition_map,
             command=self._toggle_partition_map,
             bootstyle="primary-outline",
         )
-        self.tk_cb_partition_map.pack(anchor=W, pady=(0, 8))
+        self.tk_cb_partition_map.pack(anchor=W, pady=(0, 4))
 
         # 可折叠的分区映射区域
-        self._partition_map_frame = _tk.Frame(inner, bg=C_WHITE)
+        self._partition_map_frame = _tk.Frame(disk_section, bg=C_WHITE)
 
         _tk.Label(self._partition_map_frame, text="分区盘符映射（源 D / E / F > 当前系统盘符）",
                   font=("Microsoft YaHei UI", 10, "bold"),
-                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(4, 10))
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(4, 8))
 
         map_frame = _tk.Frame(self._partition_map_frame, bg=C_WHITE)
         map_frame.pack(fill=X)
@@ -645,29 +678,31 @@ class WinGUI(ttk.Window):
             cb.pack(side=LEFT)
             setattr(self, attr, cb)
 
-        # 分隔线
-        _tk.Frame(self._partition_map_frame, height=1, bg=C_SEP).pack(fill=X, pady=(18, 0))
+        # 运行环境 (WinPE / 正常系统)
+        env_row = _tk.Frame(self._advanced_nic_frame, bg=C_WHITE)
+        env_row.pack(fill=X, pady=(0, 12))
 
-        # 运行环境
-        env_frame = _tk.Frame(inner, bg=C_WHITE)
-        env_frame.pack(fill=X, pady=(18, 0))
-
-        _tk.Label(env_frame, text="运行环境",
+        _tk.Label(env_row, text="运行环境",
                   font=("Microsoft YaHei UI", 10, "bold"),
-                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 6))
+                  fg=C_TEXT, bg=C_WHITE).pack(side=LEFT, padx=(0, 16))
 
-        radio_frame = _tk.Frame(env_frame, bg=C_WHITE)
-        radio_frame.pack(anchor=W)
-
-        self.winpe_var = _tk.StringVar(value="normal")
-        ttk.Radiobutton(radio_frame, text="WinPE 环境",
+        ttk.Radiobutton(env_row, text="WinPE 环境",
                         variable=self.winpe_var, value="winpe",
-                        bootstyle="primary").pack(side=LEFT, padx=(0, 20))
-        ttk.Radiobutton(radio_frame, text="正常系统",
+                        bootstyle="primary").pack(side=LEFT, padx=(0, 16))
+        ttk.Radiobutton(env_row, text="正常系统",
                         variable=self.winpe_var, value="normal",
                         bootstyle="primary").pack(side=LEFT)
 
+        # 初始状态: 两个主内容框架均隐藏
+        self._export_frame.pack(fill=BOTH, expand=True)
+        self._export_frame.pack_forget()
+        self._target_info_frame.pack(fill=BOTH, expand=True)
+        self._target_info_frame.pack_forget()
 
+        # 兼容旧控件 (隐藏)
+        self.tk_select_box_mqg0hm2h = ttk.Combobox(page, state="readonly")
+
+    # 磁盘选择与分区映射已移入步骤 1 的高级选项面板 (仅 WinPE 环境需要)
 
     def _toggle_partition_map(self):
         """显示/隐藏分区盘符映射高级选项"""
@@ -712,7 +747,7 @@ class WinGUI(ttk.Window):
                 self._transfer_error_frame.pack(fill=X, pady=(0, 10))
         # 状态标签也变红
         self.tk_label_transfer_status.config(
-            text="传输失败 — 请返回上一步检查后重试",
+            text=" 网络连接已中断——请依次关闭新旧设备上的磁盘拷贝应用程序，检查并确认网线物理连接正常后，再重新启动应用",
             fg=C_RED,
             font=("Microsoft YaHei UI", 9, "bold"),
         )
@@ -727,7 +762,7 @@ class WinGUI(ttk.Window):
             font=("Microsoft YaHei UI", 8),
         )
         if hasattr(self, 'tk_label_verify_online'):
-            self.tk_label_verify_online.config(text="边传边校验：等待中")
+            self.tk_label_verify_online.config(text="文件确认：等待中")
 
     def set_verify_online_status(self, text: str):
         """步骤 4: 更新"边传边校验"状态行文本 (由 control.py 通过 after 在主线程调用)"""
@@ -737,11 +772,20 @@ class WinGUI(ttk.Window):
         except Exception:
             pass
 
+    def show_report_button(self):
+        """校验报告生成后显示『查看校验报告』按钮 (定位到报告文件)"""
+        try:
+            if hasattr(self, 'tk_button_open_report'):
+                if not self.tk_button_open_report.winfo_ismapped():
+                    self.tk_button_open_report.pack(fill=X, pady=(0, 6))
+        except Exception:
+            pass
+
     # ==================== 步骤 3: 连接设置 ====================
 
     def _build_step3_connect(self):
         page = _tk.Frame(self._content_frame, bg=C_WHITE)
-        self._pages[3] = page
+        self._pages[2] = page
 
         inner = _tk.Frame(page, bg=C_WHITE)
         inner.pack(fill=BOTH, expand=True, padx=40, pady=28)
@@ -786,7 +830,7 @@ class WinGUI(ttk.Window):
         # 醒目提醒
         remind = _tk.Frame(auth_box, bg=C_WHITE)
         remind.pack(fill=X, padx=14, pady=(0, 10))
-        _tk.Label(remind, text="=请退出所有应用程序关闭所有文档，确认后请点击右下角“开始传输”",
+        _tk.Label(remind, text="=请退出所有应用程序关闭所有文档，确认后请点击右下角“开始传输”=",
                   font=("Microsoft YaHei UI", 9, "bold"),
                   fg=C_RED, bg=C_WHITE).pack(anchor=W)
 
@@ -856,7 +900,7 @@ class WinGUI(ttk.Window):
 
     def _build_step4_transfer(self):
         page = _tk.Frame(self._content_frame, bg=C_WHITE)
-        self._pages[4] = page
+        self._pages[3] = page
 
         inner = _tk.Frame(page, bg=C_WHITE)
         inner.pack(fill=BOTH, expand=True, padx=40, pady=20)
@@ -930,12 +974,18 @@ class WinGUI(ttk.Window):
 
         # 边传边校验状态行: 文件传输完成后由独立线程立即复核"存在+大小", 实时展示确认进度
         self.tk_label_verify_online = _tk.Label(
-            inner, text="边传边校验：等待中",
+            inner, text="文件确认：等待中",
             font=("Microsoft YaHei UI", 8),
             fg=C_TEXT_SEC, bg=C_WHITE,
             anchor=W,
         )
         self.tk_label_verify_online.pack(fill=X, pady=(0, 6))
+
+        # 校验报告定位按钮 (校验完成后由 control.py 显示, 点击定位到报告文件)
+        self.tk_button_open_report = ttk.Button(
+            inner, text="查看校验报告",
+            bootstyle="secondary-outline", takefocus=False, width=16,
+        )
 
         # 当前分区进度条 (隐藏不显示, 仅保留供 control.py 更新)
         self.tk_file_progress_bar = ttk.Progressbar(inner, mode="determinate",
@@ -1005,36 +1055,57 @@ class WinGUI(ttk.Window):
         )
         self.tk_button_skip_config.pack(side=LEFT)
 
-    # ==================== 步骤 5: 导入系统配置 ====================
+    # ==================== 步骤 4(索引4): 传输总结 ====================
+    # 传输完成后自动进入 (仅接收端)。展示: 配置导入结果 / 文件校验结果 / 失败文件列表
 
     def _build_step5_config_import(self):
         page = _tk.Frame(self._content_frame, bg=C_WHITE)
-        self._pages[5] = page
+        self._pages[4] = page
 
         inner = _tk.Frame(page, bg=C_WHITE)
         inner.pack(fill=BOTH, expand=True, padx=40, pady=20)
 
-        _tk.Label(inner, text="导入系统配置",
+        _tk.Label(inner, text="传输总结",
                   font=("Microsoft YaHei UI", 14, "bold"),
-                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 4))
+                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 2))
 
-        _tk.Label(inner, text="从旧设备导出的系统配置（收藏夹、Outlook 规则、输入法等）导入到新设备",
+        _tk.Label(inner, text="文件传输已完成。以下为系统配置导入与数据校验结果",
                   font=("Microsoft YaHei UI", 9), fg=C_TEXT_SEC,
-                  wraplength=700, justify=LEFT, bg=C_WHITE).pack(anchor=W, pady=(0, 14))
+                  wraplength=700, justify=LEFT, bg=C_WHITE).pack(anchor=W, pady=(0, 8))
 
-        # ---- 配置文件夹选择 ----
-        folder_section = _tk.Frame(inner, bg=C_SIDEBAR_BG, padx=14, pady=12)
-        folder_section.pack(fill=X, pady=(0, 10))
+        # ---- ① 系统配置导入结果 ----
+        import_block = _tk.Frame(inner, bg=C_SIDEBAR_BG, padx=14, pady=10)
+        import_block.pack(fill=X, pady=(0, 10))
 
-        _tk.Label(folder_section, text="选择配置文件夹",
-                  font=("Microsoft YaHei UI", 9, "bold"),
+        _tk.Label(import_block, text="系统配置导入",
+                  font=("Microsoft YaHei UI", 10, "bold"),
                   fg=C_TEXT, bg=C_SIDEBAR_BG).pack(anchor=W, pady=(0, 6))
+
+        self.tk_summary_import_items = _tk.Text(import_block, wrap=WORD,
+                                                 font=("Microsoft YaHei UI", 9),
+                                                 bg=C_SIDEBAR_BG, fg=C_TEXT,
+                                                 bd=0, highlightthickness=0, height=3,
+                                                 insertbackground=C_TEXT)
+        self.tk_summary_import_items.pack(fill=X, pady=(0, 4))
+        self.tk_summary_import_items.config(state=DISABLED)
+
+        # ---- 手动配置导入 (仅在手动模式下显示) ----
+        self._summary_manual_frame = _tk.Frame(import_block, bg=C_SIDEBAR_BG)
+        # 默认隐藏, _render_summary 中按需显示
+        # self._summary_manual_frame.pack(fill=X, pady=(6, 2))
+
+        _tk.Label(self._summary_manual_frame, text="手动配置导入",
+                  font=("Microsoft YaHei UI", 8, "bold"),
+                  fg=C_TEXT_SEC, bg=C_SIDEBAR_BG).pack(anchor=W, pady=(6, 2))
+
+        folder_section = _tk.Frame(self._summary_manual_frame, bg=C_SIDEBAR_BG)
+        folder_section.pack(fill=X, pady=(0, 4))
 
         folder_row = _tk.Frame(folder_section, bg=C_SIDEBAR_BG)
         folder_row.pack(fill=X)
 
         self.tk_combo_config_folder = ttk.Combobox(folder_row, state="readonly",
-                                                     font=("Microsoft YaHei UI", 9), width=50)
+                                                     font=("Microsoft YaHei UI", 9), width=46)
         self.tk_combo_config_folder.pack(side=LEFT, padx=(0, 8))
 
         self.tk_button_browse_config = ttk.Button(folder_row, text="浏览...", takefocus=False,
@@ -1045,11 +1116,10 @@ class WinGUI(ttk.Window):
                                                 font=("Microsoft YaHei UI", 8),
                                                 fg=C_TEXT_SEC, bg=C_SIDEBAR_BG,
                                                 wraplength=680, justify=LEFT)
-        self.tk_label_config_status.pack(anchor=W, pady=(6, 0))
+        self.tk_label_config_status.pack(anchor=W, pady=(4, 0))
 
-        # ---- 操作按钮 ----
-        btn_row = _tk.Frame(inner, bg=C_WHITE)
-        btn_row.pack(fill=X, pady=(10, 12))
+        btn_row = _tk.Frame(self._summary_manual_frame, bg=C_SIDEBAR_BG)
+        btn_row.pack(fill=X, pady=(6, 2))
 
         self.tk_button_import_config = ttk.Button(btn_row, text="导入配置", takefocus=False,
                                                    bootstyle="success", width=16)
@@ -1071,9 +1141,48 @@ class WinGUI(ttk.Window):
         self.tk_import_progress_bar.pack(fill=X, pady=(2, 10))
         self.tk_import_progress_bar.pack_forget()
 
-        # ---- 日志区域 ----
+        # ---- ② 文件校验结果 (含失败文件, 统一为一块整体) ----
+        verify_block = _tk.Frame(inner, bg=C_SIDEBAR_BG, padx=14, pady=10)
+        verify_block.pack(fill=BOTH, expand=True, pady=(0, 10))
+
+        _tk.Label(verify_block, text="文件校验结果",
+                  font=("Microsoft YaHei UI", 10, "bold"),
+                  fg=C_TEXT, bg=C_SIDEBAR_BG).pack(anchor=W, pady=(0, 6))
+
+        verify_row = _tk.Frame(verify_block, bg=C_SIDEBAR_BG)
+        verify_row.pack(fill=X)
+
+        self.tk_summary_verify_label = _tk.Label(verify_row, text="校验尚未完成",
+                                                  font=("Microsoft YaHei UI", 11, "bold"),
+                                                  fg=C_TEXT_SEC, bg=C_SIDEBAR_BG)
+        self.tk_summary_verify_label.pack(anchor=W)
+
+        # 校验失败文件 (同一区块内的子区域)
+        self.tk_summary_fail_label = _tk.Label(verify_block, text="校验失败文件 (0)",
+                                                font=("Microsoft YaHei UI", 10, "bold"),
+                                                fg=C_TEXT, bg=C_SIDEBAR_BG)
+        self.tk_summary_fail_label.pack(anchor=W, pady=(8, 4))
+
+        tree_frame = _tk.Frame(verify_block, bg=C_SIDEBAR_BG)
+        tree_frame.pack(fill=BOTH, expand=True)
+
+        self.tk_summary_fail_tree = ttk.Treeview(tree_frame,
+                                                  columns=("path", "reason"),
+                                                  show="headings", height=3)
+        self.tk_summary_fail_tree.heading("path", text="完整路径")
+        self.tk_summary_fail_tree.heading("reason", text="失败原因")
+        self.tk_summary_fail_tree.column("path", width=430, anchor=W, stretch=True, minwidth=120)
+        self.tk_summary_fail_tree.column("reason", width=240, anchor=W, stretch=False, minwidth=80)
+        self.tk_summary_fail_tree.pack(side=LEFT, fill=BOTH, expand=True)
+
+        tree_scroll = ttk.Scrollbar(tree_frame, orient=VERTICAL,
+                                    bootstyle="dark-round",
+                                    command=self.tk_summary_fail_tree.yview)
+        tree_scroll.pack(side=RIGHT, fill=Y)
+        self.tk_summary_fail_tree.configure(yscrollcommand=tree_scroll.set)
+
+        # ---- 导入日志 (按需求隐藏, 仅保留控件以便 _log_import_direct 安全写入) ----
         log_header = _tk.Frame(inner, bg=C_WHITE)
-        log_header.pack(fill=X, pady=(4, 2))
         _tk.Label(log_header, text="导入日志",
                   font=("Microsoft YaHei UI", 9, "bold"),
                   fg=C_TEXT, bg=C_WHITE).pack(side=LEFT)
@@ -1083,8 +1192,7 @@ class WinGUI(ttk.Window):
                                             bd=1, relief=SOLID,
                                             insertbackground=C_CONSOLE_FG,
                                             selectbackground="#404040",
-                                            height=10)
-        self.tk_text_import_log.pack(fill=BOTH, expand=True)
+                                            height=3)
 
         scroll = ttk.Scrollbar(self.tk_text_import_log, orient=VERTICAL,
                                bootstyle="dark-round")
@@ -1092,85 +1200,220 @@ class WinGUI(ttk.Window):
         self.tk_text_import_log.configure(yscrollcommand=scroll.set)
         self.tk_text_import_log.configure(state=DISABLED)
 
-    # ==================== 步骤 6: 文件校验 ====================
+        # ---- 底部操作按钮行 (查看校验报告 / 完成并退出) ----
+        # side=BOTTOM 固定于页面底部: 即使上方内容较多, 按钮行始终可见
+        self._summary_bottom_row = _tk.Frame(inner, bg=C_WHITE)
+        self._summary_bottom_row.pack(side=BOTTOM, fill=X, pady=(6, 0))
 
-    def _build_step6_verify(self):
+        self.tk_button_view_report = ttk.Button(self._summary_bottom_row, text="查看校验报告",
+                                                 takefocus=False,
+                                                 bootstyle="primary-outline", width=14)
+        self.tk_button_view_report.pack(side=LEFT)
+        self.tk_button_view_report.config(state=DISABLED)
+
+        self.tk_button_summary_done = ttk.Button(self._summary_bottom_row, text="完成并退出",
+                                                 takefocus=False,
+                                                 bootstyle="success", width=16)
+        self.tk_button_summary_done.pack(side=RIGHT)
+
+    def set_manual_import_visible(self, visible):
+        """总结页: 显示/隐藏手动配置导入控件 (文件夹/浏览/导入/跳过)"""
+        frame = getattr(self, "_summary_manual_frame", None)
+        if frame is None:
+            return
+        if visible:
+            frame.pack(fill=X, pady=(6, 2))
+        else:
+            frame.pack_forget()
+
+    # ==================== 发送端完成页 (step 5) ====================
+
+    def _build_step6_source_done(self):
+        """发送端: 传输完成后展示的完成页 (与整体 UI 风格统一)"""
         page = _tk.Frame(self._content_frame, bg=C_WHITE)
-        self._pages[6] = page
+        self._pages[5] = page
 
         inner = _tk.Frame(page, bg=C_WHITE)
-        inner.pack(fill=BOTH, expand=True, padx=40, pady=20)
+        inner.place(relx=0.5, rely=0.42, anchor=CENTER)
 
-        _tk.Label(inner, text="数据校验",
-                  font=("Microsoft YaHei UI", 14, "bold"),
-                  fg=C_TEXT, bg=C_WHITE).pack(anchor=W, pady=(0, 4))
+        # 成功图标 + 大标题
+        _tk.Label(inner, text="✓", font=("Microsoft YaHei UI", 44, "bold"),
+                  fg=C_GREEN, bg=C_WHITE).pack(pady=(0, 4))
+        _tk.Label(inner, text="传输完成", font=("Microsoft YaHei UI", 20, "bold"),
+                  fg=C_TEXT, bg=C_WHITE).pack(pady=(0, 6))
+        _tk.Label(inner, text="接收端已成功完成数据拷贝",
+                  font=("Microsoft YaHei UI", 10), fg=C_TEXT_SEC,
+                  bg=C_WHITE).pack(pady=(0, 26))
 
-        _tk.Label(inner, text="传输完成后, 校验文件完整性",
-                  font=("Microsoft YaHei UI", 9), fg=C_TEXT_SEC,
-                  bg=C_WHITE).pack(anchor=W, pady=(0, 14))
+        # 信息卡片 (与整体灰底卡片风格一致)
+        card = _tk.Frame(inner, bg=C_SIDEBAR_BG, padx=28, pady=16)
+        card.pack(fill=X)
 
-        # ---- CSV 文件选择 ----
-        csv_section = _tk.Frame(inner, bg=C_SIDEBAR_BG, padx=14, pady=12)
-        csv_section.pack(fill=X, pady=(0, 10))
+        _tk.Label(card, text="拷贝进度", font=("Microsoft YaHei UI", 9),
+                  fg=C_TEXT_SEC, bg=C_SIDEBAR_BG).grid(row=0, column=0,
+                                                       sticky=W, padx=(0, 32), pady=(0, 8))
+        _tk.Label(card, text="100%", font=("Microsoft YaHei UI", 13, "bold"),
+                  fg=C_GREEN, bg=C_SIDEBAR_BG).grid(row=0, column=1,
+                                                    sticky=W, pady=(0, 8))
+        _tk.Label(card, text="接收端状态", font=("Microsoft YaHei UI", 9),
+                  fg=C_TEXT_SEC, bg=C_SIDEBAR_BG).grid(row=1, column=0,
+                                                       sticky=W, padx=(0, 32))
+        _tk.Label(card, text="已完成拷贝，可在接收端查看校验结果",
+                  font=("Microsoft YaHei UI", 9), fg=C_TEXT,
+                  bg=C_SIDEBAR_BG).grid(row=1, column=1, sticky=W)
 
-        _tk.Label(csv_section, text="校验清单 (FullFilelist_DEF.csv)",
-                  font=("Microsoft YaHei UI", 9, "bold"),
-                  fg=C_TEXT, bg=C_SIDEBAR_BG).pack(anchor=W, pady=(0, 6))
+        # 完成按钮
+        self.tk_button_source_done = ttk.Button(inner, text="完成并关闭", takefocus=False,
+                                                bootstyle="success", width=16)
+        self.tk_button_source_done.pack(pady=(32, 0))
 
-        csv_row = _tk.Frame(csv_section, bg=C_SIDEBAR_BG)
-        csv_row.pack(fill=X)
+    # ==================== 传输期间霸占全屏 ====================
 
-        self.tk_entry_csv = ttk.Entry(csv_row, textvariable=self.csv_path_var,
-                                       state="readonly",
-                                       font=("Microsoft YaHei UI", 9), width=50)
-        self.tk_entry_csv.pack(side=LEFT, padx=(0, 8))
+    def lock_screen(self):
+        """传输期间霸占全屏, 避免用户误操作电脑:
+        全屏置顶 + 拦截关闭(Alt+F4/标题栏X) + 轮询抢回焦点"""
+        try:
+            if getattr(self, "_screen_locked", False):
+                return
+            self._screen_locked = True
+            try:
+                self.attributes("-fullscreen", True)
+            except Exception:
+                pass
+            try:
+                self.attributes("-topmost", True)
+            except Exception:
+                pass
+            self.lift()
+            try:
+                self.focus_force()
+            except Exception:
+                pass
+            # 拦截窗口关闭 (Alt+F4 / 标题栏 X), 传输期间禁止退出
+            try:
+                self._lock_close_cb = self.protocol("WM_DELETE_WINDOW")
+                self.protocol("WM_DELETE_WINDOW", lambda: None)
+            except Exception:
+                self._lock_close_cb = None
+            # 轮询: 失焦时抢回焦点, 防止切换到其他窗口
+            self._screen_lock_after = self.after(500, self._screen_lock_poll)
+        except Exception:
+            pass
 
-        self.tk_button_browse_csv = ttk.Button(csv_row, text="浏览...", takefocus=False,
-                                                width=10, bootstyle="secondary",
-                                                command=self._on_browse_csv)
-        self.tk_button_browse_csv.pack(side=LEFT)
+    def _screen_lock_poll(self):
+        self._screen_lock_after = None
+        if not getattr(self, "_screen_locked", False):
+            return
+        try:
+            if not self.focus_displayof():
+                self.lift()
+                try:
+                    self.focus_force()
+                except Exception:
+                    pass
+            self._screen_lock_after = self.after(500, self._screen_lock_poll)
+        except Exception:
+            pass
 
-        _tk.Label(csv_section, text="留空则自动识别最新 Appl 文件夹下的 CSV",
-                  font=("Microsoft YaHei UI", 7),
-                  fg=C_TEXT_MUTED, bg=C_SIDEBAR_BG).pack(anchor=W, pady=(6, 0))
+    def unlock_screen(self):
+        """结束锁定, 恢复窗口正常状态 (传输完成/失败/断开/退出时调用)"""
+        try:
+            if not getattr(self, "_screen_locked", False):
+                return
+            self._screen_locked = False
+            if getattr(self, "_screen_lock_after", None):
+                try:
+                    self.after_cancel(self._screen_lock_after)
+                except Exception:
+                    pass
+                self._screen_lock_after = None
+            try:
+                self.attributes("-fullscreen", False)
+            except Exception:
+                pass
+            try:
+                self.attributes("-topmost", False)
+            except Exception:
+                pass
+            if getattr(self, "_lock_close_cb", None):
+                try:
+                    self.protocol("WM_DELETE_WINDOW", self._lock_close_cb)
+                except Exception:
+                    pass
+                self._lock_close_cb = None
+        except Exception:
+            pass
 
-        # ---- 校验按钮 ----
-        self.tk_button_verify = ttk.Button(inner, text="开始校验", takefocus=False,
-                                            bootstyle="success", width=16)
-        self.tk_button_verify.pack(anchor=W, pady=(10, 12))
+    # ==================== 总结页渲染方法 ====================
 
-        # ---- 校验进度 ----
-        self.tk_label_verify_progress = _tk.Label(inner, text="",
-                                                   font=("Microsoft YaHei UI", 9),
-                                                   fg=C_TEXT_SEC, bg=C_WHITE,
-                                                   wraplength=700, justify=LEFT)
-        self.tk_label_verify_progress.pack(anchor=W, pady=(0, 4))
+    def render_import_details(self, details):
+        """总结页: 渲染配置导入明细 (主线程调用)
+        details: None=导入中 / "manual"=等待手动导入 / [] =未检测到 / list=明细"""
+        items = getattr(self, "tk_summary_import_items", None)
+        if items is None:
+            return
+        items.config(state="normal")
+        items.delete("1.0", "end")
+        items.tag_configure("ok", foreground="#1E8449")
+        items.tag_configure("fail", foreground="#C0392B")
+        items.tag_configure("skip", foreground=C_TEXT_SEC)
+        if details is None:
+            items.insert("end", "系统配置自动导入中...\n", "skip")
+        elif details == "manual":
+            items.insert("end", "等待手动导入：请选择配置文件夹后点击「导入配置」\n", "skip")
+        elif not details:
+            items.insert("end", "未检测到系统配置备份，未执行导入\n", "skip")
+        else:
+            for label, status, msg in details:
+                if status == "成功":
+                    items.insert("end", f"[OK]  {label} — 导入成功\n", "ok")
+                elif status == "失败":
+                    items.insert("end", f"[!!]  {label} — 导入失败", "fail")
+                    if msg:
+                        items.insert("end", f"（{msg}）", "fail")
+                    items.insert("end", "\n", "fail")
+                else:
+                    items.insert("end", f"[--]  {label} — 跳过（{msg or '无备份文件'}）\n", "skip")
+        items.config(state="disabled")
 
-        self.tk_verify_progress_bar = ttk.Progressbar(inner, mode="determinate",
-                                                       maximum=100, value=0,
-                                                       bootstyle="info")
-        self.tk_verify_progress_bar.pack(fill=X, pady=(2, 10))
+    def render_verify_stats(self, stats, report_zip=""):
+        """总结页: 渲染校验结果统计与查看报告按钮 (主线程调用)"""
+        label = getattr(self, "tk_summary_verify_label", None)
+        if label is not None and stats:
+            passed, failed, skipped, total = stats
+            if failed > 0:
+                label.config(text=f"总计 {total} 个文件，通过 {passed} 个，失败 {failed} 个",
+                             fg="#C0392B")
+            elif total > 0:
+                label.config(text=f"总计 {total} 个文件，通过 {passed} 个",
+                             fg="#1E8449")
+            else:
+                label.config(text="尚未执行数据校验", fg=C_TEXT_SEC)
+        btn = getattr(self, "tk_button_view_report", None)
+        if btn is not None:
+            try:
+                import os as _os
+                if report_zip and _os.path.isfile(report_zip):
+                    btn.config(state="normal")
+                else:
+                    btn.config(state="disabled")
+            except Exception:
+                btn.config(state="disabled")
 
-        # ---- 校验日志 ----
-        log_header = _tk.Frame(inner, bg=C_WHITE)
-        log_header.pack(fill=X, pady=(4, 2))
-        _tk.Label(log_header, text="校验日志",
-                  font=("Microsoft YaHei UI", 9, "bold"),
-                  fg=C_TEXT, bg=C_WHITE).pack(side=LEFT)
+    def render_fail_list(self, fail_list):
+        """总结页: 渲染校验失败文件列表 (主线程调用)"""
+        tree = getattr(self, "tk_summary_fail_tree", None)
+        if tree is None:
+            return
+        for iid in tree.get_children():
+            tree.delete(iid)
+        for path, reason in fail_list or []:
+            tree.insert("", "end", values=(path, reason))
+        flabel = getattr(self, "tk_summary_fail_label", None)
+        if flabel is not None:
+            flabel.config(text=f"校验失败文件 ({len(fail_list or [])})")
 
-        self.tk_text_verify_log = _tk.Text(inner, wrap=WORD, font=("Consolas", 8),
-                                            bg=C_CONSOLE_BG, fg=C_CONSOLE_FG,
-                                            bd=1, relief=SOLID,
-                                            insertbackground=C_CONSOLE_FG,
-                                            selectbackground="#404040",
-                                            height=10)
-        self.tk_text_verify_log.pack(fill=BOTH, expand=True)
-
-        scroll = ttk.Scrollbar(self.tk_text_verify_log, orient=VERTICAL,
-                               bootstyle="dark-round")
-        scroll.config(command=self.tk_text_verify_log.yview)
-        self.tk_text_verify_log.configure(yscrollcommand=scroll.set)
-        self.tk_text_verify_log.configure(state=DISABLED)
+    # ==================== 步骤 6: 文件校验 ====================
 
     # ==================== 导出状态表格方法 ====================
 
@@ -1385,13 +1628,13 @@ class WinGUI(ttk.Window):
         pass
 
     def show_manual_ip(self):
-        if hasattr(self, 'tk_check_advanced'):
-            if not self.tk_check_advanced.winfo_ismapped():
-                self.tk_check_advanced.pack(anchor=W, pady=(12, 0))
+        if hasattr(self, '_target_opt_row'):
+            if not self._target_opt_row.winfo_ismapped():
+                self._target_opt_row.pack(anchor=W, pady=(12, 0))
 
     def hide_manual_ip(self):
-        if hasattr(self, 'tk_check_advanced'):
-            self.tk_check_advanced.pack_forget()
+        if hasattr(self, '_target_opt_row'):
+            self._target_opt_row.pack_forget()
         if hasattr(self, '_advanced_frame'):
             self._advanced_frame.pack_forget()
 

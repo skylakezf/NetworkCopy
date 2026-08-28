@@ -68,11 +68,23 @@ def main():
         content = f.read().strip()
     print("pre_verified 内容:")
     print(content)
-    paths = set(content.splitlines())
+    paths = set()
+    sizes = {}
+    for ln in content.splitlines():
+        if "|" in ln:
+            p, _, s = ln.rpartition("|")
+            paths.add(p)
+            sizes[p] = s
+        else:
+            paths.add(ln)  # 兼容旧格式(纯路径)
     assert "D:\\a.txt" in paths, "a.txt 应记入确认清单"
     assert "D:\\sub\\b.bin" in paths, "b.bin 应记入确认清单"
     assert "D:\\empty.txt" in paths, "空文件也应记入确认清单"
     assert len(paths) == 3, f"应有 3 个确认文件, 实际 {len(paths)}"
+    # 确认清单应携带文件大小 (供校验阶段大小复核)
+    assert sizes.get("D:\\a.txt") == "7", "确认清单应记录 a.txt 的大小(7字节)"
+    assert sizes.get("D:\\sub\\b.bin") == "1000", f"确认清单应记录 b.bin 的大小(1000字节), 实际 {sizes.get('D:\\sub\\b.bin')}"
+    assert sizes.get("D:\\empty.txt") == "0", "确认清单应记录空文件大小 0"
 
     # ---- verify_progress_callback 回调断言 ----
     assert verify_prog, "verify_progress_callback 应被调用"
@@ -107,7 +119,12 @@ def main():
     assert "所有文件已存在，无需下载" in second_logs, "全量跳过应走 early return"
     assert pre_verified_out2[0] and os.path.isfile(pre_verified_out2[0]), "early return 也应保存确认清单"
     with open(pre_verified_out2[0], "r", encoding="utf-8") as f:
-        paths2 = set(f.read().strip().splitlines())
+        paths2 = set()
+        for ln in f.read().strip().splitlines():
+            if "|" in ln:
+                paths2.add(ln.rpartition("|")[0])
+            else:
+                paths2.add(ln)
     assert "D:\\a.txt" in paths2 and "D:\\sub\\b.bin" in paths2, "断点续传跳过文件也应记入确认清单"
     print("断点续传跳过文件记入确认清单 OK")
 

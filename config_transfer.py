@@ -246,21 +246,34 @@ def import_config(config_folder, log_callback=None):
     """从指定配置文件夹导入系统配置
 
     导入内容: Outlook 注册表、Chrome/Edge 收藏夹、输入法设置、打印机信息
-    返回: (success: bool)
+    返回: (success: bool, details: list[(label, status, msg)])
+        status: "成功" / "失败" / "跳过"
     """
     if log_callback is None:
         log_callback = print
 
     if not os.path.isdir(config_folder):
         log_callback(f"配置文件夹不存在: {config_folder}")
-        return False
+        return False, []
 
     log_callback(f"开始导入配置: {config_folder}")
     log_callback("")
 
-    results = []
+    details = []
+    fail_count = 0
 
-    # 1. 导入 Outlook 邮件规则
+    def _record(label, ok, skipped=False, msg=""):
+        nonlocal fail_count
+        if skipped:
+            status = "跳过"
+        elif ok:
+            status = "成功"
+        else:
+            status = "失败"
+            fail_count += 1
+        details.append((label, status, msg))
+
+    # 1. 导入 Outlook 邮件规则/配置文件/自动存档
     for name, label in [
         ("Outlook_Rules.reg", "Outlook 邮件规则"),
         ("Outlook_Profiles.reg", "Outlook 配置文件"),
@@ -268,33 +281,35 @@ def import_config(config_folder, log_callback=None):
     ]:
         reg_path = os.path.join(config_folder, name)
         if os.path.exists(reg_path):
-            results.append(_import_reg(reg_path, label, log_callback))
+            _record(label, _import_reg(reg_path, label, log_callback))
         else:
-            log_callback(f"跳过 {label}: 备份文件不存在")
+            _record(label, False, skipped=True, msg="备份文件不存在")
 
     # 2. 导入 Chrome 收藏夹
-    results.append(_import_chrome_bookmarks(config_folder, log_callback))
+    _record("Chrome 收藏夹", _import_chrome_bookmarks(config_folder, log_callback))
 
     # 3. 导入 Edge 收藏夹
-    results.append(_import_edge_bookmarks(config_folder, log_callback))
+    _record("Edge 收藏夹", _import_edge_bookmarks(config_folder, log_callback))
 
     # 4. 导入输入法设置
     reg_path = os.path.join(config_folder, "InputMethod.reg")
     if os.path.exists(reg_path):
-        results.append(_import_reg(reg_path, "输入法设置", log_callback))
+        _record("输入法设置", _import_reg(reg_path, "输入法设置", log_callback))
     else:
-        log_callback("跳过 输入法设置: 备份文件不存在")
+        _record("输入法设置", False, skipped=True, msg="备份文件不存在")
 
     # 5. 显示打印机信息 (导入需手动)
     printers_file = os.path.join(config_folder, "Printers.csv")
     if os.path.exists(printers_file):
-        results.append(_import_printers(printers_file, log_callback))
+        _record("打印机列表", _import_printers(printers_file, log_callback))
+    else:
+        _record("打印机列表", False, skipped=True, msg="备份文件不存在")
 
-    success_count = sum(1 for r in results if r)
-    fail_count = sum(1 for r in results if not r)
-    log_callback(f"\n导入完成: 成功 {success_count} 项, 失败 {fail_count} 项")
+    success_count = sum(1 for _, s, _ in details if s == "成功")
+    skip_count = sum(1 for _, s, _ in details if s == "跳过")
+    log_callback(f"\n导入完成: 成功 {success_count} 项, 失败 {fail_count} 项, 跳过 {skip_count} 项")
 
-    return fail_count == 0
+    return fail_count == 0, details
 
 
 # ==================== 配置文件夹查找 ====================

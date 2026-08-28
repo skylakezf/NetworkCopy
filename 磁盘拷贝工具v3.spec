@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_data_files
 
-datas = [('certs', 'certs')]
+datas = [('certs', 'certs'), ('eula.html', '.')]
 datas += collect_data_files('cryptography')
 datas += collect_data_files('ttkbootstrap')
 

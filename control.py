@@ -7,6 +7,7 @@ import time
 import socket
 import subprocess
 import os
+import queue
 from typing import Literal
 from tkinter import simpledialog
 import tkinter as tk
@@ -18,6 +19,22 @@ from ip_config import SOURCE_IP, SUBNET_MASK  # 169.254.100.1 (目标设备自�
 import tls_utils
 import config_transfer
 DHCP_ASSIGNED_IP = "169.254.100.2"  # DHCP 分配给源设备的 IP
+
+# ==================== 用户协议 (EULA) ====================
+EULA_URL = "http://qitv1113.gtmcl.com:3000/eula.html"  # 应用启动后用默认浏览器打开
+
+# Tk 非线程安全: 后台线程对 widget 的任何写操作必须经此锁串行化,
+# 否则多个线程并发调用 insert/after 会竞争 Tcl 内部锁导致界面死锁 (测试环境曾复现卡死)
+_TK_LOCK = threading.Lock()
+
+
+def _open_eula_url_silent(url: str):
+    """后台线程: 用默认浏览器打开 URL, 任何异常都静默吞掉 (daemon 线程不报错)"""
+    try:
+        import webbrowser
+        webbrowser.open(url)
+    except Exception:
+        pass
 
 
 def _nic_priority_key(nic):
@@ -113,14 +130,118 @@ class Controller:
         self._config_import_done = False    # 配置导入是否已完成 (完成后禁用"跳过")
         self._send_skip_verify_done = False  # 关闭程序时是否已发送跳过校验信息
 
+        # ---- 线程安全 UI 调度 ----
+        # 本环境 (嵌入式 Python 3.13) 的 tkinter 禁止后台线程调用任何 tk 接口
+        # (直接调 ui.after 会抛 RuntimeError, 打包环境下可能触发 Tcl 致命崩溃)。
+        # 因此后台线程一律把 UI 操作放入 _ui_q 队列, 由主线程 _poll_ui_q 轮询执行。
+        self._main_thread = threading.current_thread()
+        self._ui_q = queue.Queue()
+
+    def _post_ui(self, fn, *args, **kwargs):
+        """线程安全 UI 调度: 主线程直接执行; 后台线程放入队列,
+        由主线程 _poll_ui_q 轮询执行 (Tk 非线程安全, 必须只在主线程操作 widget)。"""
+        if threading.current_thread() is self._main_thread:
+            try:
+                fn(*args, **kwargs)
+            except Exception:
+                pass
+        else:
+            try:
+                self._ui_q.put((fn, args, kwargs))
+            except Exception:
+                pass
+
+    def _ui_after(self, ms, callback):
+        """线程安全调度一次性延时任务 (供后台线程使用):
+        主线程直接调用 self.ui.after 并返回 after id;
+        后台线程入队, 由主线程轮询调度 (返回 None, 无法取消)。
+        需要 after id 做 after_cancel 的周期任务, 应让主线程方法
+        自行注册 (如 _dhcp_tick), 后台线程经 _post_ui 转主线程启动。"""
+        if threading.current_thread() is self._main_thread:
+            return self.ui.after(ms, callback)
+        try:
+            self._ui_q.put(("_after", ms, callback))
+        except Exception:
+            pass
+        return None
+
+    def _poll_ui_q(self):
+        """主线程轮询执行后台线程提交的 UI 动作 (常驻 50ms 自轮询)。
+        destroy 后 self.ui.after 抛 TclError 被吞, 不影响进程退出。"""
+        try:
+            while True:
+                try:
+                    item = self._ui_q.get_nowait()
+                except Exception:
+                    break
+                try:
+                    if item[0] == "_after":
+                        self.ui.after(item[1], item[2])
+                    else:
+                        item[0](*item[1], **item[2])
+                except Exception:
+                    pass
+            self.ui.after(50, self._poll_ui_q)
+        except Exception:
+            pass
+
     # ==================== 初始化 ====================
 
     def init(self, ui):
         self.ui = ui
+        self._main_thread = threading.current_thread()
         self._install_thread_excepthook()
         self._setup_events()
         self._setup_ui_defaults()
         self._populate_nics()
+        self._open_eula_browser()
+        # 启动主线程 UI 动作轮询 (后台线程经 _post_ui 入队, 主线程在此执行)
+        self.ui.after(50, self._poll_ui_q)
+
+    def _open_eula_browser(self):
+        """应用启动后用默认浏览器打开《用户协议》页面。
+        在后台线程执行, 避免浏览器启动或系统调用无响应时阻塞主线程导致界面卡死;
+        远程 EULA 站点不可达时回退到打包内的 eula.html; 无浏览器时静默失败;
+        测试环境可用 NETCOPY_SKIP_EULA_BROWSER=1 关闭。"""
+        try:
+            if os.environ.get("NETCOPY_SKIP_EULA_BROWSER"):
+                return
+            threading.Thread(
+                target=self._open_eula_with_fallback,
+                daemon=True,
+                name="eula-browser",
+            ).start()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _open_eula_with_fallback():
+        """后台线程: 先探活远程 EULA 地址, 不可达时打开打包内的 eula.html"""
+        try:
+            import urllib.request
+            try:
+                req = urllib.request.Request(EULA_URL, method="HEAD")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if resp.status == 200:
+                        _open_eula_url_silent(EULA_URL)
+                        return
+            except Exception:
+                pass
+            # 回退: PyInstaller 打包的 eula.html (--add-data "eula.html;.")
+            candidates = [
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "eula.html"),
+                os.path.join(os.getcwd(), "eula.html"),
+            ]
+            for local in candidates:
+                if os.path.exists(local):
+                    _open_eula_url_silent("file:///" + local.replace("\\", "/"))
+                    return
+        except Exception:
+            pass
+
+    def _on_eula_toggle(self, agreed: bool):
+        """协议确认勾选状态 (发送方/接收方按钮的激活由 ui 直接处理)"""
+        pass
 
     def _install_thread_excepthook(self):
         """捕获所有后台线程的未处理异常并输出到日志。
@@ -132,7 +253,8 @@ class Controller:
             try:
                 msg = "".join(_tb.format_exception(
                     args.exc_type, args.exc_value, args.exc_traceback))
-                self.ui.after(0, lambda: self._log(f"[诊断] 后台线程异常:\n{msg}"))
+                # _log 线程安全: 后台线程调用自动入队, 由主线程渲染到日志区
+                self._log(f"[诊断] 后台线程异常:\n{msg}")
             except Exception:
                 pass
 
@@ -179,14 +301,11 @@ class Controller:
         )
         # 开始按钮
         self.ui.tk_button_mqfzl35t.config(command=self._on_start_button)
+        # 查看校验报告按钮 (校验完成后显示, 定位到报告文件)
+        if hasattr(self.ui, 'tk_button_open_report'):
+            self.ui.tk_button_open_report.config(command=self._on_open_report)
         # 开启 DHCP 按钮 (标签为"寻找旧电脑")
         self.ui.tk_button_dhcp.config(command=self._on_dhcp_button)
-        # CSV 浏览
-        if hasattr(self.ui, 'tk_button_browse_csv'):
-            self.ui.tk_button_browse_csv.config(command=self._on_browse_csv)
-        # 校验按钮 (步骤 5)
-        if hasattr(self.ui, 'tk_button_verify'):
-            self.ui.tk_button_verify.config(command=self._on_verify_start)
         # 导出系统配置按钮 (步骤 1, 发送端)
         if hasattr(self.ui, 'tk_button_export_config'):
             self.ui.tk_button_export_config.config(command=self._on_export_config)
@@ -197,17 +316,26 @@ class Controller:
             self.ui.tk_button_skip_import.config(command=self._on_skip_import)
         if hasattr(self.ui, 'tk_button_browse_config'):
             self.ui.tk_button_browse_config.config(command=self._on_browse_config_folder)
+        # 总结页: 查看校验报告按钮
+        if hasattr(self.ui, 'tk_button_view_report'):
+            self.ui.tk_button_view_report.config(command=self._on_open_report)
         # 步骤 4 配置检测按钮 (接收端传输完成后)
         if hasattr(self.ui, 'tk_button_use_config'):
             self.ui.tk_button_use_config.config(command=self._on_use_detected_config)
         if hasattr(self.ui, 'tk_button_skip_config'):
             self.ui.tk_button_skip_config.config(command=self._on_skip_detected_config)
+        # 发送端完成页"完成并关闭"按钮 (step 5)
+        if hasattr(self.ui, 'tk_button_source_done'):
+            self.ui.tk_button_source_done.config(command=self._on_source_done_close)
+        # 接收端总结页"完成并关闭"按钮 (step 4)
+        if hasattr(self.ui, 'tk_button_summary_done'):
+            self.ui.tk_button_summary_done.config(command=self._on_summary_done)
         # 发现设备列表
         if hasattr(self.ui, 'tk_select_box_discover'):
             self.ui.tk_select_box_discover.bind("<<ComboboxSelected>>", self._on_discover_selected)
-        # 运行环境
+        # 运行环境: WinPE → 扫描磁盘; 正常系统 → 盘符一一对应
         if hasattr(self.ui, 'winpe_var'):
-            self.ui.winpe_var.trace_add("write", lambda *_: self._populate_disks())
+            self.ui.winpe_var.trace_add("write", self._on_winpe_changed)
         # 验证码输入 (大写自动转)
         if hasattr(self.ui, 'tk_entry_code'):
             self.ui.tk_entry_code.bind("<KeyRelease>", self._on_auth_code_changed)
@@ -215,7 +343,9 @@ class Controller:
     # ==================== 网卡扫描 ====================
 
     def _populate_nics(self):
-        """扫描网卡并自动选择最佳有线网卡 (无需用户手动选择)"""
+        """扫描网卡并自动选择最佳有线网卡 (无需用户手动选择)。
+        后台线程只做扫描, 所有 Tk 操作统一调度回主线程执行 (Tk 非线程安全)。
+        窗口已销毁时 after 回调会抛 TclError 并被吞掉, 不会造成并发死锁。"""
         self._log("正在检测有线网卡...")
 
         def _scan():
@@ -223,14 +353,23 @@ class Controller:
                 nics = scan_nics()
                 # NIC 优先级排序: USB > 169.254 > 内置网卡
                 nics = sorted(nics, key=_nic_priority_key)
-                self._nic_list = nics
-                # 自动选择最佳有线网卡
-                self._auto_select_wired_nic()
+                err = None
             except Exception as e:
-                self._log(f"网卡检测失败: {e}")
-                self.ui.after(0, lambda: self.ui.update_auto_nic_display("", "", "", 0))
+                nics = None
+                err = str(e)
+            # 后台线程禁止直接调 tk: 经 _post_ui 转主线程执行
+            self._post_ui(self._apply_nic_scan_result, nics, err)
 
         threading.Thread(target=_scan, daemon=True).start()
+
+    def _apply_nic_scan_result(self, nics, err):
+        """主线程: 应用网卡扫描结果 (仅在主线程执行, 避免跨线程 Tk 死锁)"""
+        if err is not None:
+            self._log(f"网卡检测失败: {err}")
+            self.ui.update_auto_nic_display("", "", "", 0)
+            return
+        self._nic_list = nics
+        self._auto_select_wired_nic()
 
     # ==================== 自动网卡选择 ====================
 
@@ -271,15 +410,30 @@ class Controller:
             return self._auto_nic[1]
         return ""
 
-    def _eval_step2_next(self):
-        """评估步骤 2 的「下一步」按钮状态（磁盘扫描完成后的回调）"""
-        if self.ui._step != 2:
-            return
-        disk = self.ui.tk_select_box_mqfzmzbe.get()
-        if disk and disk not in ("未检测到磁盘", "", "请先选择设备类型", "扫描中..."):
-            self.ui.set_button_next("normal")
-        else:
-            self.ui.set_button_next("disabled")
+    def _ensure_normal_mapping(self):
+        """正常系统下: 盘符一一对应 (D→D:, E→E:, F→F:), 无需用户映射。
+        仅保留当前系统中实际存在的盘符。"""
+        mapping = {}
+        for letter in ("D", "E", "F"):
+            try:
+                if os.path.isdir(letter + ":\\"):
+                    mapping[letter] = letter + ":\\"
+            except Exception:
+                pass
+        self._partition_map = mapping
+        if mapping:
+            self._log(f"正常系统模式: 盘符自动一一对应 {mapping}")
+
+    def _on_winpe_changed(self, *args):
+        """运行环境切换: WinPE → 扫描物理磁盘; 正常系统 → 盘符一一对应"""
+        try:
+            if self.ui.winpe_var.get() == "winpe":
+                self._populate_disks()
+            else:
+                self._ensure_normal_mapping()
+                self._check_button_state()
+        except Exception:
+            pass
 
     # ==================== 事件处理 ====================
 
@@ -334,11 +488,7 @@ class Controller:
     def _on_prev_step(self):
         """上一步"""
         current = self.ui._step
-        # 发送方从步骤 6 返回时跳过步骤 5 (导入配置仅接收方使用)
-        if current == 6 and self._device_type == "源设备":
-            new_step = 4
-        else:
-            new_step = max(0, current - 1)
+        new_step = max(0, current - 1)
         self.ui.go_step(new_step)
 
         if new_step == 0:
@@ -350,25 +500,10 @@ class Controller:
 
             # 同步"下一步"按钮状态
             if new_step == 1:
-                # 网卡检测页: 网卡为全自动检测, 角色已选即可进入下一步
+                # 高级设置页: 网卡为全自动检测, 角色已选即可进入下一步
+                # (磁盘选择/映射已移入高级选项面板, 不阻塞主流程)
                 self.ui.set_button_next("normal")
             elif new_step == 2:
-                # 磁盘映射页: 尝试自动选择 → 若仍无效则触发扫描
-                disk = self.ui.tk_select_box_mqfzmzbe.get()
-                if disk and disk not in ("未检测到磁盘", "", "请先选择设备类型", "扫描中..."):
-                    self.ui.set_button_next("normal")
-                else:
-                    # 尝试从已缓存的结果中自动选择
-                    self._try_auto_select_disk()
-                    # 再次检查: 若仍无效，触发磁盘扫描
-                    disk = self.ui.tk_select_box_mqfzmzbe.get()
-                    if disk and disk not in ("未检测到磁盘", "", "请先选择设备类型", "扫描中..."):
-                        self.ui.set_button_next("normal")
-                    elif disk in ("请先选择设备类型", "扫描中...", ""):
-                        self._populate_disks(callback=self._eval_step2_next)
-                    else:
-                        self.ui.set_button_next("disabled")
-            elif new_step == 3:
                 # 连接页面: 禁用"下一步", 使用"开始传输/重新接收"
                 self.ui.set_button_next("disabled")
                 # 网络断开/传输失败后回到验证码页: 激活"重新接收"按钮
@@ -378,22 +513,20 @@ class Controller:
                         self.ui.tk_button_mqfzl35t.config(text="重新接收", state="normal")
                     except Exception:
                         pass
-            elif new_step == 4:
-                # 传输页面: 若传输已完成(接收方), 启用"导入配置 >"
+            elif new_step == 3:
+                # 传输页面: 传输完成(接收方)后可进入"传输总结"; 发送方传输完成即结束
                 if self._transfer_done:
                     if self._device_type == "目标设备":
-                        self.ui.set_button_next("normal", text="导入配置 >")
+                        self.ui.set_button_next("normal", text="查看总结 >")
                     else:
-                        self.ui.set_button_next("normal", text="校验文件 >")
+                        self.ui.set_button_next("disabled")
                 else:
                     self.ui.set_button_next("disabled")
-            elif new_step == 5:
-                # 导入配置页面: 启用"校验文件 >"
-                self.ui.set_button_next("normal", text="校验文件 >")
+            elif new_step == 4:
+                # 传输总结页 (最后一步): 下一步 = 完成
+                self.ui.set_button_next("normal", text="完成")
                 self._populate_config_folders()
-            elif new_step == 6:
-                # 校验页面: 下一步 = 跳过校验
-                self.ui.set_button_next("normal", text="跳过校验 >")
+                self._render_summary()
             else:
                 self.ui.set_button_next("normal")
 
@@ -422,59 +555,53 @@ class Controller:
             ):
                 return
 
-        # 步骤 6 (校验页): 下一步 = 跳过文件校验 → 创建空校验报告并上传
-        if current == 6:
-            self._on_skip_verify()
+        # 总结页 (最后一步): 点击"完成"结束向导
+        if current == 4 and self._device_type == "目标设备":
+            self._on_summary_done()
             return
 
-        # 特殊: 步骤 4 接收端已检测到配置文件 → "下一步" = 使用此配置
-        if current == 4 and self._device_type == "目标设备":
-            if hasattr(self, '_detected_config_path') and self._detected_config_path:
-                self._on_use_detected_config()
+        # 发送端完成页 (step 5): 点击"完成"结束程序
+        if current == 5:
+            self._on_source_done_close()
+            return
+
+        # 特殊: 步骤 3 接收端传输完成后 → "下一步" = 进入传输总结页
+        if current == 3 and self._device_type == "目标设备":
+            if getattr(self, "_transfer_done", False):
+                self._summary_entered = True
+                self.ui.go_step(4)
+                self._render_summary()
                 return
 
-        # 发送方从步骤 4 跳过步骤 5 (导入配置仅接收方使用)
-        if current == 4 and self._device_type == "源设备":
-            new_step = 6
-        else:
-            new_step = min(self.ui._total_steps - 1, current + 1)
+        new_step = min(self.ui._total_steps - 1, current + 1)
         self.ui.go_step(new_step)
         self.ui.tk_button_prev.config(state="normal")
 
         if new_step == 2:
-            # 进入步骤 2 (磁盘映射):
-            #   1) 先尝试从缓存结果中自动选择
-            #   2) 若仍无效, 触发磁盘扫描
-            self._try_auto_select_disk()
-            disk = self.ui.tk_select_box_mqfzmzbe.get()
-            if disk and disk not in ("未检测到磁盘", "", "请先选择设备类型", "扫描中..."):
-                self.ui.set_button_next("normal")
-            else:
-                self.ui.set_button_next("disabled")
-            # 若无有效磁盘, 触发扫描
-            if disk in ("请先选择设备类型", "扫描中...", ""):
-                self._populate_disks(callback=self._eval_step2_next)
-        elif new_step == 3:
-            # 步骤 3 (连接页面): 触发磁盘选定以完成分区检测和盘符填充
-            self._on_disk_selected()
-            # 禁用"下一步", 用户应点击"开始传输"而非"下一步"
+            # 进入连接页面: PE 下确保磁盘/映射就绪; 正常系统下盘符自动一一对应
             self.ui.set_button_next("disabled")
-        elif new_step == 5:
-            # 步骤 5 (导入配置页面): 启用"校验文件 >", 指向步骤 6
-            self.ui.set_button_next("normal", text="校验文件 >")
-            self._populate_config_folders()
-        elif new_step == 6:
-            # 步骤 6 (校验页面): 下一步 = 跳过校验
-            self.ui.set_button_next("normal", text="跳过校验 >")
-        elif new_step == 4:
-            # 步骤 4 (传输页面): 传输完成前禁用"下一步"
+            try:
+                if self.ui.winpe_var.get() == "winpe":
+                    self._on_disk_selected()
+                else:
+                    self._ensure_normal_mapping()
+            except Exception:
+                pass
+        elif new_step == 3:
+            # 进入传输页面: 传输完成前禁用"下一步"
             if self._transfer_done:
                 if self._device_type == "目标设备":
-                    self.ui.set_button_next("normal", text="导入配置 >")
+                    self.ui.set_button_next("normal", text="查看总结 >")
                 else:
-                    self.ui.set_button_next("normal", text="校验文件 >")
+                    # 发送端: 传输完成即结束, 校验自动在后台进行
+                    self.ui.set_button_next("disabled")
             else:
                 self.ui.set_button_next("disabled")
+        elif new_step == 4:
+            # 传输总结页 (最后一步): 下一步 = 完成
+            self.ui.set_button_next("normal", text="完成")
+            self._populate_config_folders()
+            self._render_summary()
         elif new_step >= self.ui._total_steps - 1:
             self.ui.set_button_next("disabled")
         else:
@@ -549,9 +676,9 @@ class Controller:
         self._check_button_state()
 
         # 自动检测到有线网卡 → 预配置网络 (源设备走 DHCP / 目标设备仅记录)
-        adapter_desc = self._get_adapter_desc_from_auto()
-        if adapter_desc:
-            self._configure_ip(adapter_desc, dev_type)
+        # 网卡全自动检测, 无需选定具体网卡: 源设备自己枚举有线网卡续租,
+        # 接收端 DHCP 广播自行枚举所有有线网卡
+        self._configure_ip(dev_type)
 
         # 扫描磁盘
         self._populate_disks()
@@ -575,9 +702,9 @@ class Controller:
             self._auto_selected_disk = None
         self._log(f"已选择磁盘: {disk}")
 
-        # 磁盘已选择: 允许用户确认后进入下一步 — 用 set_button_next 确保 pack 状态正确
-        # 仅在步骤 2 时启用下一步, 防止 after 延迟回调在其他步骤中误启用按钮
-        if self.ui._step == 2:
+        # 磁盘已选择: 确保高级设置页(步骤 1)的下一步可用
+        # (正常系统下无需映射, 此步骤仅影响 PE 环境)
+        if self.ui._step == 1:
             self.ui.set_button_next("normal")
 
         # 立即填充盘符 (不依赖分区检测结果)
@@ -592,31 +719,26 @@ class Controller:
                 if disk_num >= 0:
                     ntfs_count = get_partition_count(disk_num)
                     self._ntfs_partition_count = ntfs_count
-                    self.ui.after(0, lambda: self._log(
-                        f"检测到 {ntfs_count} 个 NTFS 分区 (PhysicalDrive{disk_num})"
-                    ))
+                    self._log(f"检测到 {ntfs_count} 个 NTFS 分区 (PhysicalDrive{disk_num})")
 
                     # 获取物理顺序分区详情，自动填充 D/E/F
                     details = get_partition_details(disk_num)
                     if details:
                         ordered = [dl for _, _, dl in details]
-                        self.ui.after(0, lambda o=list(ordered): self._log(
-                            f"分区物理顺序→盘符: {o}"
-                        ))
+                        self._log(f"分区物理顺序→盘符: {ordered}")
                         # 自动填充: 按磁盘物理分区顺序映射到 D/E/F
-                        self.ui.after(0, lambda o=list(ordered), n=ntfs_count:
-                                      self._auto_fill_drive_mapping(o, n))
+                        self._post_ui(self._auto_fill_drive_mapping, ordered, ntfs_count)
                 else:
                     self._ntfs_partition_count = 0
             except Exception as e:
                 self._ntfs_partition_count = 0
                 import traceback
                 tb = traceback.format_exc()
-                self.ui.after(0, lambda: self._log(f"分区检测失败: {e}"))
-                self.ui.after(0, lambda t=tb: self._log(f"调试: {t}"))
+                self._log(f"分区检测失败: {e}")
+                self._log(f"调试: {tb}")
             finally:
                 # 无论检测成功与否, 都重新评估开始按钮状态
-                self.ui.after(0, self._check_button_state)
+                self._post_ui(self._check_button_state)
 
         threading.Thread(target=_detect_partitions, daemon=True).start()
 
@@ -664,7 +786,7 @@ class Controller:
                 f"模式={'手动IP(' + manual_ip + ')' if manual_ip else 'DHCP/扫描'}"
             )
 
-            # 先做参数校验, 通过后再切换到传输进度页面 (步骤 4)
+            # 先做参数校验, 通过后再切换到传输进度页面 (步骤 3)
             # 避免校验失败时用户已停在传输页却无反应
             if dev_type == "源设备":
                 # 源设备必须指定要对外提供(拷贝)的盘符, 否则服务器虽启动但无任何数据可传,
@@ -674,17 +796,22 @@ class Controller:
                               "服务器将无任何数据可拷贝。请先在下拉框选择要提供的盘符。")
                     return
             else:
-                # 目标设备需要完成分区映射才能下载
-                ntfs_count: int = self._ntfs_partition_count
-                required_keys = ("D", "E") if ntfs_count == 2 else ("D", "E", "F")
-                mapped = [k for k in required_keys if self._partition_map.get(k)]
-                if len(mapped) < len(required_keys):
-                    self._log(f"请先完成 {'/'.join(required_keys)} 盘符映射"
-                              f"(当前: {len(mapped)} 个)")
+                if self.ui.winpe_var.get() == "winpe":
+                    # PE 环境: 目标设备需要完成分区映射才能下载
+                    ntfs_count: int = self._ntfs_partition_count
+                    required_keys = ("D", "E") if ntfs_count == 2 else ("D", "E", "F")
+                    mapped = [k for k in required_keys if self._partition_map.get(k)]
+                    if len(mapped) < len(required_keys):
+                        self._log(f"请先完成 {'/'.join(required_keys)} 盘符映射"
+                                  f"(当前: {len(mapped)} 个)")
+                        return
+                elif not self._partition_map:
+                    # 正常系统: 盘符一一对应已自动生成, 无需手动映射
+                    self._log("错误: 目标设备未检测到可接收的分区 (D/E/F)")
                     return
 
-            # 校验通过, 切换到传输进度页面 (步骤 4)
-            self.ui.go_step(4)
+            # 校验通过, 切换到传输进度页面 (步骤 3)
+            self.ui.go_step(3)
 
             if dev_type == "源设备":
                 self._start_source_server(manual_ip=manual_ip)
@@ -710,7 +837,7 @@ class Controller:
             self.ui.tk_select_box_mqfzmzbe.set(valid_disks[0])
             self._auto_selected_disk = valid_disks[0]
             self._log(f"自动选择磁盘: {valid_disks[0]}")
-            if self.ui._step == 2:
+            if self.ui._step == 1:
                 self._on_disk_selected()
             return True
         return False
@@ -734,30 +861,29 @@ class Controller:
             try:
                 disks = get_disk_list()
                 self._disks_scanned = True
-                self.ui.after(0, lambda: self._update_combobox(
-                    self.ui.tk_select_box_mqfzmzbe,
-                    disks,
-                    f"检测到 {len(disks)} 个磁盘"
-                ))
+                # 后台线程禁止直接调 tk: 一律经 _post_ui / _log 转主线程
+                self._post_ui(self._update_combobox,
+                              self.ui.tk_select_box_mqfzmzbe, disks,
+                              f"检测到 {len(disks)} 个磁盘")
                 # 自动选择: 仅 1 个磁盘时自动选中并触发分区检测
                 if len(disks) == 1:
                     self._auto_selected_disk = disks[0]
-                    self.ui.after(0, lambda: (
+                    self._post_ui(lambda: (
                         self.ui.tk_select_box_mqfzmzbe.set(disks[0])
-                        if self.ui._step == 2 else None
+                        if self.ui._step == 1 else None
                     ))
-                    self.ui.after(50, lambda: (
+                    self._post_ui(lambda: (
                         self._on_disk_selected()
-                        if self.ui._step == 2 else None
+                        if self.ui._step == 1 else None
                     ))
                 # 扫描完成回调
                 if callback:
-                    self.ui.after(100, callback)
+                    self._post_ui(callback)
             except Exception as e:
                 self._disks_scanned = False  # 失败允许重试
-                self.ui.after(0, lambda: self._log(f"磁盘扫描失败: {e}"))
+                self._log(f"磁盘扫描失败: {e}")
                 if callback:
-                    self.ui.after(100, callback)
+                    self._post_ui(callback)
 
         threading.Thread(target=_scan, daemon=True).start()
 
@@ -820,7 +946,15 @@ class Controller:
         self._update_partition_map()
 
     def _update_partition_map(self):
-        """从三个 Combobox 读取分区映射"""
+        """更新分区盘符映射。
+        正常系统下盘符一一对应 (D→D 等, 无需用户映射);
+        仅 WinPE 环境从三个 Combobox 读取用户映射。"""
+        try:
+            if self.ui.winpe_var.get() != "winpe":
+                self._ensure_normal_mapping()
+                return
+        except Exception:
+            pass
         d_letter = self.ui.tk_select_box_mqfzsdz4.get().strip()
         e_letter = self.ui.tk_select_box_mqfzuo2y.get().strip()
         f_letter = self.ui.tk_select_box_mqfzwehm.get().strip()
@@ -839,13 +973,13 @@ class Controller:
         """根据设备类型、当前步骤及传输状态启用/禁用「开始传输」按钮。
 
         网卡已改为全自动检测, 按钮状态不再依赖网卡选择。
-        仅在步骤 3 (连接页面) 才显示并启用开始传输按钮，
-        且传输进行中不重新启用, 防止用户在步骤 2 自动填充后误点跳过连接步骤。
+        仅在步骤 2 (连接页面) 才显示并启用开始传输按钮，
+        且传输进行中不重新启用, 防止用户误点跳过连接步骤。
         """
         dev_type = self._device_type
         current_step = getattr(self.ui, '_step', 0)
         if (dev_type in ("源设备", "目标设备")
-                and current_step >= 3 and not self._transferring):
+                and current_step >= 2 and not self._transferring):
             self.ui.tk_button_mqfzl35t.config(state="normal")
         else:
             self.ui.tk_button_mqfzl35t.config(state="disabled")
@@ -857,21 +991,19 @@ class Controller:
     #   目标设备: 设自身 IP → 启动 DHCP 服务器 → 等源设备获取 IP → 直连源设备
     #
 
-    def _configure_ip(self, adapter_desc: str, device_type: str):
-        """根据设备类型配置网络"""
+    def _configure_ip(self, device_type: str):
+        """根据设备类型配置网络 (网卡全自动检测, 无需指定网卡)"""
         self._use_dhcp = False
         self._source_ip = ""
 
         if "源" in str(device_type):
             # 源设备: 在所有有线网卡上释放并重新获取 IP (从目标 DHCP 获取)
-            self.ui.after(0, lambda: self._log("源设备: 正在在所有有线网卡上获取 IP..."))
+            self._log("源设备: 正在在所有有线网卡上获取 IP...")
             threading.Thread(target=self._setup_source_network, daemon=True).start()
         else:
             # 目标设备: 不自动启动 DHCP, 等待用户点击「寻找旧电脑」
-            self.ui.after(0, lambda: self._log(
-                "目标设备: 请进入连接页面后点击「寻找旧电脑」启动 DHCP 服务器，"
-                "待源设备分配到 IP 后点击「开始接收」"
-            ))
+            self._log("目标设备: 请进入连接页面后点击「寻找旧电脑」启动 DHCP 服务器，"
+                      "待源设备分配到 IP 后点击「开始接收」")
 
     def _setup_source_network(self):
         """源设备: 在所有有线网卡上释放+续租 DHCP，从目标 DHCP 获取 IP。
@@ -882,12 +1014,12 @@ class Controller:
         try:
             wired_nics = get_wired_adapters()
             if not wired_nics:
-                self.ui.after(0, lambda: self._log("错误: 未找到有线网卡"))
+                self._log("错误: 未找到有线网卡")
                 return
 
             # 后台线程: 释放所有有线网卡旧租约, 再逐个续租
-            self.ui.after(0, lambda: self._log("释放所有有线网卡 DHCP 租约..."))
-            self.ui.after(0, lambda: self._log("请求所有有线网卡 DHCP 续租..."))
+            self._log("释放所有有线网卡 DHCP 租约...")
+            self._log("请求所有有线网卡 DHCP 续租...")
 
             def _do_dhcp():
                 for nic in wired_nics:
@@ -921,11 +1053,40 @@ class Controller:
 
             if ip and ip != "0.0.0.0":
                 self._source_ip = ip
-                self.ui.after(0, lambda: self._log(f"源设备 IP: {ip}"))
+                self._log(f"源设备 IP: {ip}")
             else:
-                self.ui.after(0, lambda: self._log("源设备: 等待 IP (将使用 APIPA)"))
+                self._log("源设备: 首次续租未命中, 周期重试 DHCP 续租 (约 60 秒窗口)..., 将使用 APIPA 兜底")
+                # 周期强制 renew: 每次 renew 都会发出 DHCP DISCOVER, 显著提高
+                # 接收端 DHCP 服务器稍后启动 (后插线/后点寻找) 场景的发现成功率
+                retry_deadline = time.time() + 60
+                while time.time() < retry_deadline:
+                    for nic in wired_nics:
+                        idx = nic[4]
+                        if idx > 0:
+                            try:
+                                renew_dhcp_ip(idx)
+                            except Exception:
+                                pass
+                    # 观察 10 秒: renew 期间或之后网卡是否拿到目标 IP
+                    obs_deadline = time.time() + 10
+                    while time.time() < obs_deadline:
+                        for nic in wired_nics:
+                            ip = get_local_ip(nic[1])
+                            if ip and ip.startswith("169.254.100."):
+                                break
+                        if ip and ip.startswith("169.254.100."):
+                            break
+                        time.sleep(1)
+                    if ip and ip.startswith("169.254.100."):
+                        break
+                    time.sleep(5)
+                if ip and ip.startswith("169.254.100."):
+                    self._source_ip = ip
+                    self._log(f"源设备 IP: {ip}")
+                else:
+                    self._log("源设备: 重试仍未获得目标 IP, 使用 APIPA 地址兜底 (两端 /16 网段仍可直连)")
         except Exception as e:
-            self.ui.after(0, lambda: self._log(f"源设备网络: {e}"))
+            self._log(f"源设备网络: {e}")
 
     # ==================== 手动 IP 辅助 ====================
 
@@ -957,22 +1118,20 @@ class Controller:
         from ip_config import set_ip_via_api, set_ip_via_netsh
         try:
             success, msg = set_ip_via_api(adapter_desc, ip, mask_str=SUBNET_MASK)
-            self.ui.after(0, lambda m=msg: self._log(m))
+            # _log 线程安全: 后台线程调用自动转主线程渲染
+            self._log(msg)
             if not success:
                 success2, msg2 = set_ip_via_netsh(adapter_desc, ip)
-                self.ui.after(0, lambda m=msg2: self._log(m))
+                self._log(msg2)
                 if success2:
-                    self.ui.after(0, lambda: self._log(
-                        f"源设备手动 IP 已生效: {ip} (掩码 {SUBNET_MASK})"))
+                    self._log(f"源设备手动 IP 已生效: {ip} (掩码 {SUBNET_MASK})")
                 else:
-                    self.ui.after(0, lambda: self._log(
-                        f"警告: 源设备手动 IP 设置失败 ({ip}), 网卡可能停留在 APIPA。\n"
-                        f"  由于两端掩码已统一为 {SUBNET_MASK}, 仍可直连通信。"))
+                    self._log(f"警告: 源设备手动 IP 设置失败 ({ip}), 网卡可能停留在 APIPA。\n"
+                              f"  由于两端掩码已统一为 {SUBNET_MASK}, 仍可直连通信。")
             else:
-                self.ui.after(0, lambda: self._log(
-                    f"源设备手动 IP 已生效: {ip} (掩码 {SUBNET_MASK})"))
+                self._log(f"源设备手动 IP 已生效: {ip} (掩码 {SUBNET_MASK})")
         except Exception as e:
-            self.ui.after(0, lambda: self._log(f"设置源设备手动 IP 失败: {e}"))
+            self._log(f"设置源设备手动 IP 失败: {e}")
 
     def _apply_target_manual_ip(self, adapter_desc, source_ip):
         """目标设备: 将本机网卡 IP 设为与源 IP 同网段 (源末位+1), 以便直连。
@@ -990,21 +1149,19 @@ class Controller:
         except Exception:
             target_ip = SOURCE_IP
         success, msg = set_ip_via_api(adapter_desc, target_ip)
-        self.ui.after(0, lambda m=msg: self._log(m))
+        # _log 线程安全: 后台线程调用自动转主线程渲染
+        self._log(msg)
         if not success:
             # API 失败 → 回退 netsh (set_ip_via_netsh 内部已用 GBK 解码且默认 /16 掩码)
             success2, msg2 = set_ip_via_netsh(adapter_desc, target_ip)
-            self.ui.after(0, lambda m=msg2: self._log(m))
+            self._log(msg2)
             if success2:
-                self.ui.after(0, lambda: self._log(
-                    f"目标手动 IP 已生效: {target_ip} (掩码 {SUBNET_MASK})"))
+                self._log(f"目标手动 IP 已生效: {target_ip} (掩码 {SUBNET_MASK})")
             else:
-                self.ui.after(0, lambda: self._log(
-                    f"警告: 目标手动 IP 设置失败 ({target_ip}), 网卡可能停留在 APIPA。\n"
-                    f"  由于两端掩码已统一为 {SUBNET_MASK}, 即使本机为 APIPA 地址也可与源端 {source_ip} 直连通信。"))
+                self._log(f"警告: 目标手动 IP 设置失败 ({target_ip}), 网卡可能停留在 APIPA。\n"
+                          f"  由于两端掩码已统一为 {SUBNET_MASK}, 即使本机为 APIPA 地址也可与源端 {source_ip} 直连通信。")
         else:
-            self.ui.after(0, lambda: self._log(
-                f"目标手动 IP 已生效: {target_ip} (掩码 {SUBNET_MASK})"))
+            self._log(f"目标手动 IP 已生效: {target_ip} (掩码 {SUBNET_MASK})")
 
     def _on_dhcp_button(self):
         """目标设备: 点击「寻找旧电脑」→ 后台启动 DHCP 服务器"""
@@ -1014,16 +1171,13 @@ class Controller:
         if self._dhcp_server and self._dhcp_server.is_running():
             self._log("DHCP 服务器已在运行")
             return
-        # 网卡为全自动检测, 直接使用自动选择的有线网卡
-        adapter_desc = self._get_adapter_desc_from_auto()
-        if not adapter_desc:
-            self._log("未检测到有线网卡，请检查网线连接后再试")
-            return
+        # 接收端不依赖具体网卡: DHCP 广播自行枚举所有有线网卡 (含 APIPA 等待),
+        # 因此无需检查/选定网卡, 即使启动时网线未插也可正常发起
         self.ui.tk_button_dhcp.config(state="disabled")
         self.ui.tk_button_dhcp.configure(text="正在搜索...")
-        threading.Thread(target=self._setup_target_dhcp, args=(adapter_desc,), daemon=True).start()
+        threading.Thread(target=self._setup_target_dhcp, daemon=True).start()
 
-    def _setup_target_dhcp(self, adapter_desc):
+    def _setup_target_dhcp(self):
         """目标设备: 不设置自身 IP, 依赖 APIPA (169.254.x.x) 自动地址, 直接启动 DHCP 服务器。
 
         说明: 目标作为 DHCP 服务器, 为源设备分配 169.254.100.2。两端掩码统一为
@@ -1035,24 +1189,31 @@ class Controller:
         """
         from dhcp_server import MiniDHCPServer
 
-        self.ui.after(0, lambda: self.ui.tk_select_box_discover.config(
-            values=("等待源设备连接...",)
-        ))
+        # 后台线程禁止直接调 tk: 一律经 _post_ui / _log / _ui_after 转主线程
+        self._post_ui(self.ui.tk_select_box_discover.config,
+                      values=("等待源设备连接...",))
 
-        # 获取所有有线网卡 IP 用于 DHCP 广播 (OFFER/ACK 从所有有线网卡发出)
+        # 等待 APIPA 地址出现: 刚插网线时 Windows 需约 15 秒 ARP 探测后才分配
+        # 169.254.x.x。轮询等待可保证: ① 广播出口网卡已就绪 (OFFER/ACK 有正确
+        # 出口); ② 接收端自身处于 /16 网段, 后续才能路由到源端 169.254.100.2。
         wired_ips = self._get_wired_nic_ips()
-        _cur_ip = wired_ips[0] if wired_ips else get_local_ip(adapter_desc) if adapter_desc else ""
+        if not any(ip.startswith("169.254.") for ip in wired_ips):
+            self._log("等待网卡获得 APIPA 地址 (169.254.x.x), 最多 20 秒...")
+            _apipa_deadline = time.time() + 20
+            while time.time() < _apipa_deadline:
+                time.sleep(1)
+                wired_ips = self._get_wired_nic_ips()
+                if any(ip.startswith("169.254.") for ip in wired_ips):
+                    break
+        _cur_ip = wired_ips[0] if wired_ips else ""
         if wired_ips:
-            self.ui.after(0, lambda: self._log(
-                f"有线网卡 IP 列表: {wired_ips}, DHCP 广播将从所有有线网卡发出"))
+            self._log(f"有线网卡 IP 列表: {wired_ips}, DHCP 广播将从所有有线网卡发出")
         if _cur_ip:
-            self.ui.after(0, lambda: self._log(
-                f"DHCP 模式: 接收端不设置自身 IP, 当前本机地址 {_cur_ip} (掩码 {SUBNET_MASK})。"
-                f"只要该地址属于 169.254.x.x/16, 即可与源端 {DHCP_ASSIGNED_IP} 直连。"))
+            self._log(f"DHCP 模式: 接收端不设置自身 IP, 当前本机地址 {_cur_ip} (掩码 {SUBNET_MASK})。"
+                      f"只要该地址属于 169.254.x.x/16, 即可与源端 {DHCP_ASSIGNED_IP} 直连。")
         else:
-            self.ui.after(0, lambda: self._log(
-                f"DHCP 模式: 接收端不设置自身 IP, 等待 APIPA 自动分配 (请确认网线已连接); "
-                f"DHCP 服务器将照常启动。"))
+            self._log(f"DHCP 模式: 接收端不设置自身 IP, 等待 APIPA 自动分配 (请确认网线已连接); "
+                      f"DHCP 服务器将照常启动。")
 
         # 获取本地 MAC 地址列表，排除本地网卡的 DHCP 自响应
         from nic_scanner import get_local_mac_addresses
@@ -1068,22 +1229,28 @@ class Controller:
             self._dhcp_server.set_on_client(_on_client)
             self._dhcp_server.start()
         except Exception as e:
-            self.ui.after(0, lambda: self._log(f"DHCP 启动失败: {e}"))
-            self.ui.after(0, lambda: self.ui.tk_button_dhcp.configure(text="寻找旧电脑", state="normal"))
+            self._log(f"DHCP 启动失败: {e}")
+            self._post_ui(self.ui.tk_button_dhcp.configure,
+                          text="寻找旧电脑", state="normal")
             return
         self._use_dhcp = True
         self._source_ip = DHCP_ASSIGNED_IP  # 目标 DHCP 分配的源 IP
         self._discover_count = 0
 
-        self.ui.after(0, lambda: self._log(
-            f"DHCP 已启动, 源设备将获取 {DHCP_ASSIGNED_IP} (60s 超时)..."
-        ))
-        self.ui.after(60000, self._auto_select_target)
+        self._log(f"DHCP 已启动, 源设备将获取 {DHCP_ASSIGNED_IP} (60s 超时)...")
+        # 60 秒后自动选择目标 (后台线程经 _ui_after 转主线程调度)
+        self._ui_after(60000, self._auto_select_target)
         # 60 秒内禁用搜索按钮 (与 DHCP 自动关闭倒计时一致), 归零后由 _dhcp_tick 恢复
-        self.ui.after(0, lambda: self.ui.tk_button_dhcp.configure(
-            text="搜索中 (60 秒)...", state="disabled"))
+        self._post_ui(self.ui.tk_button_dhcp.configure,
+                      text="搜索中 (60 秒)...", state="disabled")
 
         # 倒计时: 显示 DHCP 服务剩余运行时间, 归零后自动关闭
+        # (周期任务需 after id 做 after_cancel, 转主线程方法启动)
+        self._post_ui(self._start_dhcp_countdown)
+
+    def _start_dhcp_countdown(self):
+        """主线程: 初始化 DHCP 60 秒倒计时 (由后台线程经 _post_ui 转主线程调用,
+        因为周期 after 需要 after id 供 after_cancel)"""
         self._dhcp_countdown = 60
         if self._dhcp_countdown_after:
             try:
@@ -1091,12 +1258,12 @@ class Controller:
             except Exception:
                 pass
             self._dhcp_countdown_after = None
-        self.ui.after(0, lambda: self.ui.tk_label_dhcp_status.config(
-            text="设备发现服务将在 60 秒后自动关闭"))
+        self.ui.tk_label_dhcp_status.config(
+            text="设备发现服务将在 60 秒后自动关闭")
         self._dhcp_countdown_after = self.ui.after(1000, self._dhcp_tick)
 
     def _update_discover_list(self, ip, mac, hostname=""):
-        """更新发现设备下拉框"""
+        """更新发现设备下拉框 (由 DHCP 服务器线程回调, 经 _post_ui 转主线程)"""
         self._discover_count += 1
         if not hostname:
             hostname = "Unknown"
@@ -1113,7 +1280,7 @@ class Controller:
             if values:
                 self.ui.tk_select_box_discover.current(0)
             self._log(f"[DHCP] 发现设备: {ip} ({mac}) {hostname}")
-        self.ui.after(0, _update)
+        self._post_ui(_update)
 
     def _reset_dhcp_button(self):
         """恢复「寻找旧电脑」按钮为可点击状态 (倒计时结束或服务已停止)"""
@@ -1129,6 +1296,13 @@ class Controller:
             # DHCP 已停止 (提前结束/连接成功): 恢复搜索按钮
             self._reset_dhcp_button()
             return
+        # 动态刷新广播出口: APIPA 地址可能刚出现, 立即加入广播出口,
+        # 保证源端 DISCOVER 时 OFFER/ACK 有正确出口网卡, 提高发现成功率
+        try:
+            self._dhcp_server.set_out_ips(self._get_wired_nic_ips())
+            self._dhcp_server.refresh_out_ips()
+        except Exception:
+            pass
         self._dhcp_countdown -= 1
         if self._dhcp_countdown <= 0:
             self._dhcp_countdown = 0
@@ -1147,8 +1321,8 @@ class Controller:
 
     def _auto_select_target(self):
         """60 秒后检查：如果只有 1 个客户端，自动选定"""
-        # 如果用户已经离开网络发现页面（步骤 3），不再修改下拉框
-        if getattr(self.ui, '_step', -1) != 3:
+        # 如果用户已经离开网络发现页面（步骤 2），不再修改下拉框
+        if getattr(self.ui, '_step', -1) != 2:
             return
         if not self._dhcp_server or not self._use_dhcp:
             return
@@ -1252,6 +1426,7 @@ class Controller:
             log_callback=self._log,
             auth_code=self._auth_code,
             cert_paths=cert_paths,
+            status_callback=self._on_source_report,
         )
         self._file_server.start()
         self._add_firewall_exception(TRANSFER_PORT)
@@ -1273,6 +1448,83 @@ class Controller:
         self._transferring = True
         self._transfer_done = False
         self.ui.tk_button_mqfzl35t.config(text="传输中...", state="disabled")
+        # 传输期间霸占全屏, 避免用户误操作电脑
+        try:
+            self.ui.lock_screen()
+        except Exception:
+            pass
+        # 源端无完成回调: 轮询检测"接收端已完成(长时间无请求)" 后解除全屏锁定
+        self._source_done_after = self.ui.after(2000, self._poll_source_done)
+
+    def _poll_source_done(self):
+        """源设备: 检测接收端已完成 (显式 /report done 或服务器长时间无新请求) → 解除全屏锁定"""
+        self._source_done_after = None
+        try:
+            if self._file_server and self._file_server.is_transfer_done():
+                self._source_mark_done()
+                return
+            self._source_done_after = self.ui.after(2000, self._poll_source_done)
+        except Exception:
+            pass
+
+    def _on_source_report(self, payload):
+        """源设备: 接收端 /report 上报回调 (请求线程中调用, 经 _post_ui 转主线程更新 UI)"""
+        self._post_ui(self._handle_source_report, payload)
+
+    def _handle_source_report(self, payload):
+        """源设备 (主线程): 处理接收端的进度/完成上报"""
+        try:
+            if not payload:
+                return
+            if payload.get("done"):
+                self._source_mark_done()
+                return
+            # 进度上报: 更新源端进度条与状态文字
+            total_bytes = payload.get("bytes_total") or 0
+            bytes_done = payload.get("bytes_done") or 0
+            total_files = payload.get("files_total") or 0
+            files_done = payload.get("files_done") or 0
+            if total_bytes > 0:
+                self._set_progress(bytes_done, total_bytes)
+            elif total_files > 0:
+                self._set_progress(files_done, total_files)
+            status = payload.get("status") or ""
+            if status:
+                self._set_status(f"[接收端] {status}")
+        except Exception:
+            pass
+
+    def _source_mark_done(self):
+        """源设备: 接收端传输完成 → 解除全屏锁定并进入完成页, 允许正常关闭"""
+        if getattr(self, "_source_done_marked", False):
+            return
+        self._source_done_marked = True
+        try:
+            self.ui.unlock_screen()
+        except Exception:
+            pass
+        self._set_progress(100, 100)
+        self._set_status("接收端已完成拷贝，可安全关闭此窗口")
+        # 进入发送端"传输完成"页面
+        try:
+            self.ui.go_step(5)
+        except Exception:
+            pass
+        self._log("接收端已完成拷贝，进入完成页，可正常关闭窗口")
+
+    def _on_source_done_close(self):
+        """发送端完成页「完成并关闭」/ 底部「完成」: 清理后台并退出程序"""
+        self._log("发送端流程完成，正在关闭程序")
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+        try:
+            self.ui.destroy()
+        except Exception:
+            pass
+        import os
+        os._exit(0)
 
     def _rename_gtmc_user_profiles(self):
         """检查源设备 D 盘，若存在 GTMC_User_Profiles 则重命名为 GTMC_User_ProfilesYYMMDD。
@@ -1348,10 +1600,7 @@ class Controller:
                                   f"(连续 {fail_count} 次无法连接 "
                                   f"{source_ip}:{TRANSFER_PORT})")
                         # 立即在主线程弹出提示, 不等传输结束/网络恢复
-                        try:
-                            self.ui.after(0, self._on_network_lost_ui)
-                        except Exception:
-                            pass
+                        self._post_ui(self._on_network_lost_ui)
                         break
 
         t = threading.Thread(target=_monitor, daemon=True)
@@ -1364,10 +1613,15 @@ class Controller:
     def _on_network_lost_ui(self):
         """网络断开时的立即 UI 提示 (在主线程执行)。
         只负责提示与按钮状态; 传输线程会在下次 stop_check 时自行停止。"""
+        # 网络断开: 解除全屏锁定, 允许用户检查网线
+        try:
+            self.ui.unlock_screen()
+        except Exception:
+            pass
         self.ui.show_transfer_error(
-            "网络连接已断开 — 请检查网线连接后重新开始传输"
+            "网络连接已中断——请依次关闭新旧设备上的磁盘拷贝应用程序，检查并确认网线物理连接正常后，再重新启动应用"
         )
-        self._set_status("网络已断开 — 请检查网线连接")
+        self._set_status("网络连接已中断——请依次关闭新旧设备上的磁盘拷贝应用程序，检查并确认网线物理连接正常后，再重新启动应用")
         if hasattr(self.ui, 'tk_button_mqfzl35t'):
             try:
                 self.ui.tk_button_mqfzl35t.config(text="重新接收", state="normal")
@@ -1384,14 +1638,23 @@ class Controller:
                    扰动网卡, 导致随后 Python 的 TLS 握手失败, 现已移除。
         """
         if not manual_ip:
-            # DHCP 模式: 必须先开启 DHCP 并等待源设备分配到 IP
-            if not self._use_dhcp or not (self._dhcp_server and self._dhcp_server.is_running()):
+            # DHCP 模式: 必须先开启 DHCP 并等待源设备分配到 IP。
+            # 允许继续的两种情况:
+            #   ① DHCP 服务器仍在运行 (分配流程进行中, 源设备可能已拿到 IP)
+            #   ② 服务器已因 60 秒倒计时自动关闭, 但源设备已通过 DHCP 拿到 IP
+            #      (self._source_ip 已设置), 此时不再需要 DHCP, 可直接继续
+            if not self._use_dhcp:
                 self._log("请先点击「开启DHCP」启动 DHCP 服务器并等待源设备分配 IP")
                 return
-            # DHCP 已完成使命 (源设备已拿到 IP)，停止 DHCP 服务器，释放端口避免干扰后续传输
-            self._log("源设备已通过 DHCP 获取 IP，正在关闭 DHCP 服务器...")
-            self._dhcp_server.stop()
-            self._log("DHCP 服务器已关闭")
+            if not (self._source_ip or (self._dhcp_server and self._dhcp_server.is_running())):
+                self._log("DHCP 服务器未运行且未获得源设备 IP, 请重新点击「开启DHCP」")
+                return
+            # DHCP 已完成使命 (源设备已拿到 IP)，若服务器仍在运行则停止,
+            # 释放端口避免干扰后续传输
+            if self._dhcp_server and self._dhcp_server.is_running():
+                self._log("源设备已通过 DHCP 获取 IP，正在关闭 DHCP 服务器...")
+                self._dhcp_server.stop()
+                self._log("DHCP 服务器已关闭")
 
         self._log("\n" + "=" * 50)
         self._log("目标设备模式: 连接源设备...")
@@ -1430,39 +1693,39 @@ class Controller:
 
         self._transferring = True
         self._transfer_done = False
+        # 传输期间霸占全屏, 避免用户误操作电脑
+        try:
+            self.ui.lock_screen()
+        except Exception:
+            pass
         self._reset_progress("正在连接源设备...")
         self.ui.hide_transfer_error()  # 清除上次失败的错误提示
         self.ui.tk_button_mqfzl35t.config(text="连接中...", state="disabled")
 
         def _connect_and_download():
+            # 后台线程禁止直接调 tk: 一律经 _log/_set_status/_post_ui 转主线程
             if manual_ip:
                 # 手动 IP 模式: 直连填写的源设备 IP
                 source_ip = manual_ip
-                self.ui.after(0, lambda: self._log(
-                    f"手动 IP 模式: 直连源设备 {manual_ip}:{TRANSFER_PORT}"
-                ))
+                self._log(f"手动 IP 模式: 直连源设备 {manual_ip}:{TRANSFER_PORT}")
             elif self._use_dhcp:
                 # DHCP 模式: 源 IP 由目标 DHCP 分配 (169.254.100.2)
-                self.ui.after(0, lambda: self._log(
-                    f"DHCP 模式: 直连源设备 {DHCP_ASSIGNED_IP}:{TRANSFER_PORT}"
-                ))
+                self._log(f"DHCP 模式: 直连源设备 {DHCP_ASSIGNED_IP}:{TRANSFER_PORT}")
                 source_ip = DHCP_ASSIGNED_IP
             else:
                 # APIPA 扫描
-                self.ui.after(0, lambda: self._log("APIPA 模式: 扫描源设备..."))
-                self.ui.after(0, lambda: self._set_status("正在扫描源设备..."))
+                self._log("APIPA 模式: 扫描源设备...")
+                self._set_status("正在扫描源设备...")
                 source_ip = scan_source_device(
                     log_callback=self._log, auth_code=self._auth_code
                 )
 
             if not source_ip:
-                self.ui.after(0, lambda: self._log(
-                    "未找到源设备。请确保:\n"
-                    "  1. 源设备已启动并选择了'源设备'\n"
-                    "  2. 网线已连接\n"
-                    "  3. 两端网卡已选择"
-                ))
-                self.ui.after(0, lambda: self._on_transfer_failed())
+                self._log("未找到源设备。请确保:\n"
+                          "  1. 源设备已启动并选择了'源设备'\n"
+                          "  2. 网线已连接\n"
+                          "  3. 两端网卡已选择")
+                self._post_ui(self._on_transfer_failed)
                 return
 
             # ---- 网络自检诊断: 打印本机 IP / 目标 IP / TCP 端口可达性 ----
@@ -1509,11 +1772,12 @@ class Controller:
                 self._log(f"[诊断] 网络自检异常: {e}")
 
             self._last_source_ip = source_ip  # 供校验阶段缺失文件重试下载
-            self.ui.after(0, lambda: self._log(f"连接源设备: {source_ip}:{TRANSFER_PORT}"))
-            self.ui.after(0, lambda: self.ui.tk_button_mqfzl35t.config(text="接收中..."))
+            self._log(f"连接源设备: {source_ip}:{TRANSFER_PORT}")
+            self._post_ui(self.ui.tk_button_mqfzl35t.config, text="接收中...")
 
             # 速度追踪: [_last_bytes, _last_time] 可变列表用于跨闭包共享
             _speed_tracker = [0, time.time()]
+            _report_ts = [0.0]  # 向源端同步进度的节流时间戳
 
             def _fmt_speed(byte_rate: float) -> str:
                 """字节/秒 → 人类可读速度字符串"""
@@ -1537,13 +1801,24 @@ class Controller:
                 status = f"正在传输... {files_done}/{total_files} 文件"
                 if speed_str:
                     status += f"  ({speed_str})"
-                self.ui.after(0, lambda s=status: self._set_status(s))
+                # 向源端同步拷贝进度 (节流 1 秒, 后台线程发送, 失败静默)
+                if now - _report_ts[0] >= 1.0:
+                    _report_ts[0] = now
+                    self._report_to_source({
+                        "done": False,
+                        "files_done": files_done,
+                        "files_total": total_files,
+                        "bytes_done": bytes_done,
+                        "bytes_total": total_bytes,
+                        "status": status,
+                    })
+                self._set_status(status)
                 # 总进度条: 优先按字节占比 (大文件传输时文件数不变但字节在涨,
                 # 仅按文件数会导致进度条长时间不动); 无总字节信息时退回按文件数
                 if total_bytes > 0:
-                    self.ui.after(0, lambda: self._set_progress(bytes_done, total_bytes))
+                    self._set_progress(bytes_done, total_bytes)
                 elif total_files > 0:
-                    self.ui.after(0, lambda: self._set_progress(files_done, total_files))
+                    self._set_progress(files_done, total_files)
 
             def _check_stop():
                 """供 file_transfer.download_files 轮询, 窗口关闭时返回 'cancel', 断网返回 'network_down'"""
@@ -1579,7 +1854,7 @@ class Controller:
             # ---- 停止网络断开监控 ----
             self._stop_network_monitor()
 
-            self.ui.after(0, lambda: self._on_download_complete(success, files, bytes_done, errors))
+            self._post_ui(self._on_download_complete, success, files, bytes_done, errors)
 
         threading.Thread(target=_connect_and_download, daemon=True).start()
 
@@ -1588,6 +1863,11 @@ class Controller:
         self._transferring = False
         self._transfer_done = False
         self._use_dhcp = False
+        # 传输失败: 解除全屏锁定, 允许用户操作
+        try:
+            self.ui.unlock_screen()
+        except Exception:
+            pass
         self.ui.hide_transfer_error()
         if hasattr(self, "_dhcp_server") and self._dhcp_server:
             self._dhcp_server.stop()
@@ -1597,9 +1877,28 @@ class Controller:
         self.ui.tk_button_mqfzl35t.config(text="开始接收", state="normal")
         self.ui.tk_button_dhcp.configure(text="寻找旧电脑", state="normal")
 
+    def _report_to_source(self, payload: dict):
+        """后台线程: 向源端上报进度/完成 (HTTPS POST /report, 失败静默不影响传输)"""
+        host = self._last_source_ip or self._source_ip
+        auth = self._auth_code
+        if not host or not auth:
+            return
+        try:
+            import file_transfer as _ft
+            _ft.post_report(host, TRANSFER_PORT, auth, payload)
+        except Exception:
+            pass
+
     def _on_download_complete(self, success, files, bytes_done, errors):
         """下载完成回调"""
         self._transferring = False
+        # 传输结束 (成功/失败/断开): 解除全屏锁定, 允许用户操作
+        try:
+            self.ui.unlock_screen()
+        except Exception:
+            pass
+        # 通知源端传输结束: 发送端据此解除全屏锁定并标记完成, 可正常关闭窗口
+        self._report_to_source({"done": True})
 
         # 传输过程中网络断开: 停止等待并提示用户
         if self._network_down:
@@ -1610,7 +1909,7 @@ class Controller:
             self.ui.set_button_next("disabled")
             self.ui.set_button_prev("normal", text="< 返回")
             self.ui.show_transfer_error(
-                "网络连接已断开 — 请检查网线连接后重新开始传输"
+                "网络连接已中断——请依次关闭新旧设备上的磁盘拷贝应用程序，检查并确认网线物理连接正常后，再重新启动应用"
             )
             self.ui.tk_button_mqfzl35t.config(text="重新接收", state="normal")
             if hasattr(self, "_dhcp_server") and self._dhcp_server:
@@ -1659,36 +1958,54 @@ class Controller:
         # 边传边校验: 传输阶段结束后展示最终确认状态 (hide_transfer_error 已重置该标签)
         if self._pre_verified_file:
             self.ui.set_verify_online_status(
-                "边传边校验：已完成，已确认文件将在校验阶段跳过重复校验"
+                "文件确认：已完成，已确认文件将在校验阶段跳过重复校验"
             )
         # 传输完成: 隐藏"开始传输"按钮, 清理 UI
         self.ui.hide_start_button()
 
-        # 对于接收方: 检测 F:\\systemconfig.ini, 有则提示用户确认
+        # 传输完成 → 自动启动数据校验 (后台线程): 增量确认 + 报告打包 + 自动上传
+        # (校验页已取消, 校验进度/日志通过传输页状态行与日志展示)
+        self._start_auto_verification()
+
+        # 对于接收方: 检测 F:\\systemconfig.ini
         if self._device_type == "目标设备":
+            manual_mode = False
+            try:
+                manual_mode = bool(getattr(self.ui, "tk_var_manual_import", None)
+                                   and self.ui.tk_var_manual_import.get())
+            except Exception:
+                pass
             config_path, time_str = config_transfer.get_config_from_ini()
-            if config_path:
+            self.ui.hide_config_detect()
+            if config_path and not manual_mode:
                 self._detected_config_path = config_path
-                self.ui.show_config_detect(config_path, time_str)
-                # "下一步"按钮: 点击即使用检测到的配置, 无需单独点"使用此配置"
-                self.ui.set_button_next("normal", text="导入配置 >")
-                # 强制刷新 UI 确保按钮和检测区域立即可见
-                self.ui.update_idletasks()
-                self._log("在 F 盘发现系统配置文件，请在传输日志上方确认是否使用")
-            else:
-                # 无配置文件: 直接跳转步骤 5
-                self.ui.hide_config_detect()
-                self.ui.go_step(5)
+                self._log(f"在 F 盘发现系统配置文件: {config_path}")
+                self._log("检测到系统配置，后台自动导入中...")
+                # 自动导入 (不跳转总结页, 校验完成后统一进入)
                 self._populate_config_folders()
-                self._log("传输完成，请导入系统配置")
+                self._select_config_folder(config_path)
+                self._auto_import_active = True
+                self.ui.after(150, self._on_import_config)
+            else:
+                # 手动模式或无配置: 直接进入传输总结页 (校验结果完成后自动刷新)
+                if manual_mode:
+                    self._log("手动导入模式: 请在总结页选择配置文件夹")
+                else:
+                    self._log("未检测到系统配置备份")
+                self._summary_entered = True
+                self.ui.go_step(4)
+                self._render_summary()
+        else:
+            # 发送端: 传输完成即结束 (校验自动在后台进行, 无后续页面)
+            self.ui.set_button_next("disabled")
+            self._log("传输完成，数据校验报告将自动生成并上传")
 
         # 重置进度条
         self._set_progress(0)
-        self._set_status("传输完成 — 可进入校验页面")
+        self._set_status("传输完成 — 数据校验自动进行中")
 
     def _on_use_detected_config(self):
-        """接收端步骤 4: 用户确认使用检测到的配置文件
-        选中后直接进入导入页面并自动开始导入, 无需再次点击「导入配置」"""
+        """接收端: 使用检测到的配置文件并自动导入 (不跳转总结页)"""
         if not hasattr(self, '_detected_config_path'):
             return
         self.ui.hide_config_detect()
@@ -1696,7 +2013,6 @@ class Controller:
         # 先填充配置文件夹列表, 再选中检测到的路径
         self._populate_config_folders()
         self._select_config_folder(self._detected_config_path)
-        self.ui.go_step(5)
         # 自动开始导入 (已自动选中配置路径, 无需用户再点击)
         self._auto_import_active = True
         self.ui.after(150, self._on_import_config)
@@ -1706,7 +2022,7 @@ class Controller:
         self.ui.hide_config_detect()
         self._log("已跳过自动检测的配置文件")
         self._populate_config_folders()
-        self.ui.go_step(5)
+        self.ui.go_step(4)
 
     def _select_config_folder(self, target_path: str):
         """在步骤 5 的配置文件夹下拉框中选中指定路径"""
@@ -1759,18 +2075,19 @@ class Controller:
         self._log_export("")
 
         def _status_cb(name, status):
-            """线程安全地更新导出状态表格"""
-            self.ui.after(0, lambda n=name, s=status: self.ui._update_export_item_status(n, s))
+            """线程安全地更新导出状态表格 (经 _post_ui 转主线程)"""
+            self._post_ui(self.ui._update_export_item_status, name, status)
 
         def _export():
             try:
                 success, export_path = config_transfer.export_config(
-                    log_callback=lambda msg: self.ui.after(0, lambda: self._log_export(msg)),
+                    # _log_export 线程安全: 自动转主线程渲染
+                    log_callback=lambda msg: self._log_export(msg),
                     status_callback=_status_cb,
                 )
-                self.ui.after(0, lambda: self._on_export_done(success, export_path))
+                self._post_ui(self._on_export_done, success, export_path)
             except Exception as e:
-                self.ui.after(0, lambda: self._on_export_error(str(e)))
+                self._post_ui(self._on_export_error, str(e))
 
         threading.Thread(target=_export, daemon=True).start()
 
@@ -1807,9 +2124,9 @@ class Controller:
         """在后台线程中压缩导出文件夹并上传到 Profile 服务器。"""
         import config_transfer
 
-        # 线程安全的日志写入 (通过 after 回到主线程操作 Tkinter)
+        # 线程安全的日志写入 (_log_export 自动转主线程操作 Tkinter)
         def _log_safe(msg):
-            self.ui.after(0, lambda m=msg: self._log_export(m))
+            self._log_export(msg)
 
         def _run():
             try:
@@ -1821,9 +2138,9 @@ class Controller:
                         export_path, log_callback=_log_safe
                     )
                 # 在主线程中更新按钮状态
-                self.ui.after(0, lambda: self._on_upload_done(compress_ok, upload_ok, zip_path))
+                self._post_ui(self._on_upload_done, compress_ok, upload_ok, zip_path)
             except Exception as e:
-                self.ui.after(0, lambda: self._on_upload_error(str(e)))
+                self._post_ui(self._on_upload_error, str(e))
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()
@@ -1943,36 +2260,44 @@ class Controller:
 
         def _import():
             try:
-                success = config_transfer.import_config(
+                success, details = config_transfer.import_config(
                     config_folder,
-                    log_callback=lambda msg: self.ui.after(0, lambda: self._log_import(msg))
+                    # _log_import 线程安全: 自动转主线程渲染
+                    log_callback=lambda msg: self._log_import(msg)
                 )
-                self.ui.after(0, lambda: self._on_import_done(success))
+                self._post_ui(self._on_import_done, success, details)
             except Exception as e:
-                self.ui.after(0, lambda: self._on_import_error(str(e)))
+                self._post_ui(self._on_import_error, str(e))
 
         threading.Thread(target=_import, daemon=True).start()
 
-    def _on_import_done(self, success):
+    def _on_import_done(self, success, details=None):
         self.ui.tk_import_progress_bar.stop()
         self.ui.tk_import_progress_bar.pack_forget()
         self._auto_import_active = False
+        if details is not None:
+            self._import_details = details
+        # 若传输总结页已显示, 刷新导入明细
+        if getattr(self, "_summary_entered", False):
+            self.ui.render_import_details(self._import_details or [])
 
         if success:
             self._config_import_done = True  # 配置已导入 → 禁用"跳过"按钮
             self._log("\n配置导入完成!")
             self.ui.tk_button_import_config.config(text="导入完成", bootstyle="success", state="disabled")
             self.ui.tk_button_skip_import.config(state="disabled")
-            self.ui.tk_label_import_progress.config(text="配置导入成功! 正在进入校验页面...")
+            self.ui.tk_label_import_progress.config(text="配置导入成功!")
             self._set_status("配置导入完成")
-            # 导入完成后自动跳转到文件校验页面 (步骤 6)
-            self.ui.after(300, self.ui.go_step, 6)
         else:
             self._log("\n部分配置导入失败, 请查看日志")
             self.ui.tk_button_import_config.config(text="重试导入", bootstyle="warning", state="normal")
             self.ui.tk_button_skip_import.config(state="normal")
-            self.ui.tk_label_import_progress.config(text="部分配置导入失败，请点击重试")
+            self.ui.tk_label_import_progress.config(text="部分配置导入失败，可点击重试导入")
             self._set_status("配置导入部分失败")
+
+        # 总结页是最后一步: 下一步 = 完成
+        if getattr(self, "_summary_entered", False):
+            self.ui.set_button_next("normal", text="完成")
 
         self.ui.tk_combo_config_folder.config(state="readonly")
         self.ui.tk_button_browse_config.config(state="normal")
@@ -1982,6 +2307,9 @@ class Controller:
         self.ui.tk_import_progress_bar.pack_forget()
         self._auto_import_active = False
         self._log(f"导入配置出错: {error_msg}")
+        self._import_details = [("系统配置导入", "失败", error_msg)]
+        if getattr(self, "_summary_entered", False):
+            self.ui.render_import_details(self._import_details)
         self.ui.tk_button_import_config.config(text="重试导入", bootstyle="danger", state="normal")
         self.ui.tk_button_skip_import.config(state="normal")
         self.ui.tk_combo_config_folder.config(state="readonly")
@@ -1989,17 +2317,25 @@ class Controller:
         self._set_status("配置导入出错")
 
     def _on_skip_import(self):
-        """步骤 5: 点击「跳过」按钮, 直接进入校验页面"""
+        """总结页: 点击「跳过」按钮 (手动跳过配置导入)"""
         # 配置已成功导入: 不允许再"跳过" (跳过按钮已禁用, 此处兜底防护)
         if self._config_import_done:
             self._log("配置已导入, 无需跳过")
             return
         self._log("已跳过配置导入")
-        self.ui.go_step(6)  # go_step 会将下一步置为「跳过校验 >」
+        self._import_details = [("系统配置导入", "跳过", "已由用户手动跳过")]
+        if getattr(self, "_summary_entered", False):
+            self.ui.render_import_details(self._import_details)
+        self.ui.tk_label_import_progress.config(text="已跳过配置导入")
+        self._set_status("已跳过配置导入")
+        self.ui.set_button_next("normal", text="完成")
         self.ui.tk_button_prev.config(state="normal")
 
     def _log_import(self, msg):
-        """写入导入日志区域"""
+        """写入导入日志区域 (线程安全: 自动转主线程执行)"""
+        self._post_ui(self._log_import_direct, msg)
+
+    def _log_import_direct(self, msg):
         log_widget = getattr(self.ui, 'tk_text_import_log', None)
         if log_widget:
             try:
@@ -2011,9 +2347,9 @@ class Controller:
                 pass
 
     def _log_export(self, msg):
-        """写入导出日志 (通过 UI 层的弹窗/缓冲区管理)"""
+        """写入导出日志 (通过 UI 层的弹窗/缓冲区管理)。线程安全 (自动转主线程执行)。"""
         if hasattr(self.ui, '_write_export_log'):
-            self.ui._write_export_log(msg)
+            self._post_ui(self.ui._write_export_log, msg)
 
     def _clear_export_log(self):
         """清空导出日志 (通过 UI 层的弹窗/缓冲区管理)"""
@@ -2021,17 +2357,29 @@ class Controller:
             self.ui._clear_export_log()
 
     # ==================== 校验 ====================
+    # 说明: 校验页面已取消 (2026-08-26) — 传输完成后自动在后台执行
+    #       _start_auto_verification + 报告打包 + 自动上传
 
-    def _on_verify_start(self):
-        """步骤 5 校验页面: 点击「开始校验」按钮"""
-        self._start_verification()
+    def _start_auto_verification(self):
+        """传输完成后自动启动校验线程 (后台执行, 无校验页面)。
 
-    def _start_verification(self):
-        """启动 CSV 后台校验线程 (12线程并行)"""
+        基于边传边校验确认清单增量确认未覆盖文件 → 生成校验报告并自动上传。
+        校验进度/日志通过传输页状态行与日志展示。
+
+        线程安全: 本环境 (嵌入式 Python 3.13) 的 tkinter 禁止后台线程直接调用
+        (任何 tk 调用都会抛 RuntimeError: main thread is not in main loop)。
+        因此后台线程只把日志/状态/进度消息放入 self._verify_ui_q 队列,
+        由主线程 _poll_verify_ui 定时轮询并渲染到界面。
+        """
         f_drive = self._partition_map.get("F", "")
         if not f_drive:
-            self._log("F 盘未映射，跳过校验")
-            self._set_verify_status("F 盘未映射，无法校验")
+            self._log("F 盘未映射，跳过自动校验 (无法生成校验报告)")
+            # 仍启动轮询, 以便接收端自动进入传输总结页 (校验线程不存在时会立即结束)
+            self._verify_ui_q = queue.Queue()
+            self.ui.after(100, self._poll_verify_ui)
+            return
+        if getattr(self, '_verify_thread', None) and self._verify_thread.is_alive():
+            self._log("自动校验已在运行中")
             return
 
         partition_map = dict(self._partition_map)  # 快照当前映射
@@ -2041,44 +2389,83 @@ class Controller:
         if gtmc_new_name:
             self._log(f"检测到 GTMC 目录已重命名为: {gtmc_new_name} (校验时自动映射)")
 
-        # 接收端手动指定的 FullFilelist_DEF.csv (为空则自动识别最新 Appl 文件夹)
+        # 手动指定的 FullFilelist_DEF.csv (为空则自动识别最新 Appl 文件夹)
         csv_path = self.ui.get_csv_path()
         if csv_path:
             self._log(f"将使用手动指定的 CSV: {csv_path}")
         else:
             self._log("未手动指定 CSV, 将自动识别最新 Appl 文件夹下的 FullFilelist_DEF.csv")
 
-        # 禁用校验按钮 (防止重复点击) + 禁用上一步 (防止中途返回)
-        self.ui.tk_button_verify.config(state="disabled")
-        self.ui.set_button_prev("disabled")
-        self._set_verify_status("正在校验..." )
+        # 主线程读取 winpe 标志 (后台线程禁止访问 tk 变量)
+        try:
+            winpe_mode = (self.ui.winpe_var.get() == "winpe")
+        except Exception:
+            winpe_mode = None
+
+        self._verify_result_text = ""
+        self._verify_report_path = None
+        self._verify_done = False
+        self._verify_filelist_csv = csv_path or None
+        self._verify_auto_found = not csv_path
+        # 校验结果统计与失败明细 (供传输总结页展示)
+        self._verify_stats = None
+        self._verify_fail_list = []
+        self._set_status("传输完成, 正在进行数据校验 ...")
+        self.ui.set_verify_online_status("数据校验中 ... (报告将自动生成并上传)")
+
+        # 后台线程 → 主线程 UI 消息队列 (queue 是线程安全的)
+        self._verify_ui_q = queue.Queue()
+        self._verify_upload_thread = None
 
         def _verify_log(msg):
-            """校验线程日志: 同步写入传输日志 + 校验日志"""
-            self._log(msg)
-            self.ui.after(0, lambda: self._append_verify_log(msg))
+            """校验线程日志: 入队, 由主线程 _poll_verify_ui 渲染到日志 + 状态行"""
+            try:
+                self._verify_ui_q.put(("log", str(msg)))
+                self._verify_ui_q.put(("status", str(msg)))
+            except Exception:
+                pass
 
         def _verify():
             try:
                 def _verify_progress(done, total):
                     pct = int(done / total * 100) if total > 0 else 0
-                    self.ui.after(0, lambda: self._set_verify_progress(
-                        pct, f"正在校验... {done}/{total} 文件"
-                    ))
-                    if total > 0:
-                        self.ui.after(0, lambda: self._set_progress(done, total))
+                    status = f"数据校验中... {done}/{total} 文件 ({pct}%)"
+                    try:
+                        self._verify_ui_q.put(("status", status))
+                        if total > 0:
+                            self._verify_ui_q.put(("progress", done, total))
+                    except Exception:
+                        pass
 
                 report_zip_out = []
                 # 读取边传边校验确认清单: 已确认的文件在校验阶段直接标记 Y 跳过磁盘校验
+                # 行格式: "源盘符完整路径|大小" (兼容旧格式纯路径)
                 pre_ok_paths = None
+                pre_ok_sizes = None
                 pre_file = getattr(self, "_pre_verified_file", "")
                 if pre_file and os.path.isfile(pre_file):
                     try:
+                        pre_ok_paths = set()
+                        pre_ok_sizes = {}
                         with open(pre_file, "r", encoding="utf-8") as _pf:
-                            pre_ok_paths = {ln.strip() for ln in _pf if ln.strip()}
-                        _verify_log(f"已读取边传边校验确认清单: {len(pre_ok_paths)} 个文件将跳过磁盘校验")
+                            for _ln in _pf:
+                                _ln = _ln.strip()
+                                if not _ln:
+                                    continue
+                                if "|" in _ln:
+                                    _p, _, _s = _ln.rpartition("|")
+                                    pre_ok_paths.add(_p)
+                                    try:
+                                        pre_ok_sizes[_p] = int(_s)
+                                    except (ValueError, TypeError):
+                                        pass
+                                else:
+                                    pre_ok_paths.add(_ln)  # 兼容旧格式(纯路径)
+                        _verify_log(
+                            f"已读取文件确认清单: {len(pre_ok_paths)} 个文件将跳过磁盘校验(已复核大小)"
+                        )
                     except Exception as _e:
-                        _verify_log(f"读取边传边校验确认清单失败: {_e}")
+                        _verify_log(f"读取文件确认清单失败: {_e}")
                 ok, passed, failed, skipped, total = run_verification(
                     f_drive_pe=f_drive,
                     partition_map=partition_map,
@@ -2088,37 +2475,157 @@ class Controller:
                     server_ip=server_ip,
                     gtmc_new_name=gtmc_new_name,
                     auth_code=auth_code,
-                    winpe=(self.ui.winpe_var.get() == "winpe"),
+                    winpe=winpe_mode,
                     csv_path=csv_path,
                     report_zip_out=report_zip_out,
                     pre_ok_paths=pre_ok_paths,
+                    pre_ok_sizes=pre_ok_sizes,
+                    fail_list_out=self._verify_fail_list,
                 )
                 if self._stop_verify:
-                    self.ui.after(0, lambda: _verify_log("校验已取消"))
-                    self.ui.after(0, lambda: self._set_verify_result("校验已取消"))
+                    _verify_log("数据校验已取消")
                     return
+                # 记录校验统计 (供传输总结页展示)
+                self._verify_stats = (passed, failed, skipped, total)
                 if ok:
                     result_text = f"校验完成!  通过: {passed}  失败: {failed}  跳过: {skipped}  总计: {total}"
-                    self.ui.after(0, lambda: _verify_log(
-                        f"\n{'='*50}\n  {result_text}\n{'='*50}"
-                    ))
-                    self.ui.after(0, lambda: self._set_verify_result(result_text, success=True))
-                    # 校验报告已由 verifier 打包, 后台线程上传到 Profile 服务器
+                    _verify_log(f"\n{'='*50}\n  {result_text}\n{'='*50}")
                     self._verify_done = True
+                    self._verify_ui_q.put(("status", "数据校验完成"))
+                    self._verify_ui_q.put(("status_line", result_text))
+                    # 校验报告已由 verifier 打包, 后台线程自动上传到 Profile 服务器
                     if report_zip_out:
+                        self._verify_report_path = report_zip_out[0]
                         self._upload_verifier_report(report_zip_out[0], _verify_log)
                 else:
-                    self.ui.after(0, lambda: _verify_log("校验失败，请检查日志"))
-                    self.ui.after(0, lambda: self._set_verify_result("校验失败，请检查日志", success=False))
+                    _verify_log("数据校验失败，请检查日志")
+                    self._verify_ui_q.put(("status", "数据校验失败"))
+                    self._verify_ui_q.put(("status_line", "数据校验失败"))
             except Exception as e:
-                self.ui.after(0, lambda: _verify_log(f"校验异常: {e}"))
-                self.ui.after(0, lambda: self._set_verify_result(f"校验异常: {e}", success=False))
-            finally:
-                self.ui.after(0, lambda: self.ui.tk_button_verify.config(state="normal"))
-                self.ui.after(0, lambda: self.ui.set_button_prev("normal"))
+                _verify_log(f"数据校验异常: {e}")
+                self._verify_ui_q.put(("status", "数据校验异常"))
 
         self._verify_thread = threading.Thread(target=_verify, daemon=True)
+        # 主线程启动 UI 轮询 (在主线程调用 after 是安全的)
+        self.ui.after(100, self._poll_verify_ui)
         self._verify_thread.start()
+
+    def _poll_verify_ui(self):
+        """主线程轮询自动校验 UI 消息队列, 渲染后台线程产生的日志/状态/进度。
+        校验或上传线程仍在运行期间持续自轮询。"""
+        try:
+            q = getattr(self, "_verify_ui_q", None)
+            if q is None:
+                return
+            while True:
+                try:
+                    item = q.get_nowait()
+                except Exception:
+                    break
+                kind = item[0]
+                if kind == "log":
+                    self._log(item[1])
+                elif kind == "status":
+                    self.ui.set_verify_online_status(item[1])
+                elif kind == "status_line":
+                    self._set_status(item[1])
+                elif kind == "progress":
+                    self._set_progress(item[1], item[2])
+            # 校验完成且报告已生成: 显示"查看校验报告"按钮
+            if (not getattr(self, "_report_btn_shown", False)
+                    and getattr(self, "_verify_done", False)
+                    and getattr(self, "_verify_report_path", None)
+                    and os.path.isfile(self._verify_report_path)):
+                self.ui.show_report_button()
+                self._report_btn_shown = True
+            alive = False
+            vth = getattr(self, "_verify_thread", None)
+            if vth is not None and vth.is_alive():
+                alive = True
+            uth = getattr(self, "_verify_upload_thread", None)
+            if uth is not None and uth.is_alive():
+                alive = True
+            if alive:
+                self.ui.after(150, self._poll_verify_ui)
+            else:
+                # 校验流程结束: 接收端传输完成后自动进入/刷新传输总结页
+                if (self._device_type == "目标设备"
+                        and getattr(self, "_transfer_done", False)):
+                    if not getattr(self, "_summary_entered", False):
+                        self._summary_entered = True
+                        self.ui.go_step(4)
+                    self._render_summary()
+        except Exception:
+            pass
+
+    def _on_open_report(self):
+        """点击『查看校验报告』: 在资源管理器中定位到校验报告文件"""
+        path = getattr(self, "_verify_report_path", "")
+        if not path or not os.path.isfile(path):
+            self._log("校验报告尚未生成")
+            return
+        try:
+            import subprocess
+            subprocess.Popen(["explorer", "/select,", path])
+            self._log(f"已定位校验报告: {path}")
+        except Exception as _e:
+            try:
+                os.startfile(path)
+            except Exception as _e2:
+                self._log(f"无法打开校验报告: {_e2}")
+
+    def _render_summary(self):
+        """渲染步骤4 传输总结页 (仅接收端): 配置导入结果 + 校验结果 + 失败文件列表"""
+        try:
+            self.ui.set_button_next("normal", text="完成")
+            self.ui.set_button_prev("normal", text="< 返回")
+            # ① 配置导入明细 (区分: 导入中/等待手动/未检测到/明细)
+            details = getattr(self, "_import_details", None)
+            manual = False
+            try:
+                manual = bool(getattr(self.ui, "tk_var_manual_import", None)
+                              and self.ui.tk_var_manual_import.get())
+            except Exception:
+                pass
+            # 手动导入控件 (文件夹/浏览/导入/跳过) 仅在手动模式下显示
+            try:
+                self.ui.set_manual_import_visible(manual)
+            except Exception:
+                pass
+            if details is not None:
+                self.ui.render_import_details(details)
+            elif getattr(self, "_auto_import_active", False):
+                self.ui.render_import_details(None)  # 自动导入中
+            elif manual:
+                self.ui.render_import_details("manual")  # 等待手动导入
+            else:
+                self.ui.render_import_details([])  # 未检测到配置备份
+            # ② 校验统计 + 查看报告按钮 + 失败文件列表 (统一展示)
+            stats = getattr(self, "_verify_stats", None)
+            report_zip = getattr(self, "_verify_report_path", "") or ""
+            self.ui.render_verify_stats(stats, report_zip)
+            self.ui.render_fail_list(getattr(self, "_verify_fail_list", None) or [])
+            # 手动模式提示
+            if manual:
+                self.ui.tk_label_import_progress.config(
+                    text="手动模式: 请选择配置文件夹后点击「导入配置」"
+                )
+        except Exception as e:
+            self._log(f"渲染传输总结页出错: {e}")
+
+    def _on_summary_done(self):
+        """总结页「完成并关闭」/ 底部「完成」按钮: 清理后台并退出程序"""
+        self._log("接收端流程完成，正在关闭程序")
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+        try:
+            self.ui.destroy()
+        except Exception:
+            pass
+        import os
+        os._exit(0)
 
     def _upload_verifier_report(self, zip_path, log_callback=None):
         """后台线程上传校验报告 ZIP 到 Profile 服务器。"""
@@ -2139,10 +2646,11 @@ class Controller:
             except Exception as e:
                 _log_safe(f"上传校验报告异常: {e}")
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._verify_upload_thread = threading.Thread(target=_run, daemon=True)
+        self._verify_upload_thread.start()
 
     def _on_skip_verify(self):
-        """校验页点击「下一步」: 跳过文件校验, 创建空 <设备名>_Unverifi.zip 并上传。"""
+        """跳过文件校验: 创建空 <设备名>_Unverifi.zip 并上传 (校验未完成时兜底)。"""
         from verifier import create_unverifi_zip
         import config_transfer
 
@@ -2156,13 +2664,22 @@ class Controller:
             self._log("校验已完成, 校验报告已上传")
             return
 
-        # 防止重复触发
         self.ui.set_button_next("disabled")
-        self.ui.set_button_prev("disabled")
-        self._set_verify_status("正在跳过校验, 创建空校验报告...")
+        self._log("正在跳过校验, 创建空校验报告...")
+
+        # 复用校验 UI 消息队列: 后台线程只入队, 主线程 _poll_verify_ui 渲染
+        if getattr(self, "_verify_ui_q", None) is None:
+            self._verify_ui_q = queue.Queue()
+        self._verify_upload_thread = None
+        self.ui.after(100, self._poll_verify_ui)
 
         def _log_safe(msg):
-            self.ui.after(0, lambda: self._append_verify_log(msg))
+            """后台线程日志: 入队, 由主线程轮询渲染 (禁止直接操作 tkinter 控件)"""
+            try:
+                self._verify_ui_q.put(("log", str(msg)))
+                self._verify_ui_q.put(("status", str(msg)))
+            except Exception:
+                pass
 
         def _run():
             try:
@@ -2175,53 +2692,37 @@ class Controller:
                     _log_safe("开始上传校验报告(空包)...")
                     config_transfer.upload_zip_to_server(zip_path, log_callback=_log_safe)
                     _log_safe("=" * 50)
-                    self.ui.after(0, lambda: self._set_verify_result(
-                        "已跳过校验 (空校验报告已上传)", success=True
-                    ))
+                    self._verify_ui_q.put(("status", "已跳过校验 (空校验报告已上传)"))
+                    self._verify_ui_q.put(("status_line", "已跳过校验 (空校验报告已上传)"))
             except Exception as e:
                 _log_safe(f"跳过校验/上传异常: {e}")
-                self.ui.after(0, lambda: self._set_verify_result(
-                    f"跳过校验异常: {e}", success=False
-                ))
-            finally:
-                self.ui.after(0, lambda: self.ui.set_button_prev("normal"))
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._verify_upload_thread = threading.Thread(target=_run, daemon=True)
+        self._verify_upload_thread.start()
 
     def _append_verify_log(self, msg: str):
-        """向步骤 5 校验日志区域追加一行"""
-        try:
-            tw = self.ui.tk_text_verify_log
-            tw.configure(state="normal")
-            tw.insert("end", msg + "\n")
-            tw.see("end")
-            tw.configure(state="disabled")
-        except Exception:
-            pass
+        """校验日志: 写入传输日志 (校验页已取消)"""
+        self._log(msg)
 
     def _set_verify_status(self, text: str):
-        """更新步骤 5 校验进度标签"""
+        """校验状态: 同步到底部状态条 + 边传边校验状态行"""
         try:
-            self.ui.tk_label_verify_progress.configure(text=text)
+            self._set_status(text)
+            self.ui.set_verify_online_status(text)
         except Exception:
             pass
 
     def _set_verify_progress(self, pct: int, status: str):
-        """更新步骤 5 校验进度条 + 标签"""
+        """校验进度: 更新边传边校验状态行 (校验页已取消)"""
         try:
-            self.ui.tk_verify_progress_bar.config(value=pct)
-            self.ui.tk_label_verify_progress.configure(text=status)
+            self.ui.set_verify_online_status(status)
         except Exception:
             pass
 
     def _set_verify_result(self, text: str, success: bool = True):
-        """更新步骤 5 校验结果标签"""
-        try:
-            fg = "#16a34a" if success else "#dc2626"
-            self.ui.tk_label_verify_result.configure(text=text, fg=fg)
-            self.ui.tk_verify_progress_bar.config(value=100 if success else 0)
-        except Exception:
-            pass
+        """校验结果: 写入状态条与传输日志 (校验页已取消)"""
+        self._log(text)
+        self._set_status(text)
 
     def _detect_gtmc_new_name(self) -> str:
         """
@@ -2258,18 +2759,27 @@ class Controller:
             self._log(log_msg)
 
     def _log(self, message: str):
-        """向 GUI 日志区域输出日志"""
+        """向 GUI 日志区域输出日志。
+        线程安全: 后台线程调用时自动入队, 由主线程 _poll_ui_q 渲染
+        (本环境 tkinter 禁止后台线程直接操作 widget)。"""
+        self._post_ui(self._log_direct, str(message))
+
+    def _log_direct(self, message: str):
         try:
-            text_widget = self.ui.tk_text_mqg105ch
-            text_widget.insert("end", message + "\n")
-            text_widget.see("end")
+            with _TK_LOCK:
+                text_widget = self.ui.tk_text_mqg105ch
+                text_widget.insert("end", message + "\n")
+                text_widget.see("end")
         except Exception:
             pass
 
     # ==================== 进度条 & 状态 ====================
 
     def _set_status(self, text: str):
-        """更新状态标签 (底部状态栏 + 传输页面状态)"""
+        """更新状态标签 (底部状态栏 + 传输页面状态)。线程安全 (自动转主线程执行)。"""
+        self._post_ui(self._set_status_direct, text)
+
+    def _set_status_direct(self, text: str):
         try:
             self.ui.tk_label_status.config(text=text)
         except Exception:
@@ -2280,7 +2790,10 @@ class Controller:
             pass
 
     def _set_progress(self, value: float, maximum: float = 100):
-        """更新进度条 (value 0-100)"""
+        """更新进度条 (value 0-100)。线程安全 (自动转主线程执行)。"""
+        self._post_ui(self._set_progress_direct, value, maximum)
+
+    def _set_progress_direct(self, value: float, maximum: float = 100):
         try:
             if maximum != 100:
                 pct = min(value / maximum * 100, 100) if maximum > 0 else 0
@@ -2319,24 +2832,25 @@ class Controller:
         """
         try:
             pct = min(done / total * 100, 100) if total > 0 else 0
-            self.ui.after(0, lambda: self.ui.tk_file_progress_bar.config(value=pct))
-            self.ui.after(0, lambda p=partition: self._set_status(f"正在拷贝 {p} 盘 ({done}/{total})"))
+            # 后台传输线程回调: 经 _post_ui / _set_status 转主线程
+            self._post_ui(self.ui.tk_file_progress_bar.config, value=pct)
+            self._set_status(f"正在拷贝 {partition} 盘 ({done}/{total})")
         except Exception:
             pass
 
     def _verify_online_progress(self, ok: int, fail: int, total: int):
-        """边传边校验进度回调 (在传输的校验线程中调用, 经 ui.after 转主线程更新 UI)
+        """文件确认进度回调 (在传输的校验线程中调用, 经 _post_ui 转主线程更新 UI)
 
-        file_transfer.download_files 的边传边校验线程每确认一个文件调用一次。
+        file_transfer.download_files 的文件确认线程每确认一个文件调用一次。
         """
         try:
             if total <= 0:
                 return
             if fail > 0:
-                text = f"边传边校验：已确认 {ok}/{total} 个文件（{fail} 个待校验阶段复核）"
+                text = f"文件确认：已确认 {ok}/{total} 个文件（{fail} 个待校验阶段复核）"
             else:
-                text = f"边传边校验：已确认 {ok}/{total} 个文件"
-            self.ui.after(0, lambda t=text: self.ui.set_verify_online_status(t))
+                text = f"文件确认：已确认 {ok}/{total} 个文件"
+            self._post_ui(self.ui.set_verify_online_status, text)
         except Exception:
             pass
 
@@ -2469,23 +2983,24 @@ class Controller:
                 log_callback(f"[X] 冲突对话框异常: {ex}")
                 event.set()
 
-        self.ui.after(0, _show_dialog)
+        # worker 线程禁止直接调 tk: 经 _post_ui 转主线程弹窗
+        self._post_ui(_show_dialog)
         event.wait()  # 阻塞 worker 线程, 等待用户点击
         return result[0]
 
     # ==================== 清理退出 ====================
 
     def _send_skip_verify_on_close(self):
-        """窗口关闭时: 若接收方已进入校验页但未完成校验, 参照"跳过校验"向服务器
+        """窗口关闭时: 若接收方传输已完成但校验未完成, 参照"跳过校验"向服务器
         发送跳过校验信息 (创建空 <设备名>_Unverifi.zip 并上传)。
 
         在 shutdown 中同步调用, 进程退出前需完成上传 (否则 os._exit 中断后台线程)。
         """
-        # 仅接收方 + 已到校验页 (步骤6) + 未完成校验 时触发
+        # 仅接收方 + 传输已完成 + 校验未完成 时触发 (校验页已取消, 校验自动后台执行)
         if self._device_type != "目标设备":
             return
-        if getattr(self.ui, '_step', 0) != 6:
-            return
+        if not self._transfer_done:
+            return  # 传输未完成, 无需发送
         if self._verify_done:
             return  # 已正常完成校验, 报告已上传
         if self._send_skip_verify_done:
@@ -2528,7 +3043,20 @@ class Controller:
         """
         self._log("[清理] 正在关闭所有后台进程...")
 
-        # -1. 校验页未完成校验就直接关闭程序 → 参照"跳过校验"发送跳过信息
+        # -1. 解除传输期间的全屏锁定 (兜底, 防窗口关闭时仍被锁住)
+        try:
+            self.ui.unlock_screen()
+        except Exception:
+            pass
+        # 取消源端完成检测轮询
+        if getattr(self, "_source_done_after", None):
+            try:
+                self.ui.after_cancel(self._source_done_after)
+            except Exception:
+                pass
+            self._source_done_after = None
+
+        # 0. 校验页未完成校验就直接关闭程序 → 参照"跳过校验"发送跳过信息
         #     需在进程退出前同步完成上传, 否则 os._exit 会中断后台线程
         try:
             self._send_skip_verify_on_close()

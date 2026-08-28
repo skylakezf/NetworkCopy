@@ -305,6 +305,35 @@ class MiniDHCPServer:
         """返回 DHCP 服务器是否正在运行"""
         return self._running
 
+    def set_out_ips(self, ips):
+        """更新广播出口网卡 IP 列表 (供动态刷新: APIPA 地址可能在启动后才出现)"""
+        self.out_ips = ips or []
+
+    def refresh_out_ips(self):
+        """动态刷新广播出口 send sockets: 将新出现的出口 IP 绑定新 socket。
+
+        用于 APIPA 地址在服务器启动后才分配的场景 (刚插网线时 Windows 需约
+        15 秒探测), 保证 OFFER/ACK 从新出现的地址发出, 提高发现成功率。"""
+        if not self._running:
+            return
+        bound = set()
+        for sock in list(self._send_socks):
+            try:
+                bound.add(sock.getsockname()[0])
+            except Exception:
+                pass
+        for ip in list(self.out_ips):
+            if ip in bound:
+                continue
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.bind((ip, 0))
+                self._send_socks.append(sock)
+                print(f"[DHCP] 广播应答出口网卡绑定: {ip}")
+            except Exception as e:
+                print(f"[DHCP] 绑定出口网卡 {ip} 失败: {e}")
+
     def stop(self):
         """停止 DHCP 服务器"""
         self._running = False

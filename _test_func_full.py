@@ -516,8 +516,8 @@ def test_network_down_completion():
         t.ctl._on_download_complete(False, 100, 0, [])
         t.app.update_idletasks()
         eq(t.ctl._network_down, False, "处理后应复位标志")
-        check("网络连接已断开" in t.app.tk_label_transfer_error.cget("text"),
-              "错误提示应含'网络连接已断开'")
+        check("网络连接已中断" in t.app.tk_label_transfer_error.cget("text"),
+              "错误提示应含'网络连接已中断'")
     finally:
         t.destroy()
 

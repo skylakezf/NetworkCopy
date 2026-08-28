@@ -1068,9 +1068,13 @@ def verify_csv(
     progress_callback=None,
     target_indices=None,
     pre_ok_paths: set | None = None,
+    pre_ok_sizes: dict | None = None,
+    fail_list_out: list | None = None,
 ) -> tuple:
     """
     校验 CSV 文件 (多线程) —— 纯校验，不做重试下载
+    fail_list_out: 可选输出列表, 校验失败文件的 (完整路径, 原因) 明细写入其中
+                   (调用方负责清空; run_verification 会在最终根据 CSV 重建)
     csv_path: FullFilelist_DEF.csv 的完整路径
     partition_map: {"D": "I:", "E": "J:", "F": "K:"}  正常盘符→PE盘符(目标设备)
     max_workers: 校验线程数 (默认 12)
@@ -1166,19 +1170,42 @@ def verify_csv(
         for i, r in verify_items:
             full = r[col_b].strip() if len(r) > col_b else ""
             if full and full in pre_ok_paths:
-                while len(r) <= col_e:
-                    r.append("")
-                if not r[col_e]:
-                    r[col_e] = "Y"
-                result_map[i] = r
-                pre_ok_count += 1
+                # 大小复核: 边传边校验记录的大小与磁盘当前大小一致才跳过,
+                # 不一致(传输后被改动/损坏)则转实际校验
+                size_ok = True
+                if pre_ok_sizes and full in pre_ok_sizes:
+                    try:
+                        drive_letter = r[col_a].strip().upper() if len(r) > col_a else ""
+                        pe_drive = ""
+                        if drive_letter and drive_letter in partition_map:
+                            pe_drive = partition_map[drive_letter].rstrip("\\") + "\\"
+                        elif len(full) >= 2 and full[1] == ":":
+                            src = full[0].upper()
+                            raw = partition_map.get(src, "")
+                            pe_drive = raw.rstrip("\\") + "\\" if raw else ""
+                        rel = full[3:] if len(full) >= 2 and full[1] == ":" else full
+                        actual = os.path.join(pe_drive, rel) if pe_drive else full
+                        if os.path.isfile(actual) and os.path.getsize(actual) != pre_ok_sizes[full]:
+                            size_ok = False
+                    except Exception:
+                        size_ok = True  # 无法复核时保持跳过
+                if size_ok:
+                    while len(r) <= col_e:
+                        r.append("")
+                    if not r[col_e]:
+                        r[col_e] = "Y"
+                    result_map[i] = r
+                    pre_ok_count += 1
+                else:
+                    # 大小不一致: 不跳过, 转实际校验
+                    filtered_items.append((i, r))
             else:
                 filtered_items.append((i, r))
         if pre_ok_count:
             verify_items = filtered_items
             work_total = len(verify_items) + pre_ok_count
             passed += pre_ok_count
-            log(f"边传边校验已确认 {pre_ok_count} 个文件, 跳过磁盘校验")
+            log(f"边传边校验已确认 {pre_ok_count} 个文件, 跳过磁盘校验(已复核大小)")
 
     # 多线程校验
     verify_row_map = {i: r for i, r in verify_items}
@@ -1222,6 +1249,19 @@ def verify_csv(
                 if log_msg and log_callback:
                     log_callback(log_msg)
 
+                # 收集失败文件明细 (供总结页展示)
+                if fail_list_out is not None and result == "N":
+                    _full = ""
+                    try:
+                        if len(updated_row) > col_b:
+                            _full = updated_row[col_b].strip()
+                    except Exception:
+                        pass
+                    _reason = ""
+                    if log_msg:
+                        _reason = log_msg.strip().lstrip("[N]").strip()
+                    fail_list_out.append((_full, _reason))
+
                 # 每完成一个文件回调进度
                 current = completed_count[0]
                 if progress_callback:
@@ -1248,6 +1288,17 @@ def verify_csv(
                             result_map[ex_idx] = ex_row
                 except Exception:
                     pass
+                # 异常行也收集为失败明细
+                if fail_list_out is not None:
+                    _full = ""
+                    try:
+                        _ex_idx = futures.get(future)
+                        _ex_row = verify_row_map.get(_ex_idx) if _ex_idx is not None else None
+                        if _ex_row is not None and len(_ex_row) > col_b:
+                            _full = _ex_row[col_b].strip()
+                    except Exception:
+                        pass
+                    fail_list_out.append((_full, f"校验线程异常: {e}"))
 
     # 按原始顺序重组结果
     updated_rows = [result_map[i] for i in range(len(rows)) if i in result_map]
@@ -1345,6 +1396,46 @@ def create_unverifi_zip(log_callback=None, save_dir: str = "") -> tuple:
         return False, ""
 
 
+def _get_failed_paths_from_csv(csv_path: str, partition_map: dict) -> list:
+    """读取最终 CSV, 返回 VerifyResult=N 的文件在目标设备上的完整路径列表"""
+    failed_paths = []
+    try:
+        enc = _detect_csv_encoding(csv_path)
+        with open(csv_path, "r", encoding=enc, newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                return failed_paths
+            try:
+                col_a = header.index("Drive")
+            except ValueError:
+                col_a = 0
+            try:
+                col_b = header.index("FullPath")
+            except ValueError:
+                col_b = 1
+            try:
+                col_e = header.index("VerifyResult") if "VerifyResult" in header else 4
+            except ValueError:
+                col_e = 4
+            for row in reader:
+                if len(row) <= col_e:
+                    continue
+                if row[col_e] != "N":
+                    continue
+                drive = row[col_a] if len(row) > col_a else ""
+                rel_path = row[col_b] if len(row) > col_b else ""
+                pe_drive = partition_map.get(drive, drive) if partition_map else drive
+                if pe_drive and rel_path:
+                    full = os.path.join(pe_drive, rel_path.lstrip("\\/")).replace("/", "\\")
+                else:
+                    full = rel_path or ""
+                failed_paths.append(full)
+    except Exception:
+        pass
+    return failed_paths
+
+
 # ==================== 公开入口 ====================
 
 def run_verification(
@@ -1361,6 +1452,8 @@ def run_verification(
     csv_path: str = "",
     report_zip_out=None,
     pre_ok_paths: set | None = None,
+    pre_ok_sizes: dict | None = None,
+    fail_list_out: list | None = None,
 ) -> tuple:
     """
     执行完整校验流程
@@ -1417,11 +1510,15 @@ def run_verification(
             log("非 WinPE 环境: 源端未重命名 GTMC_User_Profiles，CSV 路径保持原样")
 
         # ---- 第一轮: 纯校验 (边传边校验已确认的文件直接标记 Y, 跳过磁盘校验) ----
+        if fail_list_out is not None:
+            fail_list_out.clear()
         passed, failed, skipped, total = verify_csv(
             csv_path, partition_map, log_callback,
             max_workers=max_workers, stop_check=stop_check,
             progress_callback=progress_callback,
             pre_ok_paths=pre_ok_paths,
+            pre_ok_sizes=pre_ok_sizes,
+            fail_list_out=fail_list_out,
         )
 
         # ---- 第二轮: 如果有缺失文件且源设备可达，重试下载 ----
@@ -1483,6 +1580,7 @@ def run_verification(
                         stop_check=stop_check,
                         progress_callback=progress_callback,
                         target_indices=set(missing_indices_out),
+                        fail_list_out=fail_list_out,
                     )
                     # 合并统计 (保持全量视角): 第一次通过/跳过的 + 二次校验恢复的
                     passed = passed + passed2
@@ -1496,6 +1594,17 @@ def run_verification(
             add_file_type_column(csv_path, log)
         except Exception as e:
             log(f"文件类型标记失败: {e}")
+
+        # ---- 根据最终 CSV 重建失败文件明细 (与最终统计保持一致) ----
+        if fail_list_out is not None:
+            try:
+                final_failed_paths = _get_failed_paths_from_csv(csv_path, partition_map)
+                reason_map = {p: r for p, r in fail_list_out}
+                fail_list_out.clear()
+                for p in final_failed_paths:
+                    fail_list_out.append((p, reason_map.get(p, "校验失败")))
+            except Exception:
+                pass
 
         # ---- 校验完成后打包校验报告 <设备名>_verifierReport.zip ----
         try:

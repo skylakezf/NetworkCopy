@@ -22,6 +22,8 @@ import tempfile
 import time
 import urllib.request
 
+# 测试环境: 关闭"启动时用默认浏览器打开 EULA 页面"
+os.environ["NETCOPY_SKIP_EULA_BROWSER"] = "1"
 BASE = os.path.dirname(os.path.abspath(__file__))
 if BASE not in sys.path:
     sys.path.insert(0, BASE)
@@ -312,6 +314,99 @@ def test_verify_after_transfer_degraded():
             shutil.rmtree(p, ignore_errors=True)
 
 
+def test_auto_verify_after_transfer():
+    """场景 6: 传输完成后自动校验 + 报告生成 + 自动上传 (校验页已取消)"""
+    print("\n[场景6] 传输完成自动校验 → 生成报告 → 自动上传")
+    import ui as ui_mod
+    import control as ctl_mod
+    import verifier as v_mod
+    import config_transfer as ct_mod
+
+    auth = "G7H8"
+    src_d = tempfile.mkdtemp(prefix="old_d_")
+    src_f = tempfile.mkdtemp(prefix="old_f_")
+    dst_d = tempfile.mkdtemp(prefix="new_d_")
+    dst_f = tempfile.mkdtemp(prefix="new_f_")
+    srv = None
+    app = None
+    try:
+        make_src_partition(src_d)
+        srv = start_old_device({"D": src_d, "F": src_f}, auth)
+        check(wait_server_ready(auth), "旧设备文件服务器已就绪")
+
+        # 真实下载链路
+        ok, done, _db, _errs = download_files(
+            server_ip="127.0.0.1",
+            partition_map={"D": dst_d, "F": dst_f},
+            log_callback=lambda m: None,
+            max_workers=3,
+            partition_count=3,
+            auth_code=auth,
+        )
+        eq(ok, True, "下载应成功")
+
+        # 模拟新设备控制层「传输完成」回调
+        app = ui_mod.WinGUI()
+        app.report_callback_exception = lambda *a: None
+        ctl = ctl_mod.Controller()
+        ctl.init(app)
+        app.ctl = ctl
+        ctl._partition_map = {"D": dst_d, "F": dst_f}
+        ctl._last_source_ip = "127.0.0.1"
+        ctl._auth_code = auth
+        ctl._device_type = "目标设备"
+        ctl._pre_verified_file = None  # 简化: 不依赖边传边校验清单
+
+        calls = {"verify": 0, "upload": 0}
+        # 注意: control.py 通过模块级导入绑定 run_verification, 必须 patch control 模块全局
+        _orig_verify = ctl_mod.run_verification
+        _orig_upload = ct_mod.upload_zip_to_server
+        try:
+            def _fake_verify(**kw):
+                calls["verify"] += 1
+                # 真实 run_verification 会把校验报告 ZIP 路径 append 进 report_zip_out 列表
+                rzo = kw.get("report_zip_out")
+                if rzo is not None:
+                    rzo.append("unverifi_report.zip")
+                return True, 5, 0, 0, 5  # ok, passed, failed, skipped, total
+
+            def _fake_upload(zip_path, log_callback=None, **kw):
+                calls["upload"] += 1
+                calls["zip"] = zip_path
+                return True, None
+
+            ctl_mod.run_verification = _fake_verify
+            ct_mod.upload_zip_to_server = _fake_upload
+
+            # 传输完成 → 应自动启动校验线程
+            ctl._on_download_complete(True, done, _db, [])
+            app.update()
+            check(ctl._verify_thread is not None, "传输完成后应自动启动校验线程")
+
+            # 等待校验完成 + 报告上传
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                app.update()
+                time.sleep(0.05)
+                if ctl._verify_done and calls["upload"] >= 1:
+                    break
+            eq(ctl._verify_done, True, "校验应自动完成")
+            check(calls["verify"] >= 1, "run_verification 应被自动调用")
+            check(calls["upload"] >= 1, "校验报告应自动上传到服务器")
+            check(ctl._verify_report_path is not None, "校验报告路径应已记录")
+            eq(ctl._transfer_done, True, "传输完成标记应置位")
+        finally:
+            ctl_mod.run_verification = _orig_verify
+            ct_mod.upload_zip_to_server = _orig_upload
+    finally:
+        if app:
+            app.destroy()
+        if srv:
+            srv.stop()
+        for p in (src_d, src_f, dst_d, dst_f):
+            shutil.rmtree(p, ignore_errors=True)
+
+
 def test_dhcp_client_nic_independent():
     """场景 5: 新设备「寻找旧电脑」在无手动网卡时不会崩溃 (自动网卡逻辑)"""
     print("\n[场景5] 接收端 DHCP 按钮不依赖手动网卡选择")
@@ -352,6 +447,7 @@ def main():
     test_wrong_auth_rejected()
     test_resume_second_download_skips_existing()
     test_verify_after_transfer_degraded()
+    test_auto_verify_after_transfer()
     test_dhcp_client_nic_independent()
 
     print("-" * 60)
