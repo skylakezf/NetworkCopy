@@ -115,6 +115,9 @@ NetworkzCopy/
 ├── dhcp_server.py             # 内置迷你 DHCP 服务器
 ├── tls_utils.py               # 验证码生成 + 自签名证书管理
 ├── systemconfig/              # 分配单元迁移估算等子模块
+├── tests/                     # 全部自动化测试套件
+├── run_tests.py               # 测试唯一入口（自动发现 tests/）
+├── _cleanup_zero_byte_dupes.py  # 维护脚本: 清理 0KB 垃圾文件
 ├── certs/                     # 自签名证书（server.pem / server.key）
 ├── build.ps1                  # PyInstaller 打包脚本
 ├── .github/workflows/
@@ -169,16 +172,36 @@ NetworkzCopy/
 
 ## 测试
 
-| 脚本 | 覆盖范围 | 数量 |
-|------|----------|------|
-| `_test_ui_full.py` | UI 全流程 / 按钮状态 / 导航 / 验证码横幅 | 46 项 |
-| `_test_func_full.py` | 过滤规则 / HTTPS 端点 / 端到端传输 / CSV / 断网检测 | 30 项 |
-| `_test_device_replacement.py` | 设备更换端到端（导出→传输→导入→校验） | 29 项 |
-| `_test_user_cases.py` | 普通用户场景用例（映射《测试用例.md》） | 21 项 |
+所有测试集中在 `tests/`，由唯一入口 `run_tests.py` 统一调度（串行执行，避免 Tk 窗口与传输端口冲突）：
 
 ```powershell
-python-3.13.14-embed-amd64\python.exe _test_ui_full.py
+# 全部套件
+.\python-3.13.14-embed-amd64\python.exe run_tests.py
+# 只跑名称含 ui 的套件 / 跳过耗时 E2E / 列出套件
+.\python-3.13.14-embed-amd64\python.exe run_tests.py --only ui
+.\python-3.13.14-embed-amd64\python.exe run_tests.py --fast
+.\python-3.13.14-embed-amd64\python.exe run_tests.py --list
 ```
+
+| 套件 | 覆盖范围 | 数量 |
+|------|----------|------|
+| `tests/test_ui.py` | UI 全流程 / 按钮 / 导航 / 验证码横幅 | 60 项 |
+| `tests/test_func.py` | 过滤规则 / HTTPS 端点 / CSV 路径修复 / 端点传输 | 32 项 |
+| `tests/test_verify_e2e.py` | 增量确认 / 全盘清单 / 下载+边传边校验 E2E | 32 项 |
+| `tests/test_punctuation.py` | 文件名标点(半角/全角) + 0KB 垃圾文件防护 | 26 项 |
+| `tests/test_device_replacement.py` | 设备更换端到端（导出→传输→导入→校验） | 25 项 |
+| `tests/test_device_transfer_e2e.py` | 两设备间实际传输 E2E（需证书） | 33 项 |
+| `tests/test_user_cases.py` | 普通用户场景用例（映射《测试用例.md》） | 21 项 |
+| `tests/test_button_states.py` | 按钮状态矩阵 / 断网 / 验证码三场景 | 14 项 |
+| `tests/test_ui_readability.py` | 布局可读性与按钮可见性 | 11 项 |
+| `tests/test_disconnect.py` | 断线 / 验证码错误的完成判定 | 7 项 |
+| `tests/test_thread_safe.py` | 后台线程 tkinter 调用约束 | 7 项 |
+
+合计 **11 套件 / 268 用例**。新增套件只需在 `tests/` 放入 `test_xxx.py`（含 `main()`），
+`run_tests.py` 会自动发现，无需修改入口脚本。
+
+维护脚本：`_cleanup_zero_byte_dupes.py` 用于清理历史遗留的 0KB 垃圾文件（默认 dry-run，
+`--delete` 才真删，详见文件头说明）。
 
 ---
 

@@ -1554,7 +1554,7 @@ class Controller:
             )
         except Exception:
             pass
-        # show_transfer_error 会把传输页状态标签写为"网络连接已中断", 此处修正为验证码错误文案
+        # show_transfer_error 会把状态标签写为"请返回修改验证码", 此处细化为验证码错误文案
         try:
             self.ui.tk_label_transfer_status.config(
                 text=" 接收端输入的验证码有误，请在两台设备上确认验证码一致后重新接收"

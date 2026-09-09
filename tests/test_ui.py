@@ -2,13 +2,17 @@
 全场景 UI 准确性测试
 测试所有导航路径、按钮状态、步骤跳转逻辑
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import sys, os, threading, traceback, types
 
 # 测试环境: 关闭"启动时用默认浏览器打开 EULA 页面"
 os.environ["NETCOPY_SKIP_EULA_BROWSER"] = "1"
-os.chdir(r'c:\Users\Xinyi\Desktop\网络拷贝\NetworkzCopy')
-sys.path.insert(0, '.')
-sys.path.insert(0, os.path.join(os.getcwd(), 'python-3.13.14-embed-amd64', 'Lib', 'site-packages'))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, 'python-3.13.14-embed-amd64',
+                                'Lib', 'site-packages'))
 
 # ============================================================
 # 导入被测模块
@@ -1357,8 +1361,8 @@ def test_show_transfer_error():
         except Exception:
             check(False, "错误区应已 pack")
         eq(t.app.tk_label_transfer_error.cget("text"), "测试错误消息")
-        check("网络连接已中断" in t.app.tk_label_transfer_status.cget("text"),
-              "状态标签应显示断网提示")
+        check("请返回修改验证码" in t.app.tk_label_transfer_status.cget("text"),
+              "状态标签应显示返回修改验证码提示 (0c7c3da 起不再误写为断网提示)")
         t.app.hide_transfer_error()
         t.app.update_idletasks()
         try:

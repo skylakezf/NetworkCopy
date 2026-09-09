@@ -7,12 +7,16 @@
   C. 接收端 _on_download_complete(部分文件失败) → 不进入完成流程/配置导入, 不发 done
   D. 接收端 _on_download_complete(成功) → 上报 done, 进入完成流程
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import sys, os, threading, traceback, time
 
 os.environ["NETCOPY_SKIP_EULA_BROWSER"] = "1"
-os.chdir(r'c:\Users\Xinyi\Desktop\网络拷贝\NetworkzCopy')
-sys.path.insert(0, '.')
-sys.path.insert(0, os.path.join(os.getcwd(), 'python-3.13.14-embed-amd64', 'Lib', 'site-packages'))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, 'python-3.13.14-embed-amd64',
+                                'Lib', 'site-packages'))
 
 from ui import WinGUI
 from control import Controller, SOURCE_IDLE_TIMEOUT

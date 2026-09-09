@@ -13,6 +13,8 @@
 运行 (需 cryptography):
     python-3.13.14-embed-amd64\\python.exe _test_device_transfer_e2e.py
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import hashlib
 import os
 import shutil
@@ -24,7 +26,7 @@ import urllib.request
 
 # 测试环境: 关闭"启动时用默认浏览器打开 EULA 页面"
 os.environ["NETCOPY_SKIP_EULA_BROWSER"] = "1"
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE not in sys.path:
     sys.path.insert(0, BASE)
 os.chdir(BASE)

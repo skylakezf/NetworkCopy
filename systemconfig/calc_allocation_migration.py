@@ -99,10 +99,12 @@ def format_bytes_gb(b: int) -> float:
 
 
 def escape_csv(val: str) -> str:
-    """CSV 路径标准化: 统一正斜杠为反斜杠, 移除末尾空格。
-    注: 不再替换逗号为中文逗号 — Python csv.writer 会自动对含逗号
-        的字段加双引号转义, 手动替换会导致校验器路径不匹配。"""
-    return val.replace("/", "\\").rstrip()
+    """CSV 路径标准化: 统一正斜杠为反斜杠, 移除末尾反斜杠。
+    注1: 不再替换逗号为中文逗号 — Python csv.writer 会自动对含逗号
+         的字段加双引号转义, 手动替换会导致校验器路径不匹配。
+    注2: 只去除末尾反斜杠, 不能用 rstrip() —— 那会连文件名尾部的空格一起
+         去掉, 使 CSV 路径与磁盘真实文件名不一致 (Windows 允许文件名以空格结尾)。"""
+    return val.replace("/", "\\").rstrip("\\")
 
 
 class DriveScanResult:

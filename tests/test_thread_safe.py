@@ -8,11 +8,15 @@
   5. 后台线程 ctl._ui_after(ms, fn) → fn 在主线程延时执行
   6. 直接调用 app.after (旧违规模式) → 应抛 RuntimeError (证明必须走队列)
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import os, sys, time, threading, traceback
 os.environ["NETCOPY_SKIP_EULA_BROWSER"] = "1"
-os.chdir(r'c:\Users\Xinyi\Desktop\网络拷贝\NetworkzCopy')
-sys.path.insert(0, '.')
-sys.path.insert(0, os.path.join(os.getcwd(), 'python-3.13.14-embed-amd64', 'Lib', 'site-packages'))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, 'python-3.13.14-embed-amd64',
+                                'Lib', 'site-packages'))
 from ui import WinGUI
 from control import Controller
 

@@ -2,11 +2,15 @@
 1. 接收端设备发现页: 「手动导入系统配置」与「高级: 手动输入 IP 地址」同 Y 轴 (并排)
 2. 总结页 (step4): 「完成并退出」按钮在窗口可视范围内 (不被内容顶出)
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import os, sys, time
 os.environ["NETCOPY_SKIP_EULA_BROWSER"] = "1"
-os.chdir(r'c:\Users\Xinyi\Desktop\网络拷贝\NetworkzCopy')
-sys.path.insert(0, '.')
-sys.path.insert(0, os.path.join(os.getcwd(), 'python-3.13.14-embed-amd64', 'Lib', 'site-packages'))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, 'python-3.13.14-embed-amd64',
+                                'Lib', 'site-packages'))
 from ui import WinGUI
 from control import Controller
 

@@ -170,9 +170,9 @@ class WinGUI(ttk.Window):
         side_current = map_ui_to_side.get(current, 0)
 
         desc_map = {
-            0: ("选择发送方或接收方", "请选择[旧设备(发送方)]或[新设备(接收方)]"),
-            1: ("高级设置 — 磁盘 / 分区 / IP", "磁盘选择(仅PE) · 分区映射 · 网络配置"),
-            2: ("准备连接", "启动服务，输入验证码并开始传输"),
+            0: ("设备类型选择", ""),
+            1: ("连接并查找设备", ""),
+            2: ("准备连接", ""),
             3: ("传输进度 / 数据校验", "文件传输中，完成后自动校验并上传报告"),
             4: ("传输总结", "配置导入结果 · 文件校验结果"),
             5: ("传输完成", "接收端已完成数据拷贝，可安全关闭"),
@@ -569,7 +569,7 @@ class WinGUI(ttk.Window):
         # 手动配置导入模式: 勾选后传输完成不自动导入配置, 由用户在总结页手动操作
         self.tk_var_manual_import = _tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            self._target_opt_row, text="手动导入系统配置（传输完成后不自动导入）",
+            self._target_opt_row, text="手动导入系统配置",
             variable=self.tk_var_manual_import,
             bootstyle="secondary",
         ).pack(side=LEFT, padx=(0, 24))

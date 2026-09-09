@@ -10,13 +10,17 @@
   G. config_transfer ZIP 压缩命名
   H. controller 网络断开检测 (2026-08-05 新增)
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import sys, os, threading, time, traceback, tempfile, shutil
 import json, ssl, struct
 import urllib.request, urllib.error
 
-os.chdir(r'c:\Users\Xinyi\Desktop\网络拷贝\NetworkzCopy')
-sys.path.insert(0, '.')
-sys.path.insert(0, os.path.join(os.getcwd(), 'python-3.13.14-embed-amd64', 'Lib', 'site-packages'))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, 'python-3.13.14-embed-amd64',
+                                'Lib', 'site-packages'))
 
 # ============================================================
 # 测试框架 (与 UI 测试脚本一致)
@@ -318,8 +322,53 @@ def test_normalize_csv_path():
     eq(_normalize_csv_path(r"F:\a\b.txt"), r"F:\a\b.txt")
     eq(_normalize_csv_path(""), "")
 
-@test("D2. _repair_csv_in_place 修复损坏 CSV")
+@test("D2. _repair_csv_in_place 修复旧版 escape_csv 写坏的 CSV")
 def test_repair_csv_in_place():
+    import csv as _csv
+    from verifier import _repair_csv_in_place
+    with tempfile.TemporaryDirectory() as td:
+        # 磁盘上真实存在的是半角逗号文件, CSV 里被旧 escape_csv 写成了全角
+        sub = os.path.join(td, "学习")
+        os.makedirs(sub, exist_ok=True)
+        with open(os.path.join(sub, "前处理,ED整理表.xls"), "wb") as f:
+            f.write(b"x" * 100)
+        csv_path = os.path.join(td, "FullFilelist_DEF.csv")
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+            f.write("FullPath,FileName,Size\n")
+            f.write(r"F:\学习\前处理，ED整理表.xls,前处理，ED整理表.xls,100" + "\n")
+            f.write(r"F:\正常\文件.txt,文件.txt,50" + "\n")
+        n = _repair_csv_in_place(csv_path, partition_map={"F": td})
+        eq(n, 1, "应修复 1 行 FullPath")
+        with open(csv_path, encoding="utf-8-sig") as f:
+            rows = list(_csv.reader(f))
+        eq(rows[1][0], r"F:\学习\前处理,ED整理表.xls", "FullPath 应还原为半角逗号")
+        eq(rows[2][0], r"F:\正常\文件.txt", "无逗号路径不受影响")
+
+
+@test("D3. 文件名本身含全角逗号时绝不能被改写 (2026-09-09 回归)")
+def test_repair_csv_keeps_fullwidth_comma():
+    """回归: 磁盘真实文件名就是全角逗号, CSV 记录正确 —— 不得改成半角,
+    否则校验会误判缺失并在重试下载时写出 0KB 垃圾文件。"""
+    import csv as _csv
+    from verifier import _repair_csv_in_place
+    with tempfile.TemporaryDirectory() as td:
+        sub = os.path.join(td, "学习")
+        os.makedirs(sub, exist_ok=True)
+        with open(os.path.join(sub, "前处理，ED整理表.xls"), "wb") as f:
+            f.write(b"x" * 100)
+        csv_path = os.path.join(td, "FullFilelist_DEF.csv")
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+            f.write("FullPath,FileName,Size\n")
+            f.write(r"F:\学习\前处理，ED整理表.xls,前处理，ED整理表.xls,100" + "\n")
+        n = _repair_csv_in_place(csv_path, partition_map={"F": td})
+        eq(n, 0, "全角逗号是真实文件名, 不应修改")
+        with open(csv_path, encoding="utf-8-sig") as f:
+            rows = list(_csv.reader(f))
+        eq(rows[1][0], r"F:\学习\前处理，ED整理表.xls", "FullPath 应保持全角逗号")
+
+
+@test("D4. 无盘符映射时不修改 CSV (安全兜底)")
+def test_repair_csv_without_partition_map():
     import csv as _csv
     from verifier import _repair_csv_in_place
     with tempfile.TemporaryDirectory() as td:
@@ -327,14 +376,11 @@ def test_repair_csv_in_place():
         with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
             f.write("FullPath,FileName,Size\n")
             f.write(r"F:\学习\前处理，ED整理表.xls,前处理，ED整理表.xls,100" + "\n")
-            f.write(r"F:\正常\文件.txt,文件.txt,50" + "\n")
         n = _repair_csv_in_place(csv_path)
-        eq(n, 2, "应修复 2 个字段")
+        eq(n, 0, "无法验证磁盘存在性时不应修改")
         with open(csv_path, encoding="utf-8-sig") as f:
             rows = list(_csv.reader(f))
-        eq(rows[1][0], r"F:\学习\前处理,ED整理表.xls", "FullPath 应还原")
-        eq(rows[1][1], "前处理,ED整理表.xls", "FileName 应还原")
-        eq(rows[2][0], r"F:\正常\文件.txt", "正常路径不受影响")
+        eq(rows[1][0], r"F:\学习\前处理，ED整理表.xls", "CSV 应保持原样")
 
 # ============================================================
 # E. calc_allocation_migration 过滤 & 计算
@@ -366,9 +412,11 @@ def test_skip_dir_rules():
 def test_escape_csv():
     import systemconfig.calc_allocation_migration as cam
     eq(cam.escape_csv("a,b"), "a,b", "逗号应保留")
-    # 斜杠标准化 + 去尾部空格; 文件名内部空格保留
-    eq(cam.escape_csv(r"F:\a\b/ c "), r"F:\a\b\ c",
-       "斜杠标准化+去尾空格, 内部空格保留")
+    # 斜杠标准化 + 去尾部反斜杠; 文件名内部空格与尾部空格都保留
+    # (尾部空格可能是真实文件名的一部分, 去掉会导致 CSV 路径与磁盘不一致)
+    eq(cam.escape_csv(r"F:\a\b/ c "), r"F:\a\b\ c ",
+       "斜杠标准化, 内部/尾部空格均保留")
+    eq(cam.escape_csv("F:\\a\\b\\"), r"F:\a\b", "仅去除尾部反斜杠")
 
 @test("E4. 分配单元对齐计算 (KB140365)")
 def test_aligned_size():
@@ -686,6 +734,8 @@ if __name__ == "__main__":
     # D. verifier
     test_normalize_csv_path()
     test_repair_csv_in_place()
+    test_repair_csv_keeps_fullwidth_comma()
+    test_repair_csv_without_partition_map()
 
     # E. calc_allocation_migration
     test_skip_file_rules()

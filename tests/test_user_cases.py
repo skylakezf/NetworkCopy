@@ -14,13 +14,17 @@
 
 运行: python-3.13.14-embed-amd64/python.exe _test_user_cases.py
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import sys, os, threading, traceback, time as _time
 
 # 测试环境: 关闭"启动时用默认浏览器打开 EULA 页面"
 os.environ["NETCOPY_SKIP_EULA_BROWSER"] = "1"
-os.chdir(r'c:\Users\Xinyi\Desktop\网络拷贝\NetworkzCopy')
-sys.path.insert(0, '.')
-sys.path.insert(0, os.path.join(os.getcwd(), 'python-3.13.14-embed-amd64', 'Lib', 'site-packages'))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, 'python-3.13.14-embed-amd64',
+                                'Lib', 'site-packages'))
 
 # ============================================================
 # 导入被测模块
@@ -451,9 +455,10 @@ def test_conflict_dialog_keep():
             result_box["r"] = t.ctl._resolve_conflicts(conflicts, lambda m: None)
         th = threading.Thread(target=worker, daemon=True)
         th.start()
-        # 无 mainloop: 手动驱动 after 回调 (创建对话框)
+        # 无 mainloop: 手动驱动 after 回调 + drain _ui_q (对话框经 _post_ui 入队, 由 _poll_ui_q 执行)
         _time.sleep(0.1)
         t.pump_after(pending)
+        t.ctl._poll_ui_q()
         # 找到"保留已有文件"按钮并模拟点击
         keep_btn = None
         for b in fake_kw_capture["buttons"]:
@@ -528,6 +533,7 @@ def test_conflict_dialog_overwrite():
         th.start()
         _time.sleep(0.1)
         t.pump_after(pending)
+        t.ctl._poll_ui_q()  # drain _ui_q: 对话框经 _post_ui 入队, 由主线程轮询执行
         overwrite_btn = None
         for b in fake_kw_capture["buttons"]:
             if "覆盖重新下载" in str(b.cget("text")):

@@ -2,13 +2,17 @@
 设备更换全流程端到端集成测试
 模拟: 旧设备(Sender) 导出配置→压缩→上传 → 新设备(Receiver) 下载→检测配置→导入
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import sys, os, threading, traceback, tempfile, shutil, io, json
 
 # 测试环境: 关闭"启动时用默认浏览器打开 EULA 页面"
 os.environ["NETCOPY_SKIP_EULA_BROWSER"] = "1"
-os.chdir(r'c:\Users\Xinyi\Desktop\网络拷贝\NetworkzCopy')
-sys.path.insert(0, '.')
-sys.path.insert(0, os.path.join(os.getcwd(), 'python-3.13.14-embed-amd64', 'Lib', 'site-packages'))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, 'python-3.13.14-embed-amd64',
+                                'Lib', 'site-packages'))
 
 # ============================================================
 # 导入被测模块

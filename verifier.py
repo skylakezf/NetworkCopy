@@ -24,23 +24,105 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ---- CSV 路径修复 (兼容旧版 escape_csv 的全角逗号 bug) ----
 # 旧版 calc_allocation_migration.py 的 escape_csv 会将路径中的 ASCII 逗号替换为全角逗号,
 # 导致 CSV 中的路径与磁盘实际路径不一致。此映射表用于修复已损坏的路径。
-# 注意: 仅修复已知的 escape_csv 替换, 不做泛化 (避免误改文件名中原本就是全角逗号的情况,
-#       这种情况极端罕见, 即使存在也意味着 CSV 路径与磁盘路径一致, 无需修复)。
+#
+# 【重要｜2026-09-09 修复】绝不能"无条件"做全角逗号 → 半角逗号替换:
+#   中文输入法下文件名里的逗号本来就是全角「，」, 这类文件非常常见。
+#   无条件替换会把「本来正确」的 CSV 路径改坏 → 校验判定文件缺失 →
+#   重试下载按错误路径向服务端请求 → 服务端找不到文件返回空数据 →
+#   客户端照写 → 目标盘多出 0KB 的同名(标点被改写)垃圾文件。
+#   因此: 只有「CSV 原路径在磁盘上不存在」且「候选路径确实存在」时才改写。
 _CSV_PATH_REPAIR_MAP = {
     "，": ",",   # 全角逗号 → ASCII 逗号 (旧 escape_csv 替换)
 }
 
 
 def _normalize_csv_path(path: str) -> str:
-    """修复旧版 escape_csv 造成的路径损坏 (全角逗号→ASCII逗号)"""
+    """旧版 escape_csv 损坏路径的候选修复 (全角逗号→ASCII逗号)。
+
+    注意: 这只是"生成候选", 是否采用必须由磁盘存在性校验决定, 见 _resolve_csv_field。
+    """
     for old, new in _CSV_PATH_REPAIR_MAP.items():
         if old in path:
             path = path.replace(old, new)
     return path
 
 
-def _repair_csv_in_place(csv_path: str, log_callback=None) -> int:
-    """原地修复 CSV 中被 escape_csv 损坏的路径。返回修复的字段数。"""
+def _has_comma(path: str) -> bool:
+    """路径中是否含半角或全角逗号 (不含逗号则无需任何修复尝试)。"""
+    return "," in path or "，" in path
+
+
+def _csv_path_candidates(path: str):
+    """生成待验证的候选路径 (按优先级)。
+
+    1) 全角→半角: 修复旧版 escape_csv 写坏的 CSV
+    2) 半角→全角: 修复被旧版 _repair_csv_in_place 误改的 CSV (本修复上线前的历史数据)
+    """
+    cand = _normalize_csv_path(path)
+    if cand != path:
+        yield cand
+    if "," in path:
+        reverse = path.replace(",", "，")
+        if reverse != path:
+            yield reverse
+
+
+def _csv_path_to_disk(full_path: str, partition_map: dict) -> str:
+    """把 CSV 中的源盘路径 (D:\\xx) 映射为目标设备上的实际路径。"""
+    if not full_path:
+        return ""
+    drive = ""
+    if len(full_path) >= 2 and full_path[1] == ":":
+        drive = full_path[0].upper()
+        rel = full_path[3:]
+    else:
+        rel = full_path
+    if partition_map and drive:
+        raw = partition_map.get(drive, "")
+        pe_drive = raw.rstrip("\\") + "\\" if raw else ""
+    else:
+        pe_drive = ""
+    return os.path.join(pe_drive, rel) if pe_drive else full_path
+
+
+def _disk_exists_for_csv_path(full_path: str, partition_map: dict) -> bool:
+    """判断 CSV 路径在目标设备上是否真实存在 (兼容 >260 长路径)。"""
+    actual = _csv_path_to_disk(full_path, partition_map)
+    if not actual:
+        return False
+    for candidate in (actual, "\\\\?\\" + actual):
+        try:
+            if os.path.isfile(candidate):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _resolve_csv_field(original: str, partition_map: dict) -> tuple:
+    """确定 CSV 路径字段的最终取值: (最终值, 是否被修改)。
+
+    策略: 原路径在磁盘上存在 → 原样保留 (绝不改动!)。
+           不存在 → 依次尝试候选路径, 只有候选真实存在才采用。
+           无 partition_map 时无法验证 → 一律保留原值 (安全优先)。
+    """
+    if not original or not partition_map or not _has_comma(original):
+        return original, False
+    if _disk_exists_for_csv_path(original, partition_map):
+        return original, False
+    for cand in _csv_path_candidates(original):
+        if _disk_exists_for_csv_path(cand, partition_map):
+            return cand, True
+    return original, False
+
+
+def _repair_csv_in_place(csv_path: str, log_callback=None, partition_map=None) -> int:
+    """原地修复 CSV 中被 escape_csv 损坏的路径。返回修复的字段数。
+
+    partition_map: 必须提供 (如 {"D": "I:", "E": "J:", "F": "K:"}),
+                   用于确认"原路径不存在 + 候选路径存在"时才改写;
+                   不提供则不做任何修改 (避免误伤真实含全角逗号的文件名)。
+    """
     def log(msg):
         if log_callback:
             log_callback(msg)
@@ -71,17 +153,20 @@ def _repair_csv_in_place(csv_path: str, log_callback=None) -> int:
                 except ValueError:
                     col_filename = 2  # 默认 C 列
 
+            if not partition_map:
+                log("  [跳过] 无盘符映射，跳过 CSV 路径修复 (避免误改含全角逗号的文件名)")
+                return 0
+
             rows = [header]
             for row in reader:
-                changed = False
-                for col in (col_fullpath, col_filename):
-                    if col < len(row):
-                        original = row[col]
-                        fixed = _normalize_csv_path(original)
-                        if fixed != original:
-                            row[col] = fixed
-                            changed = True
-                            repaired += 1
+                # 只修复 FullPath: 它是唯一可映射到磁盘并验证存在性的列。
+                # FileName 列无法定位磁盘文件, 不做任何改动 (避免误改真实文件名)。
+                if col_fullpath < len(row):
+                    original = row[col_fullpath]
+                    fixed, changed = _resolve_csv_field(original, partition_map)
+                    if changed:
+                        row[col_fullpath] = fixed
+                        repaired += 1
                 rows.append(row)
 
         if repaired > 0:
@@ -89,7 +174,7 @@ def _repair_csv_in_place(csv_path: str, log_callback=None) -> int:
             with open(csv_path, "w", encoding=enc, newline="") as f:
                 writer = csv.writer(f, lineterminator="\n")
                 writer.writerows(rows)
-            log(f"  [修复] CSV 路径修复完成: {repaired} 个字段中的全角逗号已还原为 ASCII 逗号")
+            log(f"  [修复] CSV 路径修复完成: {repaired} 行的 FullPath 已按磁盘实际文件名校正")
     except Exception as e:
         log(f"  [注意] CSV 路径修复失败: {e}")
 
@@ -710,10 +795,14 @@ def _verify_single_row(
 
         # 校验文件存在性
         if not os.path.isfile(actual_path):
-            # 兼容旧版 escape_csv: 尝试修复路径中的全角字符后再查
-            fixed_path = _normalize_csv_path(actual_path)
-            if fixed_path != actual_path and os.path.isfile(fixed_path):
-                actual_path = fixed_path
+            # 兼容旧版 escape_csv: 路径不存在时尝试标点变体 (全角/半角逗号) 后再查
+            alt_path = actual_path
+            for cand in _csv_path_candidates(actual_path):
+                if os.path.isfile(cand):
+                    alt_path = cand
+                    break
+            if alt_path != actual_path:
+                actual_path = alt_path
             else:
                 while len(row) <= col_e:
                     row.append("")
@@ -840,14 +929,17 @@ def _retry_missing_files_inner(
                 if os.path.isfile(actual_path):
                     continue
 
-                # 兼容旧版 escape_csv: 尝试修复路径中的全角字符后再查
-                fixed_path = _normalize_csv_path(actual_path)
-                if fixed_path != actual_path and os.path.isfile(fixed_path):
-                    # 文件以正确路径存在, 跳过重试; 同时修复 CSV row 中的路径
-                    fixed_full = _normalize_csv_path(full_path)
-                    if fixed_full != full_path:
-                        row[col_b] = fixed_full
-                        full_path = fixed_full
+                # 兼容旧版 escape_csv: 路径不存在时尝试标点变体 (全角/半角逗号) 定位真实文件
+                alt_full = full_path
+                for cand in _csv_path_candidates(full_path):
+                    cand_rel = cand[3:] if len(cand) >= 2 and cand[1] == ":" else cand
+                    if os.path.isfile(os.path.join(pe_drive, cand_rel)):
+                        alt_full = cand
+                        break
+                if alt_full != full_path:
+                    # 文件以变体路径存在, 跳过重试; 同时校正 CSV row 中的路径
+                    row[col_b] = alt_full
+                    full_path = alt_full
                     continue
 
                 # 预检查父目录: 若已知无法创建 (与首次下载跳过的一致), 直接跳过
@@ -959,6 +1051,20 @@ def _retry_missing_files_inner(
                     for entry in entries:
                         if entry[3] == rel_path:
                             target_path = entry[4]
+                            expected_size = entry[5]
+
+                            # 服务端返回空数据: 区分「文件本身 0 字节」与「服务端读不到」
+                            # 服务端读不到时绝不能写文件 —— 那会在目标盘留下 0KB 垃圾文件
+                            if data_len == 0 and expected_size != 0:
+                                log(f"  [!] 服务端无数据, 不写入(避免0KB文件): {rel_path}")
+                                break
+
+                            # 大小校验: 与 CSV 记录不一致则不写, 防止写入半截/错误内容
+                            if expected_size >= 0 and len(file_data) != expected_size:
+                                log(f"  [!] 大小不匹配, 不写入: {rel_path} "
+                                    f"(期望{expected_size}, 实际{len(file_data)})")
+                                break
+
                             target_dir = os.path.dirname(target_path)
                             if not os.path.isdir(target_dir):
                                 try:
@@ -966,13 +1072,24 @@ def _retry_missing_files_inner(
                                 except OSError:
                                     log(f"  [X] 无法创建目录: {target_dir}")
                                     break
+
+                            # 先写 .tmp 再重命名: 中途失败不会留下损坏的目标文件
+                            tmp_path = target_path + ".tmp"
                             try:
-                                with open(target_path, "wb") as fw:
+                                with open(tmp_path, "wb") as fw:
                                     fw.write(file_data)
+                                if os.path.isfile(target_path):
+                                    os.remove(target_path)
+                                os.rename(tmp_path, target_path)
                                 downloaded += 1
                                 partition_downloaded += 1
                             except OSError:
                                 log(f"  [X] 重试写入失败: {rel_path}")
+                                try:
+                                    if os.path.isfile(tmp_path):
+                                        os.remove(tmp_path)
+                                except OSError:
+                                    pass
                             break
 
                 batch_ok = True
@@ -994,8 +1111,11 @@ def _retry_missing_files_inner(
         if not batch_ok:
             log(f"  回退: 逐个下载 {partition}")
             for entry in entries:
-                _, _, drv, rp, tp, _ = entry
-                if _download_one_file_with_retry(server_ip, port, drv, rp, tp, auth_code, log):
+                _, _, drv, rp, tp, exp_sz = entry
+                if _download_one_file_with_retry(
+                    server_ip, port, drv, rp, tp, auth_code, log,
+                    expected_size=exp_sz,
+                ):
                     downloaded += 1
 
     log(f"重试下载完成: 成功恢复 {downloaded}/{len(missing_entries)} 个文件")
@@ -1011,8 +1131,13 @@ def _download_one_file_with_retry(
     auth_code: str = "",
     log_callback=None,
     max_retries: int = 3,
+    expected_size: int = -1,
 ) -> bool:
-    """从源设备下载单个文件（带连接重试 + 超时兜底）"""
+    """从源设备下载单个文件（带连接重试 + 超时兜底）
+
+    expected_size >= 0 时做大小校验; 空响应/大小不符一律不落盘,
+    避免在目标盘留下 0KB 或半截的垃圾文件。
+    """
     import time as _time
     for attempt in range(max_retries):
         try:
@@ -1022,12 +1147,29 @@ def _download_one_file_with_retry(
             req = urllib.request.urlopen(url, timeout=30, context=_SSL_CTX)
             target_dir = os.path.dirname(target_path)
             os.makedirs(target_dir, exist_ok=True)
-            with open(target_path, "wb") as f:
+            tmp_path = target_path + ".tmp"
+            with open(tmp_path, "wb") as f:
                 while True:
                     chunk = req.read(1024 * 1024)
                     if not chunk:
                         break
                     f.write(chunk)
+            actual_size = os.path.getsize(tmp_path)
+            if actual_size == 0 and expected_size != 0:
+                # 服务端读不到文件返回空响应: 不落盘, 防止 0KB 垃圾文件
+                os.remove(tmp_path)
+                if log_callback:
+                    log_callback(f"  [!] 服务端无数据, 不写入(避免0KB文件): {rel_path}")
+                return False
+            if expected_size >= 0 and actual_size != expected_size:
+                os.remove(tmp_path)
+                if log_callback:
+                    log_callback(f"  [!] 大小不匹配, 不写入: {rel_path} "
+                                 f"(期望{expected_size}, 实际{actual_size})")
+                return False
+            if os.path.isfile(target_path):
+                os.remove(target_path)
+            os.rename(tmp_path, target_path)
             return True
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
             if attempt < max_retries - 1:
@@ -1039,9 +1181,23 @@ def _download_one_file_with_retry(
                 if log_callback:
                     log_callback(f"  [X] 下载失败(已重试{max_retries}次): {rel_path} - {e}")
                 return False
-        except Exception:
+        except Exception as e:
+            # 不再静默吞异常: 记录原因, 并清理可能残留的 .tmp
+            if log_callback:
+                log_callback(f"  [X] 下载异常: {rel_path} - {e}")
+            _remove_tmp(target_path)
             return False
     return False
+
+
+def _remove_tmp(target_path: str) -> None:
+    """清理下载失败残留的 .tmp 文件。"""
+    tmp_path = target_path + ".tmp"
+    try:
+        if os.path.isfile(tmp_path):
+            os.remove(tmp_path)
+    except OSError:
+        pass
 
 
 def _download_one_file(
@@ -1498,7 +1654,9 @@ def run_verification(
 
         # ---- 修复旧版 escape_csv 造成的路径损坏 (全角逗号 → ASCII 逗号) ----
         # 必须在 GTMC 路径替换之前执行，因为修复的是原始路径
-        _repair_csv_in_place(csv_path, log)
+        # 传入 partition_map: 只有确认"原路径不存在 + 候选路径存在"才改写,
+        # 避免把文件名本身含全角逗号的正确路径改坏
+        _repair_csv_in_place(csv_path, log, partition_map=partition_map)
 
         # 仅当运行在 WinPE 下 (源端会将 GTMC_User_Profiles 重命名为带日期后缀)
         # 且确实检测到新目录名时，才修改 CSV 文件中的路径；
