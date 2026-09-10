@@ -19,6 +19,11 @@ import datetime
 import urllib.request
 
 
+# 导入配置时自动连接的网络打印机 (与 systemconfig/in.cmd 保持一致)
+# 如需更换打印服务器/打印机名, 只需修改这一处
+DEFAULT_NETWORK_PRINTER = r"\\QITV3260\GTMCPrinter"
+
+
 # ==================== 导出配置 (入口) ====================
 
 def export_config(log_callback=None, status_callback=None):
@@ -245,7 +250,8 @@ def _export_config_builtin(log_callback, status_callback=None):
 def import_config(config_folder, log_callback=None):
     """从指定配置文件夹导入系统配置
 
-    导入内容: Outlook 注册表、Chrome/Edge 收藏夹、输入法设置、打印机信息
+    导入内容: Outlook 注册表、Chrome/Edge 收藏夹、输入法设置、
+              网络打印机连接 (并设为默认打印机)
     返回: (success: bool, details: list[(label, status, msg)])
         status: "成功" / "失败" / "跳过"
     """
@@ -298,12 +304,13 @@ def import_config(config_folder, log_callback=None):
     else:
         _record("输入法设置", False, skipped=True, msg="备份文件不存在")
 
-    # 5. 显示打印机信息 (导入需手动)
+    # 5. 连接网络打印机并设为默认打印机 (对应 systemconfig/in.cmd, 无条件执行)
     printers_file = os.path.join(config_folder, "Printers.csv")
     if os.path.exists(printers_file):
-        _record("打印机列表", _import_printers(printers_file, log_callback))
+        _record("打印机 (添加+默认)", _import_printers(printers_file, log_callback))
     else:
-        _record("打印机列表", False, skipped=True, msg="备份文件不存在")
+        _record("打印机 (添加+默认)",
+                _connect_printer(DEFAULT_NETWORK_PRINTER, log_callback))
 
     success_count = sum(1 for _, s, _ in details if s == "成功")
     skip_count = sum(1 for _, s, _ in details if s == "跳过")
@@ -605,7 +612,11 @@ def _export_printers(export_root, log_callback):
 
 
 def _import_printers(printers_file, log_callback):
-    """显示打印机列表供参考 (实际添加需手动)"""
+    """显示旧设备打印机列表, 并连接网络打印机 + 设为默认打印机
+
+    对应 systemconfig/in.cmd 中的两条 rundll32 printui.dll,PrintUIEntry 命令。
+    返回: bool — 打印机是否连接成功 (列表读取失败不影响连接结果)
+    """
     log_callback("打印机列表 (来自旧设备):")
     try:
         with open(printers_file, "r", encoding="utf-8", errors="replace") as f:
@@ -615,8 +626,55 @@ def _import_printers(printers_file, log_callback):
                     log_callback(f"  {line}")
     except Exception as e:
         log_callback(f"  读取打印机列表失败: {e}")
-    log_callback("  提示: 打印机需要手动通过控制面板添加")
-    return True
+
+    return _connect_printer(DEFAULT_NETWORK_PRINTER, log_callback)
+
+
+def _connect_printer(printer, log_callback):
+    """连接网络打印机并设为默认打印机 (rundll32 printui.dll,PrintUIEntry)
+
+    /in  添加网络打印机连接
+    /y   设为默认打印机
+    与 systemconfig/in.cmd 完全一致。WinPE 下若 printui.dll 或打印后台处理
+    程序缺失, 只记录失败不抛异常, 不影响其它配置项的导入。
+    """
+    server = printer[2:].split("\\")[0] if printer.startswith("\\\\") else ""
+    log_callback(f"正在添加网络打印机 {printer}")
+    if server:
+        log_callback(f"正在访问 \\\\{server} 服务器...")
+
+    ok = True
+    for extra, desc in ((["/in", "/n", printer], "添加"),
+                        (["/y", "/n", printer], "设为默认")):
+        try:
+            result = subprocess.run(
+                ["rundll32", "printui.dll,PrintUIEntry"] + extra,
+                capture_output=True, text=True, timeout=60,
+                encoding="utf-8", errors="replace",
+            )
+        except FileNotFoundError:
+            log_callback("  [跳过] 系统无 rundll32 (非 Windows 环境)")
+            return False
+        except subprocess.TimeoutExpired:
+            log_callback(f"  [失败] {desc}打印机超时 (60 秒)")
+            ok = False
+            continue
+        except Exception as e:
+            log_callback(f"  [失败] {desc}打印机异常: {e}")
+            ok = False
+            continue
+
+        if result.returncode == 0:
+            log_callback(f"  [OK] {desc}打印机成功")
+        else:
+            snippet = (result.stderr or result.stdout or "").strip()[:200]
+            log_callback(f"  [失败] {desc}打印机失败 (退出码 {result.returncode})"
+                         + (f": {snippet}" if snippet else ""))
+            ok = False
+
+    if ok:
+        log_callback("打印机添加完成并已设置为默认打印机")
+    return ok
 
 
 def _export_ime(export_root, log_callback):

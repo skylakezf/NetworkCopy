@@ -86,7 +86,7 @@ def _http_status(url):
 
 class ServerFixture:
     """在临时目录上启动 FileServer (partition D), 端口 9999"""
-    def __init__(self):
+    def __init__(self, collect_logs=False):
         from file_transfer import FileServer, TRANSFER_PORT
         import tls_utils
         self.port = TRANSFER_PORT
@@ -94,10 +94,12 @@ class ServerFixture:
         self.src = tempfile.mkdtemp(prefix="ft_src_")
         self._mkfiles()
         certs = tls_utils.get_or_create_fixed_cert()
+        self.logs = []
         self.srv = FileServer(
             partition_map={"D": self.src},
             auth_code=self.auth,
             cert_paths=certs,
+            log_callback=(self.logs.append if collect_logs else None),
         )
         self.srv.start()
         time.sleep(0.6)
@@ -171,6 +173,10 @@ def test_ping_ok():
         data = json.loads(body)
         eq(data.get("status"), "ok")
         eq(data.get("partitions"), ["D"])
+        # 发送端按自身空闲内存通告单包内容上限建议 (无则旧版/探测失败, 不影响)
+        mb = data.get("batch_max_total_mb")
+        check(mb is None or (isinstance(mb, int) and 32 <= mb <= 128),
+              f"/ping 应携带 batch_max_total_mb (32~128), 实际={mb!r}")
     finally:
         srv.close()
 
@@ -191,6 +197,182 @@ def test_ping_wrong_pwd():
         eq(status, 403, "错误验证码应 403")
     finally:
         srv.close()
+
+@test("B3c. 端口探活连接 (裸 TCP 连上即关) 被静默忽略, 不刷屏且服务存活")
+def test_probe_connection_silent():
+    import socket as _sock
+    srv = ServerFixture(collect_logs=True)
+    try:
+        # 模拟接收端网络监控线程的探活: 裸 TCP 连上后立刻 close, 不发任何数据
+        for _ in range(3):
+            s = _sock.create_connection(("127.0.0.1", srv.port), timeout=2)
+            s.close()
+        time.sleep(0.8)
+        joined = "\n".join(srv.logs)
+        check("读取握手头失败" not in joined,
+              f"探活连接不应产生握手失败日志 (会刷屏): {joined}")
+        check("拒绝连接" not in joined, f"探活连接不应产生拒绝日志: {joined}")
+        check("收到新连接" not in joined,
+              f"探活连接不应记录为新连接: {joined}")
+        # 服务必须仍存活: 正常 HTTPS 请求照常成功
+        status, body = _http_get(srv.url("/ping"))
+        eq(status, 200, "探活连接后服务器应仍可正常服务")
+        eq(json.loads(body).get("status"), "ok")
+    finally:
+        srv.close()
+
+@test("B3b. 单包内容上限按空闲内存÷8 映射, 上下限 32~128MB")
+def test_batch_budget_mapping():
+    import file_transfer as ft
+    eq(ft._recommended_batch_total_mb(None), None, "探测失败应返回 None")
+    eq(ft._recommended_batch_total_mb(0), None, "0 视为探测失败")
+    eq(ft._recommended_batch_total_mb(512), 64, "空闲 512MB → 64MB")
+    eq(ft._recommended_batch_total_mb(768), 96, "空闲 768MB → 96MB")
+    eq(ft._recommended_batch_total_mb(1024), 128, "空闲 1024MB → 128MB")
+    eq(ft._recommended_batch_total_mb(100), 32, "下限: 空闲 <256MB 也保持 32MB")
+    eq(ft._recommended_batch_total_mb(10000), 128, "上限: 空闲再大也最多 128MB")
+
+# ============================================================
+# B4. DHCP 分派逻辑 (NAK 校验 / 地址池去重 / NAK 报文最小化)
+# ============================================================
+
+def _mk_chaddr(mac="aa:bb:cc:dd:ee:01"):
+    return bytes(int(x, 16) for x in mac.split(":"))
+
+@test("B4a. DHCPREQUEST 请求异网段地址 → 回 NAK (不再 ACK 错误 IP)")
+def test_dhcp_nak_foreign_subnet():
+    import socket
+    from dhcp_server import MiniDHCPServer
+    srv = MiniDHCPServer()
+    try:
+        chaddr = _mk_chaddr()
+        # 192.168.1.100 不属于 169.254/16 → 必须 NAK
+        yiaddr, nak = srv._handle_request(1, chaddr, {50: socket.inet_aton("192.168.1.100")})
+        eq(nak, True, "异网段请求应回 NAK")
+        eq(yiaddr, None, "NAK 时不应返回地址")
+        # 同网段 169.254.100.50 → 正常 ACK
+        yiaddr2, nak2 = srv._handle_request(1, chaddr, {50: socket.inet_aton("169.254.100.50")})
+        eq(nak2, False, "同网段请求不应 NAK")
+        eq(socket.inet_ntoa(struct.pack("!I", yiaddr2)), "169.254.100.50",
+           "应 ACK 客户端请求的同网段地址")
+    finally:
+        srv.stop()
+
+@test("B4b. DHCP 地址池不重复分配 (option 50 占用的地址会被跳过)")
+def test_dhcp_pool_no_dup():
+    import socket
+    from dhcp_server import MiniDHCPServer
+    srv = MiniDHCPServer()
+    try:
+        a = _mk_chaddr("aa:bb:cc:dd:ee:01")
+        b = _mk_chaddr("aa:bb:cc:dd:ee:02")
+        ip1, nak = srv._handle_request(1, a, {50: socket.inet_aton("169.254.100.2")})
+        eq(nak, False, "同网段请求不应 NAK")
+        ip2 = srv._handle_discover(2, b, {})
+        check(ip1 != ip2, f"地址池不应重复分配: {ip1} vs {ip2}")
+        eq(socket.inet_ntoa(struct.pack("!I", ip2)), "169.254.100.3",
+           "第二个客户端应跳过已被占用的 .2")
+    finally:
+        srv.stop()
+
+@test("B4d. DHCP 应答重复发送, 且目标端口用客户端实际源端口")
+def test_dhcp_send_reply_ports():
+    from dhcp_server import MiniDHCPServer
+    srv = MiniDHCPServer()
+    try:
+        sent = []
+
+        class _FakeSock:
+            def sendto(self, pkt, dst):
+                sent.append(dst)
+
+            def close(self):
+                pass
+
+        srv._sock = _FakeSock()
+        srv._send_reply(b"x", 1068)
+        eq(len(sent), 2, "每个出口应重复发送 2 次 (抗丢包)")
+        eq(sent[0], ("255.255.255.255", 1068), "应发到客户端实际源端口")
+        sent.clear()
+        srv._send_reply(b"x", None)
+        eq(sent[0], ("255.255.255.255", 68), "源端口未知时应回退到标准 68")
+    finally:
+        srv.stop()
+
+@test("B4c. DHCPNAK 报文只含 message type / server id / message")
+def test_dhcp_nak_packet_minimal():
+    from dhcp_server import MiniDHCPServer, DHCPNAK
+    srv = MiniDHCPServer()
+    try:
+        pkt = srv._build_dhcp_packet(2, 1, 0, _mk_chaddr(), DHCPNAK,
+                                     options_extra={56: b"x"}, minimal=True)
+        opts = pkt[240:]
+        check(bytes([53, 1, DHCPNAK]) in opts, "NAK 应含 option 53")
+        check(bytes([54, 4]) in opts, "NAK 应含 option 54")
+        check(bytes([51, 4]) not in opts, "NAK 不应含 option 51 (租约时长)")
+        check(bytes([1, 4]) not in opts, "NAK 不应含 option 1 (子网掩码)")
+        check(opts.endswith(b"\xff"), "应以 option 255 结束")
+    finally:
+        srv.stop()
+
+# ============================================================
+# B5. 导入配置时自动连接网络打印机 (printui.dll,PrintUIEntry)
+# ============================================================
+
+class _FakeProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+@test("B5. 导入配置自动连接网络打印机并设为默认 (printui 参数正确)")
+def test_printer_connect_args():
+    import config_transfer as ct
+    calls = []
+    orig = ct.subprocess.run
+    try:
+        ct.subprocess.run = lambda cmd, **kw: (calls.append(cmd), _FakeProc())[1]
+        logs = []
+        ok = ct._connect_printer(ct.DEFAULT_NETWORK_PRINTER, logs.append)
+        eq(ok, True, "应返回成功")
+        eq(len(calls), 2, "应依次执行 添加 + 设为默认 两条命令")
+        eq(calls[0][:2], ["rundll32", "printui.dll,PrintUIEntry"], "命令前缀应为 rundll32 printui")
+        eq(calls[0][2:], ["/in", "/n", ct.DEFAULT_NETWORK_PRINTER], "/in 添加网络打印机")
+        eq(calls[1][2:], ["/y", "/n", ct.DEFAULT_NETWORK_PRINTER], "/y 设为默认打印机")
+        check(any("QITV3260" in l for l in logs), "应打印服务器访问日志")
+        check(any("已设置为默认打印机" in l for l in logs), "应打印完成日志")
+    finally:
+        ct.subprocess.run = orig
+
+@test("B5b. 打印机命令失败时记录失败但不抛异常")
+def test_printer_connect_failure():
+    import config_transfer as ct
+    orig = ct.subprocess.run
+    try:
+        ct.subprocess.run = lambda cmd, **kw: _FakeProc(returncode=1, stderr="printui failed")
+        logs = []
+        ok = ct._connect_printer(ct.DEFAULT_NETWORK_PRINTER, logs.append)
+        eq(ok, False, "退出码非 0 应判定失败")
+        check(any("失败" in l for l in logs), "应输出失败日志")
+        check(not any("添加完成" in l for l in logs), "失败时不应输出完成日志")
+    finally:
+        ct.subprocess.run = orig
+
+@test("B5c. Printers.csv 缺失时仍执行打印机连接 (对应 in.cmd 无条件执行)")
+def test_printer_connect_without_csv():
+    import config_transfer as ct
+    calls = []
+    orig = ct.subprocess.run
+    try:
+        ct.subprocess.run = lambda cmd, **kw: (calls.append(cmd), _FakeProc())[1]
+        logs = []
+        missing = os.path.join(tempfile.gettempdir(), "_nocopy_no_such_printers.csv")
+        ok = ct._import_printers(missing, logs.append)
+        eq(ok, True, "备份文件缺失也应连接成功")
+        eq(len(calls), 2, "仍应执行两条 printui 命令")
+        check(any("读取打印机列表失败" in l for l in logs), "应提示列表读取失败")
+    finally:
+        ct.subprocess.run = orig
 
 @test("B4. /list 过滤规则正确 (dat 保留, 锁定/临时文件剔除)")
 def test_list_filter():
@@ -271,6 +453,33 @@ def test_unknown_endpoint():
         eq(status, 404)
     finally:
         srv.close()
+
+@test("B10. /list 扫描中断: 仍返回合法 JSON + _list_error (2026-09-09 修复)")
+def test_list_scan_error():
+    """源端扫描抛异常时, 必须补写合法 JSON 尾部。
+    修复前写的是非法 JSON → 客户端 json.loads 失败 → 整个分区被跳过且丢失原因。"""
+    srv = ServerFixture()
+    orig_walk = os.walk
+
+    def boom(*_a, **_k):
+        raise OSError("模拟扫描中断")
+
+    try:
+        os.walk = boom
+        status, body = _http_get(srv.url("/list?partition=D"))
+    finally:
+        os.walk = orig_walk
+        srv.close()
+
+    eq(status, 200, "扫描中断仍应返回 200 (头部已发出)")
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except Exception as e:
+        check(False, f"响应必须是合法 JSON, 实际解析失败: {e}")
+        return
+    check("_list_error" in data, "响应应带 _list_error 标记")
+    check("模拟扫描中断" in str(data.get("_list_error", "")),
+          "_list_error 应包含原始错误原因")
 
 # ============================================================
 # C. download_files 端到端传输
@@ -709,7 +918,7 @@ def test_host_reachable_tcp_fail():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  功能测试全套 (30 项)")
+    print("  功能测试全套")
     print("=" * 60)
     print()
 
@@ -721,12 +930,24 @@ if __name__ == "__main__":
     test_ping_ok()
     test_ping_no_pwd()
     test_ping_wrong_pwd()
+    test_probe_connection_silent()
+    test_batch_budget_mapping()
+    # B4. DHCP 分派逻辑
+    test_dhcp_nak_foreign_subnet()
+    test_dhcp_pool_no_dup()
+    test_dhcp_nak_packet_minimal()
+    test_dhcp_send_reply_ports()
+    # B5. 打印机连接
+    test_printer_connect_args()
+    test_printer_connect_failure()
+    test_printer_connect_without_csv()
     test_list_filter()
     test_get_file()
     test_get_missing()
     test_list_invalid_partition()
     test_batch_get()
     test_unknown_endpoint()
+    test_list_scan_error()
 
     # C. 端到端
     test_download_files_e2e()

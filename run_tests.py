@@ -30,6 +30,7 @@ SUITE_META = [
     ("test_punctuation.py", "标点(半角/全角)+0KB防护", False),
     ("test_func.py", "功能: 过滤/HTTPS端点/CSV修复", False),
     ("test_verify_e2e.py", "校验 E2E: 增量/清单/下载", False),
+    ("test_full_flow.py", "端到端主流程: 标点/空目录/一致性", False),
     ("test_thread_safe.py", "线程安全 (tkinter)", False),
     ("test_ui.py", "UI 全流程", False),
     ("test_ui_readability.py", "UI 可读性", False),

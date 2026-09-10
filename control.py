@@ -1060,20 +1060,39 @@ class Controller:
                 self._source_ip = ip
                 self._log(f"源设备 IP: {ip}")
             else:
-                self._log("源设备: 首次续租未命中, 周期重试 DHCP 续租 (约 60 秒窗口)..., 将使用 APIPA 兜底")
-                # 周期强制 renew: 每次 renew 都会发出 DHCP DISCOVER, 显著提高
-                # 接收端 DHCP 服务器稍后启动 (后插线/后点寻找) 场景的发现成功率
-                retry_deadline = time.time() + 60
-                while time.time() < retry_deadline:
-                    for nic in wired_nics:
-                        idx = nic[4]
-                        if idx > 0:
-                            try:
-                                renew_dhcp_ip(idx)
-                            except Exception:
-                                pass
-                    # 观察 10 秒: renew 期间或之后网卡是否拿到目标 IP
-                    obs_deadline = time.time() + 10
+                self._log("源设备: 首次续租未命中, 进入持续重试模式 "
+                          "(每轮 release+renew, 最长 5 分钟), 将使用 APIPA 兜底")
+                # 关键修复 (2026-09-10): 每轮必须 release + renew。
+                # release 会把 Windows DHCP 客户端重置回 INIT 状态, 使本轮 renew
+                # 立即广播 DHCPDISCOVER; 只 renew 不 release 时, 客户端可能仍停在
+                # 指数退避 (1/2/4/.../64 秒) 里 —— 于是"接收端稍后才启动 DHCP"的
+                # 场景要等几十秒到一分钟才拿到 IP, 表现为"获取 IP 超级慢"。
+                # renew_dhcp_ip 是阻塞式 Win32 调用 (无 DHCP 响应时可能阻塞数十秒),
+                # 必须放后台线程, 否则下面的观察循环无法按秒级节奏执行。
+                renew_idle = threading.Event()
+                renew_idle.set()  # 初始"空闲", 允许第一轮立即启动
+
+                def _renew_all():
+                    try:
+                        for _nic in wired_nics:
+                            _idx = _nic[4]
+                            if _idx > 0:
+                                try:
+                                    release_dhcp_ip(_idx)
+                                    renew_dhcp_ip(_idx)
+                                except Exception:
+                                    pass
+                    finally:
+                        renew_idle.set()
+
+                retry_deadline = time.time() + 300
+                while (time.time() < retry_deadline
+                       and not getattr(self, "_transferring", False)):
+                    if renew_idle.is_set():
+                        renew_idle.clear()
+                        threading.Thread(target=_renew_all, daemon=True).start()
+                    # 观察 2 秒: 网卡一旦拿到目标 IP 立即结束等待
+                    obs_deadline = time.time() + 2
                     while time.time() < obs_deadline:
                         for nic in wired_nics:
                             ip = get_local_ip(nic[1])
@@ -1081,10 +1100,9 @@ class Controller:
                                 break
                         if ip and ip.startswith("169.254.100."):
                             break
-                        time.sleep(1)
+                        time.sleep(0.5)
                     if ip and ip.startswith("169.254.100."):
                         break
-                    time.sleep(5)
                 if ip and ip.startswith("169.254.100."):
                     self._source_ip = ip
                     self._log(f"源设备 IP: {ip}")
@@ -1202,13 +1220,17 @@ class Controller:
         # 169.254.x.x。轮询等待可保证: ① 广播出口网卡已就绪 (OFFER/ACK 有正确
         # 出口); ② 接收端自身处于 /16 网段, 后续才能路由到源端 169.254.100.2。
         wired_ips = self._get_wired_nic_ips()
-        if not any(ip.startswith("169.254.") for ip in wired_ips):
+        # 仅当有线网卡完全没有 IP 时才等待 APIPA 出现 (刚插网线时 Windows 需约
+        # 15 秒 ARP 探测)。若网卡已有地址 (APIPA 或 DHCP/静态), 立即启动 DHCP
+        # 服务器 —— 原实现"只要没有 169.254 就等 20 秒", 会让已经连好网线的用户
+        # 白等 20 秒, 是"点寻找旧电脑后半天没反应"的一个直接原因。
+        if not wired_ips:
             self._log("等待网卡获得 APIPA 地址 (169.254.x.x), 最多 20 秒...")
             _apipa_deadline = time.time() + 20
             while time.time() < _apipa_deadline:
                 time.sleep(1)
                 wired_ips = self._get_wired_nic_ips()
-                if any(ip.startswith("169.254.") for ip in wired_ips):
+                if wired_ips:
                     break
         _cur_ip = wired_ips[0] if wired_ips else ""
         if wired_ips:
@@ -1216,6 +1238,10 @@ class Controller:
         if _cur_ip:
             self._log(f"DHCP 模式: 接收端不设置自身 IP, 当前本机地址 {_cur_ip} (掩码 {SUBNET_MASK})。"
                       f"只要该地址属于 169.254.x.x/16, 即可与源端 {DHCP_ASSIGNED_IP} 直连。")
+            if not any(ip.startswith("169.254.") for ip in wired_ips):
+                self._log(f"警告: 本机有线网卡地址 {wired_ips} 均不在 169.254.x.x/16 网段, "
+                          f"源端获取 {DHCP_ASSIGNED_IP} 后可能无法与接收端直连。"
+                          f"请拔掉其它网络连接 (或重新插拔网线) 后再点「寻找旧电脑」。")
         else:
             self._log(f"DHCP 模式: 接收端不设置自身 IP, 等待 APIPA 自动分配 (请确认网线已连接); "
                       f"DHCP 服务器将照常启动。")
@@ -1654,7 +1680,10 @@ class Controller:
         """检测源设备是否可达: 纯 TCP 9999 端口探测。
         传输实际使用 TCP 9999, 该端口已放行防火墙 — 探测它最能反映传输是否可用,
         且 TCP 握手由内核完成 (即使服务器应用繁忙/限流, 新连接仍能建立)。
-        不依赖 ICMP ping: Windows 防火墙默认拦截 ping, 仅靠 ping 会在网络正常时误报。"""
+        不依赖 ICMP ping: Windows 防火墙默认拦截 ping, 仅靠 ping 会在网络正常时误报。
+
+        注意: 本探测"连上即 close、不发任何数据", 源端会把它识别为端口探活连接并静默
+        忽略 (file_transfer.py: ThreadingFileServer.get_request), 不会污染源端日志。"""
         try:
             s = socket.create_connection((ip, TRANSFER_PORT), timeout=2)
             s.close()

@@ -89,7 +89,7 @@
 
 - Outlook 邮件账号与规则、自动存档
 - Chrome / Edge 收藏夹
-- 打印机列表
+- 打印机（导入时自动连接 `\\QITV3260\GTMCPrinter` 并设为默认打印机）
 - 输入法（五笔、拼音词库）
 - IP 网络配置
 - 已安装程序清单（`Installed_Programs_Regedit.csv` / `StartMenu_Apps.csv`，供照单重装）
@@ -186,8 +186,9 @@ NetworkzCopy/
 | 套件 | 覆盖范围 | 数量 |
 |------|----------|------|
 | `tests/test_ui.py` | UI 全流程 / 按钮 / 导航 / 验证码横幅 | 60 项 |
-| `tests/test_func.py` | 过滤规则 / HTTPS 端点 / CSV 路径修复 / 端点传输 | 32 项 |
+| `tests/test_func.py` | 过滤规则 / HTTPS 端点 / CSV 路径修复 / 端点传输 | 33 项 |
 | `tests/test_verify_e2e.py` | 增量确认 / 全盘清单 / 下载+边传边校验 E2E | 32 项 |
+| `tests/test_full_flow.py` | 端到端主流程：标点文件名 / 空目录 / 目录树一致性 / 校验 | 16 项 |
 | `tests/test_punctuation.py` | 文件名标点(半角/全角) + 0KB 垃圾文件防护 | 26 项 |
 | `tests/test_device_replacement.py` | 设备更换端到端（导出→传输→导入→校验） | 25 项 |
 | `tests/test_device_transfer_e2e.py` | 两设备间实际传输 E2E（需证书） | 33 项 |
@@ -197,7 +198,7 @@ NetworkzCopy/
 | `tests/test_disconnect.py` | 断线 / 验证码错误的完成判定 | 7 项 |
 | `tests/test_thread_safe.py` | 后台线程 tkinter 调用约束 | 7 项 |
 
-合计 **11 套件 / 268 用例**。新增套件只需在 `tests/` 放入 `test_xxx.py`（含 `main()`），
+合计 **12 套件 / 285 用例**。新增套件只需在 `tests/` 放入 `test_xxx.py`（含 `main()`），
 `run_tests.py` 会自动发现，无需修改入口脚本。
 
 维护脚本：`_cleanup_zero_byte_dupes.py` 用于清理历史遗留的 0KB 垃圾文件（默认 dry-run，

@@ -270,7 +270,12 @@ class FileServerHandler(BaseHTTPRequestHandler):
             elif path == "/filelist":
                 self._handle_filelist(params)
             elif path == "/ping":
-                self._send_json({"status": "ok", "partitions": list(FileServerHandler.partition_map.keys())})
+                self._send_json({
+                    "status": "ok",
+                    "partitions": list(FileServerHandler.partition_map.keys()),
+                    # 发送端按自身空闲内存建议的单包内容上限(MB), 供接收端自适应分批
+                    "batch_max_total_mb": _recommended_batch_total_mb(_get_avail_phys_mb()),
+                })
             else:
                 self._send_json({"error": "未知端点"}, 404)
         except Exception as e:
@@ -343,6 +348,9 @@ class FileServerHandler(BaseHTTPRequestHandler):
         # 流式写入: 不分 Content-Length，用 Connection: close 让客户端读至连接关闭。
         # 文件条目一边 walk 一边写入 wfile, 定期 flush, 避免大磁盘 (100GB+ 小文件)
         # 因响应构建时间过长导致客户端 30s 超时。
+        # 前置初始化: 异常分支会引用 wf/first_file (静态分析可证始终已绑定)
+        wf = self.wfile
+        first_file = True
         try:
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -462,9 +470,18 @@ class FileServerHandler(BaseHTTPRequestHandler):
             pass
         except Exception as e:
             # 若已开始写响应体 (header 已发), 无法回退 500；
-            # 尝试追加错误标记, 客户端需容错处理。
+            # 必须补写合法的 JSON 尾部, 否则客户端 json.loads 直接失败,
+            # 整个分区被当作"获取列表失败"跳过且丢失错误原因 (2026-09-09 修复)。
+            # 客户端检测到 _list_error 会视为该分区列表不完整并给出明确提示。
             try:
-                wf.write(('\n,"_list_error":"' + str(e).replace('"', "'") + '"}').encode("utf-8"))
+                msg = str(e).replace('"', "'").replace("\\", "/")
+                err_entry = ('{"_list_error":"%s"}' % msg) if first_file \
+                    else (',{"_list_error":"%s"}' % msg)
+                tail = ('],"dirs":' + json.dumps(dirs_info, ensure_ascii=False)
+                        + ',"file_count":' + str(file_count)
+                        + ',"total_size":' + str(total_size)
+                        + ',"_list_error":"' + msg + '"}')
+                wf.write((err_entry + tail).encode("utf-8"))
                 wf.flush()
             except Exception:
                 pass
@@ -546,7 +563,9 @@ class FileServerHandler(BaseHTTPRequestHandler):
         import struct as _struct
 
         content_len = int(self.headers.get("Content-Length", 0))
-        if content_len == 0 or content_len > 2 * 1024 * 1024:
+        # 请求体是"路径清单", 上限 4MB: 容纳单批最多 5000 个(含深路径)文件清单。
+        # 与客户端 BATCH_MAX_PATH_BYTES=3MB 配套, 留结构/转义余量; 超过即拒绝。
+        if content_len == 0 or content_len > 4 * 1024 * 1024:
             self._send_json({"error": "请求体为空或过大"}, 400)
             return
 
@@ -649,10 +668,13 @@ class ThreadingFileServer(ThreadingMixIn, HTTPServer):
         若抛 RuntimeError 会导致异常逃逸出 serve_forever, 使整个服务器线程崩溃 ——
         这正是"浏览器一发明文请求服务器就死、后续 https 也连不上"的根因。
         改为抛 OSError 后, 非法/握手失败的连接只会被丢弃, 服务器继续存活。
+
+        2026-09-10: 区分"端口探活连接"与"异常连接"。接收端网络监控线程每秒用裸 TCP
+        连接探测 9999 端口后立即 close (control.py: _host_reachable), 它不做 TLS 握手,
+        因此源端会读到"连接已建立但 0 字节即关闭"。这是正常健康检查, 静默丢弃且不打
+        日志; 否则传输期间源端日志会被每秒 2 条"握手头失败"刷屏。
         """
         conn, addr = super().get_request()
-        if FileServerHandler.log_callback:
-            FileServerHandler.log_callback(f"[诊断] 收到新连接来自 {addr}")
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
         conn.settimeout(30)  # 30s 超时，防止僵死连接
@@ -673,8 +695,18 @@ class ThreadingFileServer(ThreadingMixIn, HTTPServer):
             while len(peek) < 2:
                 chunk = conn.recv(2 - len(peek), socket.MSG_PEEK)
                 if not chunk:
-                    raise ConnectionAbortedError("客户端未发送数据 (连接已关闭)")
+                    # 连接建立后 0 字节即关闭 = 端口探活/健康检查 (接收端网络监控线程
+                    # 每秒裸 TCP 探测一次, 见 control.py: _host_reachable), 属正常现象,
+                    # 既非攻击也非故障 → 静默丢弃且不打日志, 避免传输期间日志被刷屏。
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    raise ConnectionAbortedError("端口探活连接 (未发送数据), 已忽略")
                 peek += chunk
+        except ConnectionAbortedError:
+            # 探活连接: 已静默处理, 不再记录日志
+            raise
         except Exception as e:
             try:
                 conn.close()
@@ -682,9 +714,12 @@ class ThreadingFileServer(ThreadingMixIn, HTTPServer):
                 pass
             if FileServerHandler.log_callback:
                 FileServerHandler.log_callback(
-                    f"[诊断] 拒绝连接 {addr}: 读取握手头失败/超时: {e} (连接已关闭)")
+                    f"[诊断] 拒绝连接 {addr}: 读取握手头失败/超时: {e}")
             # 抛 OSError 子类, 让服务器在拒绝该连接后继续存活 (而非崩溃)
             raise ConnectionAbortedError("明文 HTTP 已被禁用 (指令 C)")
+        # 确认客户端确实发来了数据, 才记录"新连接"诊断 (探活连接已在上方静默返回)
+        if FileServerHandler.log_callback:
+            FileServerHandler.log_callback(f"[诊断] 收到新连接来自 {addr}")
         if not (peek[:1] == b"\x16" and peek[1:2] == b"\x03"):
             # 非 TLS 请求 (明文 HTTP) → 禁止, 关闭连接
             try:
@@ -819,10 +854,56 @@ class FileServer:
 # 降低至 4, 减少对服务端的并发连接压力, 避免 ThreadingMixIn 线程爆炸
 DEFAULT_DOWNLOAD_WORKERS = 4
 
-# 小文件批量传输配置
-BATCH_SIZE_THRESHOLD = 1 * 1024 * 1024   # < 1MB 归入批次
-BATCH_MAX_FILES = 200                     # 每批次最多文件数
-BATCH_MAX_TOTAL = 20 * 1024 * 1024        # 每批次最大总字节数 (20MB)
+# 小文件批量传输配置 (2026-09-09: 放宽包上限解决"几万小文件被切成过多小包")
+# 核心: 真正瓶颈是"每包固定开销(HTTPS 往返/HTTP 头/服务端逐文件处理)×包数量"。
+# 原来 200 文件/包时, 5 万个小文件要切 250 个包(每包实际载荷才 ~100KB);
+# 放开文件数与路径预算后仅需 ~10 个包, overhead 降约 40 倍, 与"包内容多大"无关。
+# 注意: /batch_get 为整包读内存。单包内容上限 BATCH_MAX_TOTAL(64MB) 只是"回退默认":
+# 运行时按发送端与接收端空闲内存自适应取较小建议值 (空闲内存÷8, 上下限 32~128MB,
+# 见 _recommended_batch_total_mb), 防止小内存机器整包读内存 OOM; 仅当两端内存探测
+# 都失败时才用此默认。若将来要更大的包, 应改两端流式边读边写而非只调大上限。
+BATCH_SIZE_THRESHOLD = 1 * 1024 * 1024    # < 1MB 归入批次
+BATCH_MAX_FILES = 5000                    # 每批次最多文件数
+BATCH_MAX_TOTAL = 64 * 1024 * 1024       # 每批次最大总字节数 (64MB)
+# 每批次"路径清单"的 UTF-8 字节上限: 与服务端 /batch_get 的请求体上限(4MB)配套,
+# 预留 JSON 结构/转义开销余量; 5000 个平均 400B 的深路径 ≈ 2MB, 3MB 足够。
+BATCH_MAX_PATH_BYTES = 3 * 1024 * 1024
+
+# ---- 空闲内存探测与单包内容上限推荐 (发送端/接收端共用) ----
+def _get_avail_phys_mb():
+    """返回当前可用物理内存 (MB); 非 Windows / 探测失败返回 None。
+    PE 环境无 psutil, 用 ctypes 调 kernel32.GlobalMemoryStatusEx。
+    仅作内存预算参考, 失败时调用方回退默认值, 绝不影响传输主流程。"""
+    try:
+        import ctypes
+        class _MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+        m = _MEMORYSTATUSEX()
+        m.dwLength = ctypes.sizeof(m)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            return int(m.ullAvailPhys // (1024 * 1024))
+    except Exception:
+        pass
+    return None
+
+
+def _recommended_batch_total_mb(avail_mb):
+    """按可用物理内存推荐单包内容上限 (MB): 空闲内存÷8, 上下限 32~128MB。
+    空闲 512/768/1024MB → 64/96/128MB; avail_mb 为空返回 None (调用方回退默认)。"""
+    if not avail_mb:
+        return None
+    return max(32, min(128, int(avail_mb) // 8))
+
 
 # 线程本地 HTTP 连接池: 每个线程持有一个持久连接，复用避免 TCP 握手开销
 # 关键设计: 连接断开后只标记为死，不立即重建 → 避免 Windows 临时端口耗尽
@@ -1601,6 +1682,7 @@ def _download_files_inner(
     log(f"[诊断] 客户端 TLS 上下文: check_hostname={getattr(CLIENT_SSL_CTX,'check_hostname',None)}, "
         f"verify_mode={getattr(CLIENT_SSL_CTX,'verify_mode',None)} (CERT_NONE=0 表示已忽略证书错误)")
     connected = False
+    data = None
     for attempt in range(5):
         try:
             req = _urlopen_https(
@@ -1629,6 +1711,20 @@ def _download_files_inner(
             time.sleep(2)
     if not connected:
         return False, 0, 0, errors
+
+    # ---- 按空闲内存自适应单包内容上限 (传输期间固定一次) ----
+    # /batch_get 需两端各 hold ≈ 单包内容内存 (发送端整包读入构造响应, 接收端整包读入解析),
+    # 故取"发送端建议 / 接收端建议"中较小者, 防止小内存机器 OOM。
+    # 探测失败(非 Windows/旧版服务端)时回退 BATCH_MAX_TOTAL, 不影响主流程。
+    server_total_mb = data.get("batch_max_total_mb") if isinstance(data, dict) else None
+    local_total_mb = _recommended_batch_total_mb(_get_avail_phys_mb())
+    batch_total_limit = BATCH_MAX_TOTAL
+    have_total_mb = [mb for mb in (server_total_mb, local_total_mb) if mb]
+    if have_total_mb:
+        batch_total_limit = min(have_total_mb) * 1024 * 1024
+    log(f"[诊断] 单批内容上限: {batch_total_limit // (1024 * 1024)}MB"
+        f" (发送端建议 {server_total_mb or '默认'}MB, "
+        f"接收端建议 {local_total_mb or '默认'}MB)")
 
     # ---- 边传边校验: 先下载源端全盘文件清单 FullFilelist_DEF.csv ----
     # 清单先落到目标端 Appl 目录, 供边传边校验与后续校验阶段使用
@@ -1670,6 +1766,15 @@ def _download_files_inner(
         if "error" in list_data:
             log(f"{normal_partition}: {list_data['error']}")
             errors.append(f"分区 {normal_partition}: {list_data['error']}")
+            continue
+
+        # 源端扫描过程中断: 列表可能不完整, 视为该分区失败并给出明确原因,
+        # 避免用户误以为只扫描到这么点文件
+        if "_list_error" in list_data:
+            msg = str(list_data["_list_error"])
+            log(f"{normal_partition}: 源端扫描中断, 文件列表不完整 - {msg}")
+            errors.append(
+                f"分区 {normal_partition}: 源端文件列表不完整({msg})，请检查源设备该分区是否可读")
             continue
 
         files = list_data.get("files", [])
@@ -2022,8 +2127,10 @@ def _download_files_inner(
         for d in _skipped_dirs:
             _created_dirs.discard(d)
 
-        # 第二遍: 还原所有源端存在、目标端也已存在的目录的 mtime
-        # (包含 os.makedirs 隐式创建的中间父目录、以及不含文件的纯目录)
+        # 第二遍: 还原目录 mtime; 源端存在但目标端缺失的目录(不含文件的空目录)也要创建。
+        # 注: 以前只还原"目标端已存在"的目录时间戳, 导致整盘拷贝会丢失源端的空文件夹
+        #     (如空的项目模板目录/分类目录)。dirs 列表已由 /list 下发, 直接用它补齐。
+        empty_dirs_created = 0
         for dir_path, d_mtime in dir_mtimes.items():
             full_dir = os.path.normpath(
                 os.path.join(target_drive, dir_path.replace("/", "\\"))
@@ -2031,11 +2138,21 @@ def _download_files_inner(
             if full_dir in _created_dirs:
                 continue  # 已在上面处理过
             if not os.path.isdir(full_dir):
-                continue  # 目标端不存在，不创建空目录
+                if os.path.isfile(full_dir):
+                    continue  # 路径被同名文件占用, 无法创建目录
+                try:
+                    os.makedirs(full_dir, exist_ok=True)
+                    empty_dirs_created += 1
+                except (PermissionError, FileExistsError, OSError) as e:
+                    log(f"  [!] 无法创建目录: {full_dir} ({e})")
+                    continue
             if not os.access(full_dir, os.W_OK):
                 log(f"  [!] 目录无写入权限，跳过时间戳还原: {full_dir}")
                 continue
             _apply_dir_mtime(full_dir, target_drive, dir_mtimes)
+
+        if empty_dirs_created:
+            log(f"  已创建 {empty_dirs_created} 个源端空目录")
 
         # 分区内: 按大小分组 (小文件批次 / 大文件单独)
         partition_batches = []   # [batch_tasks, ...]
@@ -2044,6 +2161,7 @@ def _download_files_inner(
         skipped_count = 0
         current_batch = []
         current_batch_bytes = 0
+        current_batch_path_bytes = 0
         for task in partition_tasks:
             _, rel_path, fsize, target_path, _mtime = task
             if os.path.dirname(target_path) in _skipped_dirs:
@@ -2052,10 +2170,14 @@ def _download_files_inner(
             if fsize < BATCH_SIZE_THRESHOLD:
                 current_batch.append(task)
                 current_batch_bytes += fsize
-                if len(current_batch) >= BATCH_MAX_FILES or current_batch_bytes >= BATCH_MAX_TOTAL:
+                current_batch_path_bytes += len(rel_path.encode("utf-8")) + 4
+                if (len(current_batch) >= BATCH_MAX_FILES
+                        or current_batch_bytes >= batch_total_limit
+                        or current_batch_path_bytes >= BATCH_MAX_PATH_BYTES):
                     partition_batches.append(current_batch)
                     current_batch = []
                     current_batch_bytes = 0
+                    current_batch_path_bytes = 0
             else:
                 partition_singles.append(task)
         if current_batch:
