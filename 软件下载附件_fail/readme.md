@@ -1,0 +1,2 @@
+`Boot_Software_Install` 为启动下载服务器入口，建议以 lingtong 身份运行，后续软件包安装可实现免授权。
+Link_To_QITV3260Printer 为连接QITV3260打印机快速脚本连接后将自动设置打印机

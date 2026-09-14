@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>软件包选择</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .admin-status {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            padding: 10px;
+            text-align: center;
+            font-weight: bold;
+            z-index: 1000;
+        }
+        .admin-status.admin {
+            background-color: #4CAF50;
+            color: white;
+        }
+        .admin-status.not-admin {
+            background-color: #f44336;
+            color: white;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-top: 50px;
+        }
+         h3 {
+            text-align: center;
+            margin-top: 50px;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        th {
+            background-color: #4CAF50;
+            color: white;
+            font-weight: bold;
+        }
+        tr:hover {
+            background-color: #f5f5f5;
+        }
+        .checkbox {
+            text-align: center;
+        }
+        .btn {
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-top: 20px;
+        }
+        .btn:hover {
+            background-color: #45a049;
+        }
+        .status {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #f0f0f0;
+            border-radius: 4px;
+        }
+        .error {
+            color: red;
+        }
+        .success {
+            color: green;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>软件选择</h1>
+        <h2 style="color: white;background-color: red;">文件夹内含有Lingtong密码使用后必须删除文件夹</h2>
+        <table id="installerTable">
+            <thead>
+                <tr>
+                    <th class="checkbox"><input type="checkbox" id="selectAll"></th>
+                    <!-- <th>软件包描述</th style="display: none;"> -->
+                    <th>文件名</th>
+                    <th>软件包路径</th>
+                </tr>
+            </thead>
+            <tbody>
+                <!-- 数据将通过JavaScript动态添加 -->
+            </tbody>
+        </table>
+        <button class="btn" onclick="downloadAndInstall()">下载并安装所选软件</button>
+        <button class="btn" onclick="exitServer()">忘记GTMC-VIP WiFi并退出</button>
+        <div class="status" id="status"></div>
+        <p>©Zhiyu_Chen 2026</p>
+    </div>
+
+    <script>
+        // 读取Excel文件并显示数据
+        async function loadInstallerData() {
+            try {
+                document.getElementById('status').innerHTML = '正在加载Excel文件...';
+                
+                // 添加超时设置，避免请求无限期等待
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 20000); // 20秒超时
+                
+                const response = await fetch('Installer_Packages.xlsx', {
+                    signal: controller.signal
+                });
+                clearTimeout(timeoutId); // 清除超时定时器
+                
+                console.log('Excel文件请求状态:', response.status, response.statusText);
+                
+                if (!response.ok) {
+                    throw new Error(`无法加载Excel文件: ${response.status} ${response.statusText}`);
+                }
+                
+                const arrayBuffer = await response.arrayBuffer();
+                console.log('Excel文件大小:', arrayBuffer.byteLength, '字节');
+                
+                // 检查文件大小，避免处理过大的文件
+                if (arrayBuffer.byteLength > 10 * 1024 * 1024) { // 10MB限制
+                    throw new Error('Excel文件过大，请确保文件大小不超过10MB');
+                }
+                
+                const data = new Uint8Array(arrayBuffer);
+                
+                // 使用SheetJS库解析Excel文件
+                console.log('开始解析Excel文件...');
+                const workbook = XLSX.read(data, { type: 'array' });
+                console.log('Excel工作表名称:', workbook.SheetNames);
+                
+                const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+                const jsonData = XLSX.utils.sheet_to_json(worksheet);
+                console.log('解析后的数据:', jsonData);
+                
+                // 填充表格
+                const tbody = document.querySelector('#installerTable tbody');
+                tbody.innerHTML = '';
+                
+                if (jsonData.length === 0) {
+                    document.getElementById('status').innerHTML = '<span class="error">Excel文件中没有数据</span>';
+                    return;
+                }
+                
+                jsonData.forEach((row, index) => {
+                    console.log('处理行', index, ':', row);
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td class="checkbox"><input type="checkbox" class="installerCheckbox" style="height: 30px;width: 30px;" data-path="${row['安装包路径'] || '未知'}" data-name="${row['产品名称'] || row['文件名'] || '未知'}" data-filename="${row['文件名'] || '未知'}"></td>
+                        
+                        <td>${row['文件名'] || '未知'}</td>
+                        <td>${row['安装包路径'] || '未知'}</td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+                
+                // 全选功能
+                document.getElementById('selectAll').addEventListener('change', function() {
+                    const checkboxes = document.querySelectorAll('.installerCheckbox');
+                    checkboxes.forEach(checkbox => {
+                        checkbox.checked = this.checked;
+                    });
+                });
+                
+                document.getElementById('status').innerHTML = `<span class="success">成功加载 ${jsonData.length} 个软件包</span>`;
+            } catch (error) {
+                if (error.name === 'AbortError') {
+                    document.getElementById('status').innerHTML = '<span class="error">错误: 加载Excel文件超时，请检查网络连接或文件大小</span>';
+                    console.error('加载Excel文件超时:', error);
+                } else {
+                    document.getElementById('status').innerHTML = `<span class="error">错误: ${error.message}</span>`;
+                    console.error('加载Excel文件时出错:', error);
+                    console.error('错误堆栈:', error.stack);
+                }
+            }
+        }
+        
+        // 下载并安装所选软件
+        async function downloadAndInstall() {
+            const selectedCheckboxes = document.querySelectorAll('.installerCheckbox:checked');
+            if (selectedCheckboxes.length === 0) {
+                document.getElementById('status').innerHTML = '<span class="error">请至少选择一个软件包</span>';
+                return;
+            }
+            
+            document.getElementById('status').innerHTML = '正在处理,等待下载';
+            
+            const selectedPackages = Array.from(selectedCheckboxes).map(checkbox => ({
+                name: checkbox.dataset.name,
+                path: checkbox.dataset.path,
+                filename: checkbox.dataset.filename
+            }));
+            
+            try {
+                // 发送请求到后端进行下载和安装
+                console.log('发送请求到后端:', selectedPackages);
+                const response = await fetch('install.py', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ 
+                        packages: selectedPackages,
+                        exitAfterInstall: false
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error('请求失败');
+                }
+                
+                const result = await response.json();
+                console.log('后端响应:', result);
+                document.getElementById('status').innerHTML = `<span class="success">${result.message}</span>`;
+                
+                // 显示完成信息并询问是否退出
+                setTimeout(() => {
+                    if (confirm('所有软件安装完成，是否关闭服务器进程？')) {
+                        // 发送退出请求
+                        fetch('install.py', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({ exitServer: true })
+                        }).then(() => {
+                            document.getElementById('status').innerHTML = '<span class="success">服务关闭并删除了GTMC-VIP配置文件 你可以关闭此页面了</span>';
+                            setTimeout(() => {
+                                window.close();
+                            }, 1000);
+                        });
+                    } else {
+                        document.getElementById('status').innerHTML = '<span class="success">所有软件安装完成</span>';
+                    }
+                }, 1000);
+                
+            } catch (error) {
+                console.error('请求失败:', error);
+                document.getElementById('status').innerHTML = `<span class="error">请求失败: ${error.message}</span>`;
+            }
+        }
+        function exitServer() {
+               fetch('install.py', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({ exitServer: true })
+                        }).then(() => {
+                            document.getElementById('status').innerHTML = '<span class="success">服务器正在关闭...</span>';
+                            setTimeout(() => {
+                                window.close();
+                            }, 1000);
+                        });
+        }
+        
+        // 检查管理员权限
+        async function checkAdminPermission() {
+            try {
+                // 创建管理员状态显示元素
+                const adminStatus = document.createElement('div');
+                adminStatus.className = 'admin-status';
+                adminStatus.id = 'adminStatus';
+                document.body.insertBefore(adminStatus, document.body.firstChild);
+                
+                adminStatus.textContent = '正在检查管理员权限...';
+                
+                // 尝试向后端发送请求检查权限
+                // 注意：由于浏览器限制，这里我们无法直接检查Windows管理员权限
+                // 但我们可以通过尝试执行需要权限的操作来间接判断
+                
+                // 这里使用一个简单的方法：尝试访问本地文件系统相关的操作
+                // 或者通过后端API获取权限状态
+                
+                // 由于我们的后端服务器运行在本地，我们可以假设如果能够连接到后端
+                // 并且后端能够执行管理员操作，那么当前环境可能具有管理员权限
+                
+                // 尝试连接到后端
+                const response = await fetch('install.py', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ checkAdmin: true })
+                });
+                
+                if (response.ok) {
+                    const result = await response.json();
+                    if (result.isAdmin) {
+                        adminStatus.className = 'admin-status admin';
+                        adminStatus.textContent = '当前用户具有管理员权限';
+                    } else {
+                        adminStatus.className = 'admin-status not-admin';
+                        adminStatus.textContent = '当前用户不具有管理员权限';
+                    }
+                } else {
+                    // 如果后端请求失败，显示默认状态
+                    adminStatus.className = 'admin-status not-admin';
+                    adminStatus.textContent = '无法检查管理员权限';
+                }
+            } catch (error) {
+                // 如果发生错误，显示默认状态
+                const adminStatus = document.getElementById('adminStatus');
+                if (adminStatus) {
+                    adminStatus.className = 'admin-status not-admin';
+                    adminStatus.textContent = '无法检查管理员权限';
+                }
+                console.error('检查管理员权限时出错:', error);
+            }
+        }
+        
+        // 页面加载时加载数据
+        window.onload = function() {
+            // 先检查管理员权限 ，未经测试废弃
+            // checkAdminPermission();
+            
+            // 加载SheetJS库
+            const script = document.createElement('script');
+            script.src = 'xlsx.full.min.js';
+            script.onload = loadInstallerData;
+            document.head.appendChild(script);
+        };
+    </script>
+</body>
+</html>
