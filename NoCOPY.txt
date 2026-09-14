@@ -1,0 +1,73 @@
+# ============================================================
+# NoCOPY.txt — 无法拷贝 / 不应拷贝的文件与文件夹排除清单
+# 说明：
+#   - 每行一个条目，支持以下格式：
+#       纯文件名/文件夹名（如 pagefile.sys）
+#       相对路径片段（如 System Volume Information）
+#       通配符 *（如 *.tmp）
+#       用户级通配（如 *\AppData\Local\Temp\*）
+#   - 以 # 开头的行是注释，会被忽略
+#   - 本清单用于磁盘网络拷贝工具过滤掉无意义或无法读取的文件
+# ============================================================
+
+# ---------- 一、Windows 系统运行态/内核数据（无法读取或无意义）----------
+# 虚拟内存页文件（系统占用，无法读取）
+pagefile.sys
+# Modern App 交换文件
+swapfile.sys
+# 休眠文件（系统占用）
+hiberfil.sys
+# 卷影副本/系统还原点（ACL 受限）
+System Volume Information
+# 回收站（权限受限且为垃圾数据）
+$Recycle.Bin
+RECYCLER
+# EFI / 启动分区（通常不可见/只读）
+Boot
+EFI
+
+# ---------- 二、临时/缓存类（无需迁移）----------
+# Windows 临时目录
+*\Windows\Temp\*
+# 预读取缓存
+*\Windows\Prefetch\*
+# Windows 更新缓存
+*\Windows\SoftwareDistribution\*
+# 组件存储（引用计数，直接拷会膨胀）
+*\Windows\WinSxS\*
+# 各用户临时目录
+*\AppData\Local\Temp\*
+# 通用临时文件
+*.tmp
+*.temp
+
+# ---------- 三、浏览器缓存与锁文件 ----------
+# Edge/IE 缓存（运行锁）
+*\AppData\Local\Microsoft\Windows\WebCache\*
+# IE/Edge 下载缓存
+*\AppData\Local\Microsoft\Windows\INetCache\*
+# 浏览器运行锁
+*\AppData\Local\Microsoft\Edge\User Data\*\lockfile
+*\AppData\Local\Google\Chrome\User Data\*\lockfile
+
+# ---------- 四、云同步盘（符号链接/云映射，拷本地缓存无意义）----------
+*\OneDrive\*
+
+# ---------- 五、杀毒/安全软件（运行锁 + 需注册）----------
+*\ProgramData\Microsoft\Windows Defender\*
+
+# ---------- 六、数据库运行文件（独占有锁）----------
+# SQLite 写前日志与锁
+*.db-wal
+*.db-lock
+*.sqlite-wal
+*.sqlite-lock
+
+# ---------- 七、虚拟机磁盘（运行中无法读）----------
+*.vhdx
+*.vmdk
+*.vdi
+
+# ---------- 八、加密/受保护内容（逐字节拷无效） ----------
+# EFS / BitLocker 等加密卷内文件不建议直接拷
+# 注：加密文件需先解密或在目标机恢复密钥，否则无法使用

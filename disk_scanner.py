@@ -74,7 +74,7 @@ def _buf2str(raw: bytes, offset: int) -> str:
 
 
 def _looks_like_serial(s: str) -> bool:
-    """判断字符串是否像序列号/hex ID（不超过8个纯字母数字、或含大量下划线/点）"""
+    """判断字符串是否像序列号/hex ID（不超过个纯字母数字、或含大量下划线/点）"""
     if not s:
         return True
     # 纯十六进制/数字串，长度较短

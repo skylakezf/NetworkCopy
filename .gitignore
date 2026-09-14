@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller 构建输出
+build/
+dist/
+
+# 嵌入式 Python (99MB, 不应提交到 GitHub; CI 使用 conda 环境)
+python-3.13.14-embed-amd64/
+
+# 本地测试产物
+_test_*.txt
+_test_output*.txt
+_test_output_new.txt
+
+# 日志
+*.log

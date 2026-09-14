@@ -25,28 +25,42 @@ try {
 Set-Location -LiteralPath $PSScriptRoot
 Write-Green " 工作目录: $PSScriptRoot"
 
-# ---- 定位嵌入 Python ----
-$PythonCandidates = @(
+# ---- 定位 Python ----
+# 优先级:
+#   1) 环境变量 $env:PYTHON_EXE   —— CI 场景(如 GitHub Actions 的 conda 环境)
+#   2) 本地嵌入式 Python          —— 开发机 python-3.13.14-embed-amd64/
+#   3) PATH 上的 python           —— conda / 系统环境
+$PythonCandidates = @()
+if ($env:PYTHON_EXE) {
+    $PythonCandidates += $env:PYTHON_EXE
+}
+$PythonCandidates += @(
     "$PSScriptRoot\python-3.13.14-embed-amd64\python.exe",
     "$PSScriptRoot\python-3.13.14-embed-amd64\python3.exe",
     "$PSScriptRoot\python-3.13.14-embed-amd64\pythonw.exe"
 )
+$cmdPy = Get-Command python -ErrorAction SilentlyContinue
+if ($cmdPy) { $PythonCandidates += $cmdPy.Source }
+
 foreach ($candidate in $PythonCandidates) {
-    if (Test-Path -LiteralPath $candidate) {
-        $script:PythonExe = $candidate
+    if ($candidate -and (Test-Path -LiteralPath $candidate)) {
+        $script:PythonExe = (Resolve-Path -LiteralPath $candidate).Path
         break
     }
 }
 
 if (-not $script:PythonExe) {
-    Write-Red "✗ 未找到嵌入式 Python，请确认 python-3.13.14-embed-amd64 目录存在"
+    Write-Red "✗ 未找到 Python，请确认嵌入式 Python 目录存在，或已安装 conda/系统 Python 并加入 PATH"
     exit 1
 }
 Write-Green "✓ Python: $script:PythonExe"
 
-# ---- 超时看门狗（保险：5 分钟后强制杀死） ----
-$watchdogJob = Start-Job -ScriptBlock {
-    $timeout = 300  # 秒
+# ---- 超时看门狗（保险：超过时限后强制终止，避免 CI 卡死） ----
+# 默认 15 分钟；可通过环境变量 BUILD_TIMEOUT_SECONDS 覆盖（如 CI 上设更长）
+$buildTimeout = if ($env:BUILD_TIMEOUT_SECONDS) { [int]$env:BUILD_TIMEOUT_SECONDS } else { 900 }
+Write-Yellow "  构建超时上限: ${buildTimeout} 秒"
+$watchdogJob = Start-Job -ArgumentList $buildTimeout -ScriptBlock {
+    param($timeout)
     Start-Sleep -Seconds $timeout
     Write-Warning "BUILD TIMEOUT: 构建超过 $timeout 秒，自动终止"
     Stop-Process -Name "python" -Force -ErrorAction SilentlyContinue
@@ -55,7 +69,7 @@ $watchdogJob = Start-Job -ScriptBlock {
 $buildTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
 # ---- PyInstaller 参数 ----
-$AppName  = "磁盘拷贝工具"
+$AppName  = "磁盘拷贝工具v4_beta"
 $MainPy   = "main.py"
 
 $HiddenImports = @(
@@ -77,7 +91,10 @@ $HiddenImports = @(
     "PIL",
     "PIL.Image",
     "PIL.ImageTk",
-    "secrets", "tls_utils"
+    "secrets", "tls_utils",
+    "file_transfer", "nic_scanner", "disk_scanner",
+    "verifier", "ip_config", "dhcp_server", "config_transfer",
+    "systemconfig", "systemconfig.calc_allocation_migration"
 )
 
 $CollectData = @("cryptography", "ttkbootstrap")
@@ -100,6 +117,11 @@ foreach ($cd in $CollectData) {
 }
 $PyArgs += "--add-data"
 $PyArgs += "certs;certs"        # 在 .NET 字符串中分号不会被当成语句分隔符
+# EULA 协议页面 (本地回退: 远程 qitv1113.gtmcl.com:3000/eula.html 不可达时打开打包版)
+if (Test-Path -LiteralPath "$PSScriptRoot\eula.html") {
+    $PyArgs += "--add-data"
+    $PyArgs += "eula.html;."
+}
 $PyArgs += $MainPy
 
 # ---- 打印参数（调试用） ----
@@ -117,7 +139,11 @@ foreach ($d in @($buildDir, $distDir)) {
         Write-Yellow "  已清理: $d"
     }
 }
-# spec 文件由 PyInstaller 自动重新生成 (含 --noupx 参数), 无需手动删除
+# spec 文件也必须删除, 否则 PyInstaller 会使用旧 spec 并忽略所有 --hidden-import 参数
+if (Test-Path -LiteralPath $specFile) {
+    Remove-Item -LiteralPath $specFile -Force -ErrorAction SilentlyContinue
+    Write-Yellow "  已清理: $specFile"
+}
 
 # ---- 执行构建 ----
 Write-Green ">> 开始 PyInstaller 打包..."

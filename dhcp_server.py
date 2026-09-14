@@ -43,15 +43,15 @@ class MiniDHCPServer:
     """最小的 DHCP 服务器 - 只给外部客户端分配 IP，排除本地网卡"""
 
     def __init__(self, server_ip=SERVER_IP, subnet=DHCP_SUBNET, mask=DHCP_MASK,
-                 exclude_macs=None, out_ip=""):
+                 exclude_macs=None, out_ips=None):
         self.server_ip = server_ip
         self.server_int = _ip2int(server_ip)
         self.subnet = subnet
         self.mask = mask
         self.mask_int = _ip2int(mask)
-        # 广播应答的出口网卡 IP: 多网卡时把 255.255.255.255 广播绑定到该网卡发出,
-        # 否则 Windows 可能把 OFFER 路由到别的网卡, 导致源端收不到而反复重试 (表现为"等很久")
-        self.out_ip = out_ip
+        # 广播应答的出口网卡 IP 列表: 每个有线网卡 IP 创建一个独立 send socket,
+        # 保证 OFFER/ACK 从所有有线网卡发出, 源端任意有线网卡都能收到
+        self.out_ips = out_ips or []
 
         # 需要排除的本地 MAC 地址集合（避免本地网卡 DHCP 自响应）
         self._exclude_macs = set()
@@ -64,7 +64,7 @@ class MiniDHCPServer:
         self._leases = {}      # mac -> {"ip": int, "hostname": str}
         self._running = False
         self._sock = None
-        self._send_sock = None
+        self._send_socks = []  # 多个 send socket, 每个绑定到一个有线网卡 IP
         self._thread = None
         self._client_assigned = threading.Event()
         self._on_client = None  # callback(ip_str, mac_str, hostname)
@@ -105,8 +105,13 @@ class MiniDHCPServer:
 
         return (op, htype, hlen, xid, flags, chaddr, ciaddr, options)
 
-    def _build_dhcp_packet(self, op, xid, yiaddr, chaddr, msg_type, options_extra=None):
-        """构建 DHCP 响应包"""
+    def _build_dhcp_packet(self, op, xid, yiaddr, chaddr, msg_type, options_extra=None,
+                           minimal=False):
+        """构建 DHCP 响应包
+
+        minimal=True 用于 DHCPNAK: RFC 2131 规定 NAK 只携带 message type、
+        server identifier 与 message, 不应携带租约时长/掩码/网关等配置参数。
+        """
         flags = 0x8000  # broadcast
         giaddr = 0
 
@@ -128,16 +133,18 @@ class MiniDHCPServer:
         # Option 54: Server Identifier
         server_ip_bytes = struct.pack("!I", self.server_int)
         pkt += bytes([54, 4]) + server_ip_bytes
-        # Option 51: Lease Time (1 hour)
-        pkt += bytes([51, 4, 0, 0, 14, 16])
-        # Option 1: Subnet Mask
-        mask_bytes = struct.pack("!I", self.mask_int)
-        pkt += bytes([1, 4]) + mask_bytes
-        # Option 3: Router (same as server)
-        pkt += bytes([3, 4]) + server_ip_bytes
-        # Option 28: Broadcast Address
-        broadcast_int = (yiaddr & self.mask_int) | (~self.mask_int & 0xFFFFFFFF)
-        pkt += bytes([28, 4]) + struct.pack("!I", broadcast_int)
+
+        if not minimal:
+            # Option 51: Lease Time (1 hour)
+            pkt += bytes([51, 4, 0, 0, 14, 16])
+            # Option 1: Subnet Mask
+            mask_bytes = struct.pack("!I", self.mask_int)
+            pkt += bytes([1, 4]) + mask_bytes
+            # Option 3: Router (same as server)
+            pkt += bytes([3, 4]) + server_ip_bytes
+            # Option 28: Broadcast Address
+            broadcast_int = (yiaddr & self.mask_int) | (~self.mask_int & 0xFFFFFFFF)
+            pkt += bytes([28, 4]) + struct.pack("!I", broadcast_int)
 
         if options_extra:
             for code, value in options_extra.items():
@@ -151,6 +158,20 @@ class MiniDHCPServer:
     def _is_local_mac(self, mac):
         """检查 MAC 地址是否为本地网卡"""
         return mac.lower() in self._exclude_macs
+
+    def _alloc_ip(self):
+        """分配一个池内未被占用的地址 (跳过服务器自身与已分配地址)
+
+        2026-09-10 修复: 原实现直接取 _next_ip, 当客户端通过 option 50
+        (INIT-REBOOT) 占用了某个地址后, _next_ip 仍指向该地址, 会导致后续
+        客户端拿到重复 IP (地址冲突)。
+        """
+        used = {info["ip"] for info in self._leases.values()}
+        while self._next_ip == self.server_int or self._next_ip in used:
+            self._next_ip += 1
+        ip = self._next_ip
+        self._next_ip += 1
+        return ip
 
     def _handle_discover(self, xid, chaddr, options):
         """处理 DHCPDISCOVER → 分配 IP，返回 DHCPOFFER（排除本地 MAC）"""
@@ -171,21 +192,32 @@ class MiniDHCPServer:
         if mac in self._leases:
             yiaddr = self._leases[mac]["ip"]
         else:
-            yiaddr = self._next_ip
+            yiaddr = self._alloc_ip()
             self._leases[mac] = {"ip": yiaddr, "hostname": hostname}
-            self._next_ip += 1
 
         print(f"[DHCP] DISCOVER from {mac} ({hostname}) → OFFER {_int2ip(yiaddr)}")
         return yiaddr
 
     def _handle_request(self, xid, chaddr, options):
-        """处理 DHCPREQUEST → 确认租约，返回 DHCPACK（排除本地 MAC）"""
+        """处理 DHCPREQUEST, 返回 (yiaddr, nak)。
+
+        - (ip_int, False): 正常, 回 DHCPACK
+        - (None, True):    请求的地址不属于本服务器网段, 必须回 DHCPNAK
+        - (None, False):   忽略 (本地网卡)
+
+        2026-09-10 修复: 原实现无条件 ACK 客户端 option 50 请求的地址。当源端
+        网卡之前从其它 DHCP 服务器 (办公网等) 拿过异网段租约时, 客户端会以
+        INIT-REBOOT 状态请求那个旧地址, 我们会 ACK 一个与接收端不同网段的 IP:
+        客户端认为租约有效而长期不再重新请求, 表现为"获取 IP 极慢 / 拿到了 IP
+        却连不上接收端"。正确做法是回 NAK, 客户端立即回到 INIT 重新广播
+        DISCOVER, 下一轮即可拿到正确地址 (秒级)。
+        """
         mac = ":".join(f"{b:02x}" for b in chaddr[:6])
 
         # 排除本地网卡的 DHCP 请求
         if self._is_local_mac(mac):
             print(f"[DHCP] REQUEST from {mac} (LOCAL) → IGNORED")
-            return None
+            return None, False
 
         # 提取主机名 (option 12)
         hostname = ""
@@ -195,15 +227,22 @@ class MiniDHCPServer:
             except Exception:
                 pass
 
+        requested = None
+        if 50 in options and len(options[50]) == 4:
+            requested = struct.unpack("!I", options[50])[0]
+
         if mac in self._leases:
             yiaddr = self._leases[mac]["ip"]
         else:
-            if 50 in options and len(options[50]) == 4:
-                yiaddr = struct.unpack("!I", options[50])[0]
+            if requested is not None:
+                if (requested & self.mask_int) != (self.server_int & self.mask_int):
+                    print(f"[DHCP] REQUEST from {mac} 请求异网段地址 "
+                          f"{_int2ip(requested)} → NAK")
+                    return None, True
+                yiaddr = requested
             else:
-                yiaddr = self._next_ip
+                yiaddr = self._alloc_ip()
             self._leases[mac] = {"ip": yiaddr, "hostname": hostname}
-            self._next_ip += 1
 
         ip_str = _int2ip(yiaddr)
         print(f"[DHCP] REQUEST from {mac} ({hostname}) → ACK {ip_str}")
@@ -216,7 +255,26 @@ class MiniDHCPServer:
             except Exception:
                 pass
 
-        return yiaddr
+        return yiaddr, False
+
+    def _send_reply(self, pkt, client_port=None):
+        """发送 DHCP 应答 (OFFER/ACK/NAK)
+
+        出口: 监听 socket (0.0.0.0:67, 源端口 67 符合 RFC) + 每个有线网卡出口
+        socket 各发一份, 保证源端任意有线网卡都能收到; 每份重复 2 次抗丢包。
+        目标端口: 优先用客户端的实际源端口 (通常 68)。用实际源端口可兼容源端口
+        非 68 的客户端, 也避免与系统 DHCP 服务抢占 68 端口。
+        """
+        dst = ("255.255.255.255", client_port or DHCP_CLIENT_PORT)
+        for sock in [self._sock] + list(self._send_socks):
+            if sock is None:
+                continue
+            for _ in range(2):
+                try:
+                    sock.sendto(pkt, dst)
+                except Exception:
+                    pass
+                time.sleep(0.02)
 
     def _serve(self):
         """主循环 - 监听 DHCP 请求"""
@@ -239,6 +297,7 @@ class MiniDHCPServer:
             if op != BOOTREQUEST:
                 continue
 
+            client_port = addr[1] if addr else None
             msg_type = options.get(53, b'\x00')[0] if 53 in options else 0
 
             try:
@@ -247,14 +306,20 @@ class MiniDHCPServer:
                     if yiaddr is None:
                         continue  # 本地 MAC，跳过不响应
                     pkt = self._build_dhcp_packet(BOOTREPLY, xid, yiaddr, chaddr, DHCPOFFER)
-                    (self._send_sock or self._sock).sendto(pkt, ('255.255.255.255', DHCP_CLIENT_PORT))
+                    self._send_reply(pkt, client_port)
 
                 elif msg_type == DHCPREQUEST:
-                    yiaddr = self._handle_request(xid, chaddr, options)
-                    if yiaddr is None:
-                        continue  # 本地 MAC，跳过不响应
-                    pkt = self._build_dhcp_packet(BOOTREPLY, xid, yiaddr, chaddr, DHCPACK)
-                    (self._send_sock or self._sock).sendto(pkt, ('255.255.255.255', DHCP_CLIENT_PORT))
+                    yiaddr, nak = self._handle_request(xid, chaddr, options)
+                    if nak:
+                        # 请求的地址不在本网段 → 回 NAK, 让客户端立即重新 DISCOVER
+                        pkt = self._build_dhcp_packet(
+                            BOOTREPLY, xid, 0, chaddr, DHCPNAK,
+                            options_extra={56: b"requested address is not on this network"},
+                            minimal=True)
+                        self._send_reply(pkt, client_port)
+                    elif yiaddr is not None:
+                        pkt = self._build_dhcp_packet(BOOTREPLY, xid, yiaddr, chaddr, DHCPACK)
+                        self._send_reply(pkt, client_port)
 
             except Exception as e:
                 print(f"[DHCP] Error: {e}")
@@ -273,17 +338,20 @@ class MiniDHCPServer:
 
         self._sock.bind(('0.0.0.0', DHCP_SERVER_PORT))
 
-        # 独立发送套接字: 绑定到出口网卡 IP, 保证广播应答 (OFFER/ACK) 从正确网卡发出。
+        # 独立发送套接字: 每个有线网卡 IP 各绑一个, 保证广播应答从所有有线网卡发出。
         # 多网卡主机上, 若直接用 0.0.0.0 套接字发 255.255.255.255, Windows 可能选错出口网卡,
         # 导致源端收不到 OFFER 而反复 DISCOVER 重试 (表现为"获取 IP 要等很久")。
-        self._send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        if self.out_ip:
-            try:
-                self._send_sock.bind((self.out_ip, 0))
-                print(f"[DHCP] 广播应答出口网卡绑定: {self.out_ip}")
-            except Exception as e:
-                print(f"[DHCP] 绑定出口网卡 {self.out_ip} 失败, 回退默认路由: {e}")
+        self._send_socks = []
+        if self.out_ips:
+            for ip in self.out_ips:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                    sock.bind((ip, 0))
+                    self._send_socks.append(sock)
+                    print(f"[DHCP] 广播应答出口网卡绑定: {ip}")
+                except Exception as e:
+                    print(f"[DHCP] 绑定出口网卡 {ip} 失败: {e}")
 
         self._running = True
         self._thread = threading.Thread(target=self._serve, daemon=True)
@@ -294,12 +362,41 @@ class MiniDHCPServer:
         """返回 DHCP 服务器是否正在运行"""
         return self._running
 
+    def set_out_ips(self, ips):
+        """更新广播出口网卡 IP 列表 (供动态刷新: APIPA 地址可能在启动后才出现)"""
+        self.out_ips = ips or []
+
+    def refresh_out_ips(self):
+        """动态刷新广播出口 send sockets: 将新出现的出口 IP 绑定新 socket。
+
+        用于 APIPA 地址在服务器启动后才分配的场景 (刚插网线时 Windows 需约
+        15 秒探测), 保证 OFFER/ACK 从新出现的地址发出, 提高发现成功率。"""
+        if not self._running:
+            return
+        bound = set()
+        for sock in list(self._send_socks):
+            try:
+                bound.add(sock.getsockname()[0])
+            except Exception:
+                pass
+        for ip in list(self.out_ips):
+            if ip in bound:
+                continue
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.bind((ip, 0))
+                self._send_socks.append(sock)
+                print(f"[DHCP] 广播应答出口网卡绑定: {ip}")
+            except Exception as e:
+                print(f"[DHCP] 绑定出口网卡 {ip} 失败: {e}")
+
     def stop(self):
         """停止 DHCP 服务器"""
         self._running = False
         if self._thread:
             self._thread.join(timeout=2)
-        for s in (self._sock, self._send_sock):
+        for s in [self._sock] + self._send_socks:
             if s:
                 try:
                     s.close()

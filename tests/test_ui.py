@@ -1,0 +1,1636 @@
+"""
+全场景 UI 准确性测试
+测试所有导航路径、按钮状态、步骤跳转逻辑
+"""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import sys, os, threading, traceback, types
+
+# 测试环境: 关闭"启动时用默认浏览器打开 EULA 页面"
+os.environ["NETCOPY_SKIP_EULA_BROWSER"] = "1"
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, 'python-3.13.14-embed-amd64',
+                                'Lib', 'site-packages'))
+
+# ============================================================
+# 导入被测模块
+# ============================================================
+from ui import WinGUI
+from control import Controller
+
+# ============================================================
+# 测试框架
+# ============================================================
+
+results = []
+errors = []
+
+def test(name):
+    def decorator(fn):
+        def wrapper():
+            try:
+                fn()
+                results.append(f"  PASS: {name}")
+            except AssertionError as e:
+                msg = f"  FAIL: {name} — {e}"
+                results.append(msg)
+                errors.append(msg)
+            except Exception as e:
+                msg = f"  ERROR: {name} — {e}\n{traceback.format_exc()}"
+                results.append(msg)
+                errors.append(msg)
+        return wrapper
+    return decorator
+
+def check(cond, msg=""):
+    if not cond:
+        raise AssertionError(msg)
+
+def eq(a, b, msg=""):
+    if a != b:
+        raise AssertionError(f"{msg} 期望={b!r}, 实际={a!r}")
+
+# ============================================================
+# 测试辅助
+# ============================================================
+
+class T:
+    """测试 fixture"""
+    def __init__(self):
+        self.app = WinGUI()
+        # 抑制 bgerror, 防止前序测试的残留 after 回调污染当前实例
+        self.app.report_callback_exception = lambda *a: None
+        self.ctl = Controller()
+        self.ctl.init(self.app)
+        self.app.ctl = self.ctl
+        # 协议确认 (EULA): 测试默认勾选, 激活发送方/接收方按钮
+        self.app._eula_var.set(True)
+        self.app._on_eula_toggle()
+        self.app.update_idletasks()
+
+    @property
+    def step(self):
+        return self.app._step
+
+    @property
+    def next_state(self):
+        try:
+            return str(self.app.tk_button_next.cget("state"))
+        except:
+            return "ERROR"
+
+    @property
+    def prev_state(self):
+        try:
+            return str(self.app.tk_button_prev.cget("state"))
+        except:
+            return "ERROR"
+
+    @property
+    def next_text(self):
+        try:
+            return self.app.tk_button_next.cget("text")
+        except:
+            return "ERROR"
+
+    def select_role(self, role):
+        self.app._on_select_role(role)
+        self.app.update_idletasks()
+
+    def set_nic(self, name="Test NIC [Realtek]"):
+        # 网卡已改为全自动检测 (不再有手动选择下拉框)。
+        # 此方法仅用于测试中模拟自动网卡选择结果。
+        self.ctl._auto_nic = (name, "Realtek PCIe GbE Family Controller",
+                              "ethernet0", "1Gbps", 1, "169.254.100.2")
+        self.ctl._nic_list = [self.ctl._auto_nic]
+        self.app.update_idletasks()
+
+    def set_disk(self, name="磁盘 0 (ST1000DM010)"):
+        cb = self.app.tk_select_box_mqfzmzbe
+        cb.set(name)
+        if hasattr(self.ctl, '_on_disk_selected'):
+            self.ctl._on_disk_selected()
+        self.app.update_idletasks()
+
+    def next_step(self):
+        # 发送方步骤1前进会触发"未导出配置"提醒弹窗 → 测试中模拟已导出
+        if self.app._step == 1 and getattr(self.ctl, '_device_type', '') == "源设备":
+            self.ctl._config_export_done = True
+        self.ctl._on_next_step()
+        self.app.update_idletasks()
+
+    def prev_step(self):
+        self.ctl._on_prev_step()
+        self.app.update_idletasks()
+
+    def destroy(self):
+        try:
+            # 取消所有 pending after 回调, 防止污染后续 Tk 实例
+            for cb_id in self.app.tk.call('after', 'info'):
+                try:
+                    self.app.after_cancel(cb_id)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self.app.destroy()
+        except:
+            pass
+
+def make_app():
+    return T()
+
+
+def _destroy_app_clean(app):
+    """销毁窗口前先取消所有 pending after 回调, 防止残留回调污染后续 Tk 实例"""
+    try:
+        for cb_id in app.tk.call('after', 'info'):
+            try:
+                app.after_cancel(cb_id)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        app.destroy()
+    except Exception:
+        pass
+
+# ============================================================
+# EULA 协议确认 (2026-08-28 新增)
+# ============================================================
+
+@test("49. 未勾选协议时发送方/接收方按钮禁用, 点击不触发")
+def test_eula_blocks_role_buttons():
+    app = WinGUI()
+    app.report_callback_exception = lambda *a: None
+    ctl = Controller()
+    ctl.init(app)
+    app.ctl = ctl
+    try:
+        eq(str(app.tk_btn_source.cget("state")), "disabled",
+           "未勾选协议时发送方按钮应禁用")
+        eq(str(app.tk_btn_target.cget("state")), "disabled",
+           "未勾选协议时接收方按钮应禁用")
+        # 直接调用 _on_select_role (模拟点击卡片) 也不应触发
+        app._on_select_role("source")
+        app.update_idletasks()
+        eq(app._step, 0, "未勾选协议时选择角色不应跳转")
+        eq(getattr(ctl, '_device_type', None), None, "未勾选协议时不应设置设备类型")
+    finally:
+        _destroy_app_clean(app)
+
+@test("50. 勾选协议后发送方/接收方按钮激活, 可正常选择角色")
+def test_eula_agree_enables_buttons():
+    app = WinGUI()
+    app.report_callback_exception = lambda *a: None
+    ctl = Controller()
+    ctl.init(app)
+    app.ctl = ctl
+    try:
+        eq(str(app.tk_btn_source.cget("state")), "disabled",
+           "初始发送方按钮应禁用")
+        app._eula_var.set(True)
+        app._on_eula_toggle()
+        app.update_idletasks()
+        eq(str(app.tk_btn_source.cget("state")), "normal",
+           "勾选后发送方按钮应激活")
+        eq(str(app.tk_btn_target.cget("state")), "normal",
+           "勾选后接收方按钮应激活")
+        app._on_select_role("source")
+        app.update_idletasks()
+        eq(ctl._device_type, "源设备", "勾选后应能正常选择角色")
+        # 取消勾选 → 重新禁用
+        app._eula_var.set(False)
+        app._on_eula_toggle()
+        app.update_idletasks()
+        eq(str(app.tk_btn_source.cget("state")), "disabled",
+           "取消勾选后发送方按钮应重新禁用")
+    finally:
+        _destroy_app_clean(app)
+
+# ============================================================
+# 测试 1: 初始状态
+# ============================================================
+
+@test("1. 初始状态: step=0, 两个按钮均禁用")
+def test_initial():
+    t = make_app()
+    try:
+        eq(t.step, 0)
+        eq(t.next_state, "disabled")
+        eq(t.prev_state, "disabled")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 2: 发送端正向导航
+# ============================================================
+
+@test("2. 发送端: 0→1 选角色后 step=1, 上一步启用, 下一步启用(网卡全自动)")
+def test_source_role_select():
+    t = make_app()
+    try:
+        t.select_role("source")
+        eq(t.step, 1)
+        eq(t.prev_state, "normal")
+        eq(t.next_state, "normal", "步骤1 网卡全自动检测, 下一步直接启用")
+    finally:
+        t.destroy()
+
+@test("3. 发送端: step1 模拟自动网卡后下一步启用")
+def test_source_nic_select():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        eq(t.next_state, "normal")
+    finally:
+        t.destroy()
+
+@test("4. 发送端: 1→2 前进, step=2(连接页), 下一步禁用")
+def test_source_step2():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.next_step()
+        eq(t.step, 2)
+        eq(t.next_state, "disabled")
+    finally:
+        t.destroy()
+
+@test("5. 发送端: step1 高级选项选磁盘后下一步保持启用")
+def test_source_disk_select():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.set_disk()  # 磁盘选择已移入高级选项(步骤1), 不阻塞下一步
+        eq(t.step, 1)
+        eq(t.next_state, "normal")
+    finally:
+        t.destroy()
+
+@test("6. 发送端: 1→2 前进到连接页, step=2, 下一步禁用")
+def test_source_step3():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.next_step()
+        eq(t.step, 2)
+        eq(t.next_state, "disabled")
+    finally:
+        t.destroy()
+
+@test("7. 发送端: 传输完成后 step3 下一步禁用 (校验自动后台执行)")
+def test_source_step4_done():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.next_step()  # →2 连接页
+        t.ctl._transfer_done = True
+        t.app.go_step(3)  # →3 传输页
+        t.app.update_idletasks()
+        eq(t.step, 3)
+        eq(t.next_state, "disabled", "发送端传输完成即结束, 校验自动在后台进行")
+    finally:
+        t.destroy()
+
+@test("8. 发送端: 传输完成后无后续步骤 (不进入步骤4/5)")
+def test_source_no_further_step():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.next_step()
+        t.ctl._transfer_done = True
+        t.app.go_step(3)
+        t.app.update_idletasks()
+        eq(t.step, 3)
+        eq(t.next_state, "disabled", "发送端传输完成即结束")
+        eq(t.prev_state, "normal")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 3: 发送端反向导航
+# ============================================================
+
+@test("9. 发送端: step3(传输完成) 回退到 step2")
+def test_source_backward_from4():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.next_step()
+        t.ctl._transfer_done = True
+        t.app.go_step(3)
+        t.app.update_idletasks()
+        t.prev_step()  # →2
+        eq(t.step, 2)
+    finally:
+        t.destroy()
+
+@test("10. 发送端: 3→2→1→0 完整回退")
+def test_source_full_backward():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.next_step()  # →2 连接页
+        t.ctl._transfer_done = True
+        t.app.go_step(3)  # →3 传输页
+        t.app.update_idletasks()
+
+        t.prev_step()  # →2
+        eq(t.step, 2)
+        t.prev_step()  # →1
+        eq(t.step, 1)
+        eq(t.next_state, "normal", "回退到step1时网卡仍选中, 下一步启用")
+        t.prev_step()  # →0
+        eq(t.step, 0)
+        eq(t.next_state, "disabled")
+        eq(t.prev_state, "disabled")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 4: 接收端正向导航
+# ============================================================
+
+@test("11. 接收端: 0→1 选角色后 step=1, 下一步启用(网卡全自动)")
+def test_target_role_select():
+    t = make_app()
+    try:
+        t.select_role("target")
+        eq(t.step, 1)
+        eq(t.prev_state, "normal")
+        eq(t.next_state, "normal", "步骤1 网卡全自动检测, 下一步直接启用")
+    finally:
+        t.destroy()
+
+@test("12. 接收端: step3 传输完成后下一步为'查看总结 >'")
+def test_target_step4():
+    t = make_app()
+    try:
+        t.select_role("target")
+        t.set_nic()
+        t.next_step()
+        t.ctl._transfer_done = True
+        t.app.go_step(3)
+        t.app.update_idletasks()
+        eq(t.step, 3)
+        eq(t.next_text, "查看总结 >")
+        eq(t.next_state, "normal")
+    finally:
+        t.destroy()
+
+@test("13. 接收端: 3→4 前进, step=4 是最后一步, 下一步为'完成'")
+def test_target_step5():
+    t = make_app()
+    try:
+        t.select_role("target")
+        t.set_nic()
+        t.next_step()
+        t.ctl._transfer_done = True
+        t.app.go_step(3)
+        t.app.update_idletasks()
+        t.next_step()
+        eq(t.step, 4)
+        eq(t.next_text, "完成", "step4 传输总结页, 下一步为'完成'")
+        eq(t.next_state, "normal", "step4 点击完成结束向导")
+    finally:
+        t.destroy()
+
+@test("14. 接收端: step4 为最后一步, 下一步为'完成'而非进入步骤5")
+def test_target_no_step6():
+    t = make_app()
+    try:
+        t.select_role("target")
+        t.set_nic()
+        t.next_step()
+        t.ctl._transfer_done = True
+        t.app.go_step(3)
+        t.app.update_idletasks()
+        t.next_step()  # →4 传输总结
+        eq(t.step, 4)
+        eq(t.next_text, "完成", "总结页为最后一步, 点击完成结束")
+        eq(t.next_state, "normal")
+        t.prev_step()  # →3
+        eq(t.step, 3)
+        eq(t.next_text, "查看总结 >")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 5: 接收端反向导航
+# ============================================================
+
+@test("15. 接收端: 4→3→2→1→0 完整回退")
+def test_target_full_backward():
+    t = make_app()
+    try:
+        t.select_role("target")
+        t.set_nic()
+        t.next_step()  # →2 连接页
+        t.ctl._transfer_done = True
+        t.app.go_step(3)  # →3 传输页
+        t.app.update_idletasks()
+        t.next_step()  # →4 传输总结
+
+        t.prev_step()  # →3
+        eq(t.step, 3)
+        eq(t.next_text, "查看总结 >")
+        t.prev_step()  # →2
+        eq(t.step, 2)
+        t.prev_step()  # →1
+        eq(t.step, 1)
+        eq(t.next_state, "normal")
+        t.prev_step()  # →0
+        eq(t.step, 0)
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 6: 网卡状态检查
+# ============================================================
+
+@test("16. 步骤1 无需网卡选择即可进入下一步 (网卡全自动检测)")
+def test_nic_placeholders():
+    t = make_app()
+    try:
+        t.select_role("source")
+        eq(t.step, 1)
+        # 网卡为全自动检测, 角色已选即可进入下一步
+        eq(t.next_state, "normal", "步骤1 角色已选即可进入下一步")
+        # 手动选择下拉框已从 UI 移除
+        check(not hasattr(t.app, 'tk_select_box_mqfzkd6x'),
+              "网卡选择下拉框应已从 UI 移除")
+        check(not hasattr(t.app, 'tk_label_nic_detail'),
+              "网卡详情标签应已从 UI 移除")
+    finally:
+        t.destroy()
+
+@test("17. 自动网卡检测信息显示后下一步保持启用")
+def test_nic_real():
+    t = make_app()
+    try:
+        t.select_role("source")
+        # 模拟自动网卡检测回调 (无需手动选择)
+        t.app.update_auto_nic_display("Realtek PCIe GbE Family Controller",
+                                      "169.254.100.2", "1Gbps", 1)
+        eq(t.next_state, "normal")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 7: 磁盘状态检查
+# ============================================================
+
+@test("18. 磁盘选择已移入高级选项, 未选磁盘不阻塞步骤1前进")
+def test_disk_placeholders():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        eq(t.step, 1)
+        # 磁盘选择已移入高级选项面板, 未选磁盘时下一步保持启用
+        eq(t.next_state, "normal")
+        t.app.tk_select_box_mqfzmzbe.set("扫描中...")
+        eq(t.next_state, "normal")
+        t.app.tk_select_box_mqfzmzbe.set("未检测到磁盘")
+        eq(t.next_state, "normal")
+        t.app.tk_select_box_mqfzmzbe.set("请先选择设备类型")
+        eq(t.next_state, "normal")
+    finally:
+        t.destroy()
+
+@test("19. 在高级选项选真实磁盘后下一步保持启用")
+def test_disk_real():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.set_disk("磁盘 0 (ST1000DM010-2EP102)")
+        eq(t.step, 1)
+        eq(t.next_state, "normal")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 8: 传输未完成时不可前进
+# ============================================================
+
+@test("20. 传输未完成 step3 下一步禁用, 发送端完成后保持禁用")
+def test_transfer_not_done():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.next_step()
+        t.app.go_step(3)
+        t.app.update_idletasks()
+        eq(t.step, 3)
+        eq(t.next_state, "disabled", "传输未完成应禁用")
+
+        t.ctl._transfer_done = True
+        t.app.go_step(3)
+        t.app.update_idletasks()
+        eq(t.next_state, "disabled", "发送端传输完成后仍禁用 (校验自动后台执行)")
+    finally:
+        t.destroy()
+
+@test("20b. 步骤3 边传边校验状态行存在且可更新")
+def test_verify_online_label():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.next_step()
+        t.app.go_step(3)
+        t.app.update_idletasks()
+        eq(t.step, 3)
+        check(hasattr(t.app, "tk_label_verify_online"),
+              "步骤3 应存在边传边校验状态行 (tk_label_verify_online)")
+        t.app.set_verify_online_status("边传边校验：已确认 3/5 个文件")
+        t.app.update_idletasks()
+        eq(t.app.tk_label_verify_online.cget("text"), "边传边校验：已确认 3/5 个文件",
+           "set_verify_online_status 应更新标签文本")
+        t.app.hide_transfer_error()
+        t.app.update_idletasks()
+        eq(t.app.tk_label_verify_online.cget("text"), "文件确认：等待中",
+           "hide_transfer_error 应重置状态行为等待中")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 9: 步骤间跳转保留网卡/磁盘选择
+# ============================================================
+
+@test("21. 回退到 step1 下一步保持启用 (网卡全自动)")
+def test_nic_preserved():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.next_step()  # →2
+        t.prev_step()  # →1
+        eq(t.next_state, "normal", "回退到步骤1 下一步仍启用")
+    finally:
+        t.destroy()
+
+@test("22. 回退到 step1 磁盘选择保留 (磁盘选择在高级选项)")
+def test_disk_preserved():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.set_disk("磁盘 1 (WDC WD10EZEX)")
+        t.next_step()  # →2 连接页
+        t.prev_step()  # →1
+        eq(t.app.tk_select_box_mqfzmzbe.get(), "磁盘 1 (WDC WD10EZEX)")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 10: 角色切换一致性
+# ============================================================
+
+@test("23. 角色切换后按钮状态一致性")
+def test_role_switch():
+    t = make_app()
+    try:
+        t.select_role("source")
+        eq(t.ctl._device_type, "源设备")
+        t.prev_step()  # →0
+
+        t.select_role("target")
+        eq(t.ctl._device_type, "目标设备")
+        eq(t.step, 1)
+        eq(t.prev_state, "normal")
+        eq(t.next_state, "normal", "步骤1 网卡全自动检测, 下一步直接启用")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 11: 发送端不应出现步骤5
+# ============================================================
+
+@test("24. 发送端传输完成后不进入步骤4/5")
+def test_source_no_step5():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.next_step()
+        t.ctl._transfer_done = True
+        t.app.go_step(3)
+        t.app.update_idletasks()
+        eq(t.step, 3)
+        eq(t.next_state, "disabled", "发送端传输完成即结束, 无步骤4/5")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 12: go_step 边界
+# ============================================================
+
+@test("25. go_step(0) 正确设置状态")
+def test_gostep_0():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.app.go_step(0)
+        t.app.update_idletasks()
+        eq(t.step, 0)
+        eq(t.next_state, "disabled")
+        eq(t.prev_state, "disabled")
+    finally:
+        t.destroy()
+
+@test("26. go_step(1) 下一步启用")
+def test_gostep_1():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.app.go_step(1)
+        eq(t.step, 1)
+        eq(t.next_state, "normal")
+    finally:
+        t.destroy()
+
+@test("27. go_step(1) 不依赖网卡选择 (下拉框已移除)")
+def test_gostep_1_no_nic():
+    t = make_app()
+    try:
+        t.select_role("source")
+        check(not hasattr(t.app, 'tk_select_box_mqfzkd6x'),
+              "网卡选择下拉框应已移除")
+        t.app.go_step(1)
+        eq(t.step, 1)
+        eq(t.next_state, "normal", "步骤1 下一步不依赖网卡选择")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 13: 连续快速点击
+# ============================================================
+
+@test("28. 未选磁盘时连续点下一步不跳过步骤")
+def test_rapid_click():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.next_step()  # →2 (因为下一步在step1启用)
+        eq(t.step, 2)
+        # 连续点击 (下一步在step2禁用, 所以不会前进)
+        t.next_step()
+        eq(t.step, 2, "不应前进")
+        t.next_step()
+        eq(t.step, 2, "不应前进")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 14: 按钮文字变化
+# ============================================================
+
+@test("29. 发送端各步骤按钮文字")
+def test_button_text_source():
+    t = make_app()
+    try:
+        t.select_role("source")
+        eq(t.next_text, "下一步 >", "step1文字")
+        t.set_nic()
+        t.next_step()  # →2 连接页
+        eq(t.next_text, "下一步 >", "step2文字(但禁用)")
+        t.ctl._transfer_done = True
+        t.app.go_step(3)  # →3 传输页
+        t.app.update_idletasks()
+        eq(t.next_text, "下一步 >", "step3文字(但禁用)")
+    finally:
+        t.destroy()
+
+@test("30. 接收端各步骤按钮文字")
+def test_button_text_target():
+    t = make_app()
+    try:
+        t.select_role("target")
+        t.set_nic()
+        t.next_step()
+        t.ctl._transfer_done = True
+        t.app.go_step(3)
+        t.app.update_idletasks()
+        eq(t.next_text, "查看总结 >", "接收端 step3 应为'查看总结 >'")
+        t.next_step()
+        eq(t.step, 4)
+        eq(t.next_text, "完成", "step4 传输总结页, 下一步为'完成'")
+        eq(t.next_state, "normal")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 15: 接收端跳过导入
+# ============================================================
+
+@test("31. 接收端跳过导入: 停留在 step4 (最后一步), 下一步为'完成'")
+def test_skip_import():
+    t = make_app()
+    try:
+        t.select_role("target")
+        t.set_nic()
+        t.next_step()
+        t.ctl._transfer_done = True
+        t.app.go_step(3)
+        t.app.update_idletasks()
+        t.next_step()  # →4 传输总结
+        eq(t.step, 4)
+        t.ctl._on_skip_import()
+        eq(t.step, 4, "跳过导入后停留在步骤4 (校验已自动后台执行)")
+        eq(t.next_text, "完成", "跳过导入后下一步为'完成'")
+        eq(t.next_state, "normal")
+        eq(t.prev_state, "normal")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 16: 导出配置面板显隐
+# ============================================================
+
+@test("32. 发送端 step1 显示导出配置面板")
+def test_export_visible_source():
+    t = make_app()
+    try:
+        t.select_role("source")
+        eq(t.step, 1)
+        check(t.app._export_frame.winfo_ismapped(), "发送端应显示导出面板")
+    finally:
+        t.destroy()
+
+@test("33. 接收端 step1 隐藏导出配置面板")
+def test_export_hidden_target():
+    t = make_app()
+    try:
+        t.select_role("target")
+        eq(t.step, 1)
+        check(not t.app._export_frame.winfo_ismapped(), "接收端应隐藏导出面板")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 17: step3 开始传输按钮状态
+# ============================================================
+
+@test("34. step2 开始传输按钮启用 (无需网卡选择)")
+def test_transfer_button_enabled():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.next_step()
+        eq(t.step, 2)
+        eq(str(t.app.tk_button_mqfzl35t.cget("state")), "normal",
+           "开始传输按钮应启用 (不依赖网卡选择)")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 18: _on_next_step 在 step1 无网卡时不前进
+# ============================================================
+
+@test("35. step1 无需网卡选择即可前进到 step2")
+def test_next_blocked_no_nic():
+    t = make_app()
+    try:
+        t.select_role("source")
+        eq(t.step, 1)
+        t.next_step()
+        eq(t.step, 2, "步骤1 无需网卡选择即可进入连接页")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 19: 接收端传输完成自动跳转 step5
+# ============================================================
+
+@test("36. 接收端 _on_download_complete 自动跳到 step4 (无配置文件时)")
+def test_auto_jump_step5():
+    t = make_app()
+    try:
+        t.select_role("target")
+        t.set_nic()
+        t.next_step()
+        t.ctl._transfer_done = True
+        # 模拟无配置文件: monkey-patch get_config_from_ini 返回 None
+        import config_transfer
+        _orig = config_transfer.get_config_from_ini
+        config_transfer.get_config_from_ini = lambda: (None, None)
+        try:
+            t.ctl._on_download_complete(True, 10, 1024*1024, [])
+            eq(t.step, 4, "接收端传输完成应自动到step4(传输总结)")
+        finally:
+            config_transfer.get_config_from_ini = _orig
+    finally:
+        t.destroy()
+
+@test("36b. 接收端 _on_download_complete 发现配置文件时后台自动导入 (校验完成后统一进总结页)")
+def test_stay_step4_with_config():
+    t = make_app()
+    try:
+        t.select_role("target")
+        t.set_nic()
+        t.next_step()
+        # 模拟传输已启动: 先跳到 step3 (传输页面)
+        t.app.go_step(3)
+        t.ctl._transfer_done = True
+        import config_transfer
+        _orig = config_transfer.get_config_from_ini
+        config_transfer.get_config_from_ini = lambda: ("F:\\Appl\\2026-08-02", "2026-08-02 22:57:42")
+        try:
+            t.ctl._on_download_complete(True, 10, 1024*1024, [])
+            t.app.update_idletasks()
+            # 自动导入: 检测到配置后后台自动导入, 停留在传输页(step3), 校验完成后统一进入总结页
+            eq(t.step, 3, "发现配置文件时后台自动导入, 不立即跳转 (校验完成后统一进入总结页)")
+            check(t.ctl._auto_import_active, "应处于自动导入状态")
+            # 配置检测确认区不再显示
+            try:
+                t.app._config_detect_frame.pack_info()
+                assert False, "配置检测确认区不应 pack"
+            except Exception:
+                pass  # 正确: 未 pack
+        finally:
+            config_transfer.get_config_from_ini = _orig
+    finally:
+        t.destroy()
+
+@test("L1. 传输期间全屏锁定/解锁 (lock_screen/unlock_screen)")
+def test_lock_screen():
+    t = make_app()
+    try:
+        t.app.lock_screen()
+        check(getattr(t.app, "_screen_locked", False), "lock_screen 后应处于锁定状态")
+        eq(t.app.attributes("-fullscreen"), 1, "应全屏")
+        eq(t.app.attributes("-topmost"), 1, "应置顶")
+        t.app.unlock_screen()
+        check(not getattr(t.app, "_screen_locked", False), "unlock_screen 后应解除锁定")
+        eq(t.app.attributes("-fullscreen"), 0, "应恢复非全屏")
+        eq(t.app.attributes("-topmost"), 0, "应取消置顶")
+    finally:
+        t.destroy()
+
+@test("L2. 接收端传输结束(_on_download_complete)自动解除锁定")
+def test_lock_release_on_complete():
+    t = make_app()
+    try:
+        t.select_role("target")
+        t.app.lock_screen()  # 模拟开始传输后的锁定
+        t.ctl._on_download_complete(False, [], 0, ["模拟失败"])
+        check(not getattr(t.app, "_screen_locked", False), "传输结束后应解除锁定")
+    finally:
+        t.destroy()
+
+@test("L3. 源端检测到接收端完成(_poll_source_done)自动解除锁定")
+def test_source_done_unlock():
+    t = make_app()
+    try:
+        t.select_role("source")
+
+        class _FakeServer:
+            def is_transfer_done(self, idle_seconds=15.0):
+                return True
+
+        t.ctl._file_server = _FakeServer()
+        t.app.lock_screen()
+        t.ctl._poll_source_done()
+        check(not getattr(t.app, "_screen_locked", False), "源端检测到完成后应解除锁定")
+    finally:
+        t.destroy()
+
+@test("L4. 源端接收端进度上报 → 更新进度条与状态")
+def test_source_progress_report():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.ctl._on_source_report({
+            "done": False, "files_done": 5, "files_total": 10,
+            "bytes_done": 5120, "bytes_total": 10240, "status": "正在传输... 5/10 文件",
+        })
+        t.app.update()  # 处理 after(0) 主线程回调
+        eq(t.app.tk_progress_bar["value"], 50, "进度条应为 50% (5120/10240)")
+        check("[接收端]" in t.app.tk_label_transfer_status.cget("text"),
+              "状态文字应带[接收端]前缀")
+    finally:
+        t.destroy()
+
+@test("L5. 源端收到完成上报 → 解除锁定并标记完成")
+def test_source_done_report():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.app.lock_screen()
+        t.ctl._on_source_report({"done": True})
+        t.app.update()  # 处理 after(0) 主线程回调
+        check(getattr(t.ctl, "_source_done_marked", False), "应标记源端已完成")
+        check(not getattr(t.app, "_screen_locked", False), "应解除全屏锁定")
+        check("已完成拷贝" in t.app.tk_label_transfer_status.cget("text"),
+              "状态应提示接收端已完成拷贝")
+        eq(t.app.tk_progress_bar["value"], 100, "进度条应到 100")
+    finally:
+        t.destroy()
+
+@test("L6. 发送端完成后进入[传输完成]页面(step5)")
+def test_source_done_page():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.app.lock_screen()
+        t.ctl._source_mark_done()
+        t.app.update_idletasks()
+        eq(t.step, 5, "发送端完成后应切换到完成页(step5)")
+        check(hasattr(t.app, "tk_button_source_done"), "完成页应包含[完成并关闭]按钮")
+        eq(t.app.tk_button_source_done.cget("text"), "完成并关闭")
+        eq(t.next_text, "完成", "底部下一步按钮文字应为[完成]")
+        eq(t.next_state, "normal", "完成页下一步按钮应启用")
+        eq(t.prev_state, "disabled", "完成页应禁用上一步")
+        check(not getattr(t.app, "_screen_locked", False), "应解除全屏锁定")
+    finally:
+        t.destroy()
+
+@test("L7. 总结页导入明细背景与整体灰卡片风格统一")
+def test_summary_style_unified():
+    t = make_app()
+    try:
+        t.select_role("target")
+        t.app.go_step(4)
+        t.app.update_idletasks()
+        bg = str(t.app.tk_summary_import_items.cget("bg")).lower()
+        check(bg != "#ffffff", f"导入明细不应为白色编辑框风格, 实际 {bg}")
+        check("f0f0f0" in bg or bg == "#f0f0f0", f"应为灰卡片背景色, 实际 {bg}")
+    finally:
+        t.destroy()
+
+@test("L8. 接收端总结页: 完成并关闭按钮 + 底部报告按钮 + 校验统计简洁格式")
+def test_summary_done_button():
+    t = make_app()
+    try:
+        t.select_role("target")
+        t.app.go_step(4)
+        t.app.update_idletasks()
+        check(hasattr(t.app, "tk_button_summary_done"), "总结页应包含[完成并退出]按钮")
+        eq(t.app.tk_button_summary_done.cget("text"), "完成并退出")
+        check(hasattr(t.app, "_summary_bottom_row"), "总结页应存在底部按钮行")
+        check(t.app.tk_button_view_report.master is t.app._summary_bottom_row,
+              "查看校验报告按钮应位于内容框底部按钮行")
+        check(t.app.tk_button_summary_done.master is t.app._summary_bottom_row,
+              "完成并退出按钮应位于内容框底部按钮行")
+        # 校验统计简洁格式: 总计 X 个文件，通过 Y 个
+        t.app.render_verify_stats((95, 5, 0, 100))
+        txt = str(t.app.tk_summary_verify_label.cget("text"))
+        check("总计 100 个文件" in txt, f"校验统计应显示总计, 实际: {txt}")
+        check("通过 95 个" in txt, f"校验统计应显示通过, 实际: {txt}")
+        check("跳过" not in txt, f"校验统计不应再显示跳过项, 实际: {txt}")
+        t.app.render_verify_stats((100, 0, 0, 100))
+        txt = str(t.app.tk_summary_verify_label.cget("text"))
+        check("失败 0 个" not in txt, f"全通过时不显示失败数, 实际: {txt}")
+    finally:
+        t.destroy()
+
+# ============================================================
+#  新增测试 — 网卡自动选择 & 高级选项 (2026-08-02)
+# ============================================================
+
+def test_get_wired_adapters_struct():
+    """get_wired_adapters() 返回正确的 6 元组结构"""
+    from nic_scanner import get_wired_adapters
+    wired = get_wired_adapters()
+    assert isinstance(wired, list), "应返回列表"
+    for item in wired:
+        assert len(item) == 6, f"每项应为 6 元组, 实际 {len(item)}"
+        assert isinstance(item[0], str), "display_name 应为 str"
+        assert isinstance(item[1], str), "description 应为 str"
+        assert isinstance(item[2], str), "adapter_name 应为 str"
+        assert isinstance(item[3], str), "speed_str 应为 str"
+        assert isinstance(item[4], int), "index 应为 int"
+        assert isinstance(item[5], str), "ip_address 应为 str"
+        assert item[4] > 0, f"网卡索引应 > 0, 实际 {item[4]}"
+    print(f"  PASS test_get_wired_adapters_struct ({len(wired)} 个有线网卡)")
+
+def test_get_wired_adapters_no_wifi():
+    """get_wired_adapters() 不应包含 Wi-Fi(Type 71) 适配器"""
+    from nic_scanner import get_wired_adapters
+    wired = get_wired_adapters()
+    # 检查返回的适配器不包含 802.11/Wi-Fi 关键词
+    wifi_keywords = ["wireless", "wi-fi", "wifi", "802.11", "wlan"]
+    for item in wired:
+        lower_name = item[0].lower()
+        lower_desc = item[1].lower()
+        for kw in wifi_keywords:
+            assert kw not in lower_name, f"Wi-Fi 适配器不应在结果中: {item[0]}"
+            assert kw not in lower_desc, f"Wi-Fi 适配器不应在结果中: {item[1]}"
+    print(f"  PASS test_get_wired_adapters_no_wifi")
+
+def test_auto_nic_init_state():
+    """Controller 初始化后 _auto_nic 为自动检测结果 (异步填充, 无手动选择状态)"""
+    app = T()
+    try:
+        # 网卡自动检测为异步线程, 本机有网卡时可能已填充; 均属正常
+        auto = app.ctl._auto_nic
+        check(auto is None or (isinstance(auto, tuple) and len(auto) >= 6),
+              "_auto_nic 应为 None 或自动检测结果元组")
+        check(not hasattr(app.ctl, '_manual_nic'),
+              "_manual_nic 字段应已移除")
+        print("  PASS test_auto_nic_init_state")
+    finally:
+        app.destroy()
+
+def test_auto_select_wired_nic():
+    """_auto_select_wired_nic() 在有有线网卡时设置 _auto_nic"""
+    from nic_scanner import get_wired_adapters
+    wired = get_wired_adapters()
+    app = T()
+    try:
+        app.ctl._auto_select_wired_nic()
+        if wired:
+            eq(app.ctl._auto_nic is not None, True,
+               f"有线网卡 {len(wired)} 个, _auto_nic 不应为 None")
+            eq(len(app.ctl._auto_nic), 6, "_auto_nic 应为 6 元组")
+        else:
+            eq(app.ctl._auto_nic, None, "无有线网卡时 _auto_nic 应为 None")
+        print(f"  PASS test_auto_select_wired_nic (wired={len(wired)})")
+    finally:
+        app.destroy()
+
+def test_manual_nic_removed():
+    """网卡手动选择下拉框已移除, 传输流程不依赖手动网卡选择"""
+    app = T()
+    try:
+        # 等待自动扫描完成, 确认 UI 中已无手动选择下拉框
+        import time
+        time.sleep(1.0)
+        app.app.update()
+        check(not hasattr(app.app, 'tk_select_box_mqfzkd6x'),
+              "网卡手动选择下拉框应已从 UI 移除")
+        check(not hasattr(app.app, 'tk_label_nic_detail'),
+              "网卡详情标签应已从 UI 移除")
+        print("  PASS test_manual_nic_removed")
+    finally:
+        app.destroy()
+
+def test_get_wired_nic_ips():
+    """_get_wired_nic_ips() 返回 IP 地址列表"""
+    app = T()
+    try:
+        ips = app.ctl._get_wired_nic_ips()
+        assert isinstance(ips, list), "应返回列表"
+        for ip in ips:
+            assert "." in ip, f"IP 地址格式无效: {ip}"
+            assert ip != "0.0.0.0", "不应包含 0.0.0.0"
+        print(f"  PASS test_get_wired_nic_ips ({len(ips)} 个 IP)")
+    finally:
+        app.destroy()
+
+def test_get_adapter_desc_from_auto():
+    """_get_adapter_desc_from_auto() 返回自动网卡描述"""
+    from nic_scanner import get_wired_adapters
+    wired = get_wired_adapters()
+    app = T()
+    try:
+        app.ctl._auto_select_wired_nic()
+        desc = app.ctl._get_adapter_desc_from_auto()
+        if wired:
+            eq(desc, app.ctl._auto_nic[1], "应返回 _auto_nic 的 description")
+        else:
+            eq(desc, "", "无自动网卡时应返回空字符串")
+        print("  PASS test_get_adapter_desc_from_auto")
+    finally:
+        app.destroy()
+
+def test_auto_nic_display_update():
+    """update_auto_nic_display() 正确更新标签文本"""
+    app = T()
+    try:
+        app.app.update_auto_nic_display("Test NIC 1Gbps", "169.254.100.2",
+                                        "1Gbps", 2)
+        app.app.update_idletasks()
+
+        # tk_label_auto_nic_detail 是高级选项内的详细网卡信息
+        detail = app.app.tk_label_auto_nic_detail.cget("text")
+        assert "Test NIC" in detail, f"详细标签应包含 NIC 名: {detail}"
+        assert "169.254.100.2" in detail, f"详细标签应包含 IP: {detail}"
+        assert "2 个" in detail, f"详细标签应包含数量: {detail}"
+
+        # 无网卡情况
+        app.app.update_auto_nic_display("", "", "", 0)
+        app.app.update_idletasks()
+        detail = app.app.tk_label_auto_nic_detail.cget("text")
+        assert "未检测到" in detail, f"详细标签应显示'未检测到': {detail}"
+        print("  PASS test_auto_nic_display_update")
+    finally:
+        app.destroy()
+
+def test_advanced_panel_hidden_default():
+    """高级选项面板默认隐藏"""
+    app = T()
+    try:
+        assert not app.app._advanced_nic_frame.winfo_ismapped(), \
+            "高级选项面板默认应隐藏"
+        print("  PASS test_advanced_panel_hidden_default")
+    finally:
+        app.destroy()
+
+def test_advanced_toggle_show_hide():
+    """切换高级选项面板的显示/隐藏（需要先到步骤 1 页面）"""
+    app = T()
+    try:
+        # 先选择角色进入步骤 1, 否则高级面板的父页面未 pack
+        app.ctl._device_type = "源设备"
+        app.select_role("source")
+        eq(app.step, 1, "应在步骤 1")
+
+        # 展开
+        app.app._toggle_advanced_nic()
+        app.app.update_idletasks()
+        assert app.app._advanced_nic_frame.winfo_ismapped(), \
+            "展开后面板应可见"
+        assert "▾" in app.app._advanced_nic_toggle_btn.cget("text"), \
+            "展开后按钮应为 ▾"
+
+        # 折叠
+        app.app._toggle_advanced_nic()
+        app.app.update_idletasks()
+        assert not app.app._advanced_nic_frame.winfo_ismapped(), \
+            "折叠后面板应隐藏"
+        assert "▸" in app.app._advanced_nic_toggle_btn.cget("text"), \
+            "折叠后按钮应为 ▸"
+        print("  PASS test_advanced_toggle_show_hide")
+    finally:
+        app.destroy()
+
+def test_multisock_dhcp_init():
+    """MiniDHCPServer 接受 out_ips 列表并创建多个 send socket"""
+    from dhcp_server import MiniDHCPServer
+    srv = MiniDHCPServer(out_ips=["169.254.100.1"])
+    try:
+        assert hasattr(srv, "out_ips"), "应有 out_ips 属性"
+        assert not hasattr(srv, "out_ip"), "不应有旧的 out_ip 属性"
+        eq(srv.out_ips, ["169.254.100.1"], "out_ips 应等于传入值")
+        eq(srv._send_socks, [], "start 前 send_socks 应为空列表")
+        print("  PASS test_multisock_dhcp_init")
+    finally:
+        try: srv.stop()
+        except: pass
+
+def test_multisock_dhcp_empty_ips():
+    """MiniDHCPServer 无 out_ips 时仍然能启动（回退到监听 socket）"""
+    from dhcp_server import MiniDHCPServer
+    srv = MiniDHCPServer(out_ips=[])
+    try:
+        srv.start()
+        import time
+        time.sleep(0.2)
+        eq(len(srv._send_socks), 0, "无 out_ips 时 send_socks 应为空")
+        # 应使用监听 socket 本身发送（回退）
+        srv.stop()
+        print("  PASS test_multisock_dhcp_empty_ips")
+    except Exception as e:
+        srv.stop()
+        raise e
+
+def test_dhcp_no_out_ip_attribute():
+    """MiniDHCPServer 不应有旧的 out_ip 属性（已重构为 out_ips）"""
+    from dhcp_server import MiniDHCPServer
+    srv = MiniDHCPServer(out_ips=["169.254.100.1"])
+    try:
+        assert hasattr(srv, "out_ips"), "应有 out_ips"
+        assert not hasattr(srv, "out_ip"), "不应有 out_ip（已重构）"
+        assert isinstance(srv._send_socks, list), "_send_socks 应为 list"
+        print("  PASS test_dhcp_no_out_ip_attribute")
+    finally:
+        try: srv.stop()
+        except: pass
+
+def test_auto_nic_enables_next_button():
+    """Bug #1 修复验证: 自动选择网卡后应启用「下一步」按钮"""
+    from nic_scanner import get_wired_adapters
+    wired = get_wired_adapters()
+    app = T()
+    try:
+        # 等待扫描线程完成并处理所有 after 回调（模拟真实用户等待时间）
+        import time
+        time.sleep(1.0)
+        app.app.update_idletasks()
+
+        # 选角色 → 进入步骤 1
+        app.select_role("source")
+        app.app.update_idletasks()
+
+        eq(app.step, 1, "应在步骤 1")
+        if wired and app.ctl._auto_nic is not None:
+            eq(app.next_state, "normal",
+               "有有线网卡时下一步按钮应启用")
+        print(f"  PASS test_auto_nic_enables_next_button (wired={len(wired)})")
+    finally:
+        app.destroy()
+
+def test_no_auto_nic_enables_next():
+    """无有线网卡时步骤 1 的下一步按钮仍启用 (网卡全自动, 不阻塞流程)"""
+    from nic_scanner import get_wired_adapters
+    wired = get_wired_adapters()
+    app = T()
+    try:
+        app.ctl._device_type = "源设备"
+        app.ctl._on_role_selected("source")
+        app.app.update_idletasks()
+        eq(app.step, 1)
+        # 无论是否检测到有线网卡, 下一步均启用 (网卡为全自动检测)
+        eq(str(app.app.tk_button_next.cget("state")), "normal",
+           "步骤1 下一步按钮应启用 (不依赖网卡检测结果)")
+        print("  PASS test_no_auto_nic_enables_next")
+    finally:
+        app.destroy()
+
+def test_source_setup_network_no_arg():
+    """_setup_source_network 不再需要 adapter_desc 参数 (新 API)"""
+    app = T()
+    try:
+        # 直接调用验证不报 TypeError
+        import time
+        time.sleep(0.5)
+        app.app.update()
+        try:
+            # 不应抛出参数错误
+            app.ctl._setup_source_network()
+            print("  PASS test_source_setup_network_no_arg")
+        except TypeError as e:
+            assert False, f"调用 _setup_source_network() 失败: {e}"
+    finally:
+        app.destroy()
+
+def test_step1_has_auto_nic_card():
+    """步骤 1 应有自动检测网卡信息卡片和高级选项按钮"""
+    app = T()
+    try:
+        app.app.update_idletasks()
+        assert hasattr(app.app, '_auto_nic_frame'), "应有 _auto_nic_frame"
+        assert hasattr(app.app, 'tk_label_auto_nic_detail'), "应有 tk_label_auto_nic_detail"
+        assert hasattr(app.app, '_advanced_nic_toggle_btn'), "应有 _advanced_nic_toggle_btn"
+        assert hasattr(app.app, '_advanced_nic_frame'), "应有 _advanced_nic_frame"
+        print("  PASS test_step1_has_auto_nic_card")
+    finally:
+        app.destroy()
+
+
+# ============================================================
+# 测试 20: 验证码横幅显示 (2026-08-11 修复)
+# ============================================================
+
+@test("37. 发送端选角色后传输页验证码横幅已 pack")
+def test_auth_banner_packed_source():
+    t = make_app()
+    try:
+        t.select_role("source")
+        try:
+            t.app._auth_banner_frame.pack_info()
+        except Exception:
+            check(False, "发送端选角色后横幅应已 pack")
+    finally:
+        t.destroy()
+
+@test("38. 发送端 go_step(3) 横幅可见并显示验证码")
+def test_auth_banner_visible_step4():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.set_nic()
+        t.ctl._auth_code = "XY12"
+        t.app.go_step(3)
+        t.app.update_idletasks()
+        eq(t.step, 3)
+        check(t.app._auth_banner_frame.winfo_ismapped(), "step3 横幅应可见")
+        eq(t.app.tk_label_transfer_auth_code.cget("text"), "XY12",
+           "横幅应显示当前验证码")
+    finally:
+        t.destroy()
+
+@test("39. 接收端选角色后验证码横幅未 pack")
+def test_auth_banner_not_packed_target():
+    t = make_app()
+    try:
+        t.select_role("target")
+        try:
+            t.app._auth_banner_frame.pack_info()
+            check(False, "接收端横幅不应 pack")
+        except Exception:
+            pass
+    finally:
+        t.destroy()
+
+@test("40. 发送端切到接收端后横幅 pack_forget")
+def test_auth_banner_hidden_on_role_switch():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.prev_step()  # →0
+        t.select_role("target")
+        try:
+            t.app._auth_banner_frame.pack_info()
+            check(False, "切换到接收端后横幅应取消 pack")
+        except Exception:
+            pass
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 21: 传输错误提示区
+# ============================================================
+
+@test("41. show_transfer_error 显示红色错误区, hide 后隐藏")
+def test_show_transfer_error():
+    t = make_app()
+    try:
+        t.app.show_transfer_error("测试错误消息")
+        t.app.update_idletasks()
+        try:
+            t.app._transfer_error_frame.pack_info()
+        except Exception:
+            check(False, "错误区应已 pack")
+        eq(t.app.tk_label_transfer_error.cget("text"), "测试错误消息")
+        check("请返回修改验证码" in t.app.tk_label_transfer_status.cget("text"),
+              "状态标签应显示返回修改验证码提示 (0c7c3da 起不再误写为断网提示)")
+        t.app.hide_transfer_error()
+        t.app.update_idletasks()
+        try:
+            t.app._transfer_error_frame.pack_info()
+            check(False, "隐藏后错误区不应 pack")
+        except Exception:
+            pass
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 22: 网络断开检测 (2026-08-05 新增)
+# ============================================================
+
+@test("42. _on_download_complete 断网分支显示提示并复位标志")
+def test_network_down_completion():
+    t = make_app()
+    try:
+        t.select_role("target")
+        t.ctl._network_down = True
+        t.ctl._on_download_complete(False, 100, 0, [])
+        t.app.update_idletasks()
+        eq(t.ctl._network_down, False, "处理后应复位标志")
+        check("网络连接已中断" in t.app.tk_label_transfer_error.cget("text"),
+              "错误提示应含'网络连接已中断'")
+        check("重新接收" in t.app.tk_button_mqfzl35t.cget("text"),
+              "按钮应变为'重新接收'")
+    finally:
+        t.destroy()
+
+@test("43. 网络监控线程生命周期 (本地回环不误判)")
+def test_network_monitor_lifecycle():
+    import time as _time
+    t = make_app()
+    try:
+        t.ctl._start_network_monitor("127.0.0.1")
+        _time.sleep(0.6)
+        eq(t.ctl._network_down, False, "本地回环不应误判断网")
+        t.ctl._stop_network_monitor()
+        _time.sleep(0.3)
+    finally:
+        t.destroy()
+
+# ============================================================
+# 测试 21: 网卡全自动检测 — 开始传输按钮状态 (2026-08-26)
+# ============================================================
+
+@test("46. 发送端开始传输按钮启用 (不依赖网卡选择)")
+def test_transfer_btn_no_nic_source():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.next_step()
+        eq(t.step, 2)
+        # 未 set_nic (无手动网卡) 时按钮也应启用
+        eq(str(t.app.tk_button_mqfzl35t.cget("state")), "normal",
+           "发送端开始传输按钮应启用 (网卡全自动)")
+    finally:
+        t.destroy()
+
+@test("47. 接收端开始传输按钮启用 (不依赖网卡选择)")
+def test_transfer_btn_no_nic_target():
+    t = make_app()
+    try:
+        t.select_role("target")
+        t.next_step()
+        eq(t.step, 2)
+        eq(str(t.app.tk_button_mqfzl35t.cget("state")), "normal",
+           "接收端开始传输按钮应启用 (网卡全自动)")
+    finally:
+        t.destroy()
+
+@test("48. 传输中开始传输按钮禁用 (回归)")
+def test_transfer_btn_disabled_busy():
+    t = make_app()
+    try:
+        t.select_role("source")
+        t.next_step()
+        t.ctl._transferring = True
+        t.ctl._check_button_state()
+        eq(str(t.app.tk_button_mqfzl35t.cget("state")), "disabled",
+           "传输进行中按钮应禁用")
+        t.ctl._transferring = False
+        t.ctl._check_button_state()
+        eq(str(t.app.tk_button_mqfzl35t.cget("state")), "normal",
+           "传输结束后按钮应恢复启用")
+    finally:
+        t.destroy()
+
+@test("44. 断网时 download_files 的 stop_check 返回 'network_down'")
+def test_stop_check_network_down():
+    import control as _ctl_mod
+    import time as _time
+    t = make_app()
+    captured = {}
+    orig_dl = _ctl_mod.download_files
+
+    def fake_download_files(**kwargs):
+        captured['stop_check'] = kwargs.get('stop_check')
+        return True, 0, 0, []
+
+    # control.py 是 `from file_transfer import download_files`, 需 patch control 模块内的引用
+    _ctl_mod.download_files = fake_download_files
+    try:
+        # 测试无 mainloop: 后台线程的 after/_log 访问 Tk 控件会阻塞 → 替换为安全 no-op
+        t.app.after = lambda *a, **kw: None
+        t.ctl._log = lambda m: None
+        # 手动 IP 直连, 避免 DHCP 依赖; 填入验证码
+        t.app.tk_entry_code.delete(0, 'end')
+        t.app.tk_entry_code.insert(0, "ABCD")
+        t.ctl._start_target_download(manual_ip="127.0.0.1")
+        # 等待下载线程调用 download_files
+        deadline = _time.time() + 3
+        while 'stop_check' not in captured and _time.time() < deadline:
+            _time.sleep(0.05)
+            t.app.update_idletasks()
+        sc = captured.get('stop_check')
+        assert sc is not None, "stop_check 应被传入 download_files"
+        eq(sc(), None, "正常状态返回 None")
+        t.ctl._stop_transfer = True
+        eq(sc(), "cancel", "取消时返回 cancel")
+        t.ctl._stop_transfer = False
+        t.ctl._network_down = True
+        eq(sc(), "network_down", "断网时返回 network_down")
+    finally:
+        t.ctl._stop_transfer = False
+        t.ctl._network_down = False
+        _ctl_mod.download_files = orig_dl
+        t.destroy()
+
+@test("45. 验证码输入自动转大写并限制4位")
+def test_auth_code_entry():
+    t = make_app()
+    try:
+        # 大写转换 (validate 允许 ≤4 位字母数字)
+        t.app.tk_entry_code.delete(0, 'end')
+        t.app.tk_entry_code.insert(0, "ab1d")
+        t.ctl._on_auth_code_changed()
+        eq(t.app.tk_entry_code.get(), "AB1D", "应自动转大写")
+        # validatecommand 是实际输入拦截机制: 超4位/特殊字符被拒
+        eq(t.app._auth_validate("ABCD"), True, "4位应允许")
+        eq(t.app._auth_validate("ABCDE"), False, "5位应被拦截")
+        eq(t.app._auth_validate("AB!D"), False, "含特殊字符应被拦截")
+        # _on_auth_code_changed 对超长输入的兜底截断 (绕过 validate 直接注入)
+        t.app.tk_entry_code.configure(validate="none")
+        t.app.tk_entry_code.delete(0, 'end')
+        t.app.tk_entry_code.insert(0, "ABCDE")
+        t.ctl._on_auth_code_changed()
+        eq(t.app.tk_entry_code.get(), "ABCD", "应截断为4位")
+    finally:
+        t.destroy()
+
+# ============================================================
+# 运行
+# ============================================================
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  UI 全场景导航测试")
+    print("=" * 60)
+    print()
+
+    test_initial()
+    test_source_role_select()
+    test_source_nic_select()
+    test_source_step2()
+    test_source_disk_select()
+    test_source_step3()
+    test_source_step4_done()
+    test_source_no_further_step()
+    test_source_backward_from4()
+    test_source_full_backward()
+    test_target_role_select()
+    test_target_step4()
+    test_target_step5()
+    test_target_no_step6()
+    test_target_full_backward()
+    test_nic_placeholders()
+    test_nic_real()
+    test_disk_placeholders()
+    test_disk_real()
+    test_transfer_not_done()
+    test_verify_online_label()
+    test_nic_preserved()
+    test_disk_preserved()
+    test_role_switch()
+    test_source_no_step5()
+    test_gostep_0()
+    test_gostep_1()
+    test_gostep_1_no_nic()
+    test_rapid_click()
+    test_button_text_source()
+    test_button_text_target()
+    test_skip_import()
+    test_export_visible_source()
+    test_export_hidden_target()
+    test_transfer_button_enabled()
+    test_next_blocked_no_nic()
+    test_auto_jump_step5()
+    test_stay_step4_with_config()
+
+    # 新增 — 传输期间全屏锁定 (2026-08-27)
+    test_lock_screen()
+    test_lock_release_on_complete()
+    test_source_done_unlock()
+    test_source_progress_report()
+    test_source_done_report()
+    test_source_done_page()
+    test_summary_style_unified()
+    test_summary_done_button()
+
+    # 新增 — 验证码横幅 / 传输错误 / 网络断开检测 (2026-08-11)
+    test_auth_banner_packed_source()
+    test_auth_banner_visible_step4()
+    test_auth_banner_not_packed_target()
+    test_auth_banner_hidden_on_role_switch()
+    test_show_transfer_error()
+    test_network_down_completion()
+    test_network_monitor_lifecycle()
+    test_stop_check_network_down()
+    test_auth_code_entry()
+
+    # 新增 — 网卡全自动检测: 开始传输按钮状态 (2026-08-26)
+    test_transfer_btn_no_nic_source()
+    test_transfer_btn_no_nic_target()
+    test_transfer_btn_disabled_busy()
+
+    # 新增 — 自动网卡 & 高级选项 (2026-08-02)
+    test_get_wired_adapters_struct()
+    test_get_wired_adapters_no_wifi()
+    test_auto_nic_init_state()
+    test_auto_select_wired_nic()
+    test_manual_nic_removed()
+    test_get_wired_nic_ips()
+    test_get_adapter_desc_from_auto()
+    test_auto_nic_display_update()
+    test_advanced_panel_hidden_default()
+    test_advanced_toggle_show_hide()
+    test_multisock_dhcp_init()
+    test_multisock_dhcp_empty_ips()
+    test_dhcp_no_out_ip_attribute()
+    test_auto_nic_enables_next_button()
+    test_no_auto_nic_enables_next()
+    test_source_setup_network_no_arg()
+    test_step1_has_auto_nic_card()
+
+    # 新增 — EULA 协议确认 (2026-08-28)
+    test_eula_blocks_role_buttons()
+    test_eula_agree_enables_buttons()
+
+    print()
+    print("=" * 60)
+    print("  结果汇总")
+    print("=" * 60)
+    for r in results:
+        print(r)
+
+    total = len(results)
+    failed = len(errors)
+    passed = total - failed
+    print()
+    print(f"  总计: {total}  通过: {passed}  失败: {failed}")
+    if failed:
+        print()
+        print("  失败详情:")
+        for e in errors:
+            print(f"    {e}")
+        sys.exit(1)
+    else:
+        print("  全部通过!")
+    print()

@@ -1,0 +1,70 @@
+# 磁盘拷贝工具 — GitHub Actions 自动构建
+#
+# 工作流程:
+#   1. 检出代码
+#   2. 创建 conda 环境 (python + tk, tk 提供 tkinter)
+#   3. pip 安装 PyInstaller / ttkbootstrap / cryptography / pillow
+#   4. 调用 build.ps1 打包为单文件 exe (PyInstaller --onefile --windowed)
+#   5. 上传 dist/*.exe 为 Actions 构建产物
+#
+# 触发方式:
+#   - push 到 main / beta 分支
+#   - push 匹配 v* 的 tag (发布版本)
+#   - 手动触发 (Actions 页面 "Run workflow")
+
+name: 构建 Windows 可执行文件 (Conda + PyInstaller)
+
+on:
+  push:
+    branches: [ main, beta ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Windows 构建 (Python ${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.13" ]
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Miniconda 环境
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          auto-update-conda: true
+          python-version: ${{ matrix.python-version }}
+          channels: conda-forge,defaults
+          activate-environment: build
+          auto-activate-base: false
+
+      - name: 安装构建依赖
+        shell: pwsh -l {0}
+        run: |
+          # tk 包提供 tkinter 运行时, PyInstaller 打包 GUI 必需
+          conda install -y -c conda-forge tk
+          python -m pip install --upgrade pip
+          pip install pyinstaller ttkbootstrap cryptography pillow
+
+      - name: 执行构建脚本 (build.ps1)
+        shell: pwsh -l {0}
+        run: |
+          # 让 build.ps1 优先使用 conda 环境中的 Python (而非仓库内嵌的嵌入式 Python)
+          $env:PYTHON_EXE = Join-Path $env:CONDA_PREFIX "python.exe"
+          # CI 机器较慢, 放宽构建超时看门狗到 25 分钟
+          $env:BUILD_TIMEOUT_SECONDS = "1500"
+          Write-Host "使用 Python: $env:PYTHON_EXE"
+          ./build.ps1
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: 磁盘拷贝工具-windows-py${{ matrix.python-version }}
+          path: dist/*.exe
+          if-no-files-found: error

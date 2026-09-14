@@ -15,10 +15,201 @@ import re
 import ssl
 import threading
 import json
+import zipfile
 import urllib.request
 import urllib.parse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ---- CSV 路径修复 (兼容旧版 escape_csv 的全角逗号 bug) ----
+# 旧版 calc_allocation_migration.py 的 escape_csv 会将路径中的 ASCII 逗号替换为全角逗号,
+# 导致 CSV 中的路径与磁盘实际路径不一致。此映射表用于修复已损坏的路径。
+#
+# 【重要｜2026-09-09 修复】绝不能"无条件"做全角逗号 → 半角逗号替换:
+#   中文输入法下文件名里的逗号本来就是全角「，」, 这类文件非常常见。
+#   无条件替换会把「本来正确」的 CSV 路径改坏 → 校验判定文件缺失 →
+#   重试下载按错误路径向服务端请求 → 服务端找不到文件返回空数据 →
+#   客户端照写 → 目标盘多出 0KB 的同名(标点被改写)垃圾文件。
+#   因此: 只有「CSV 原路径在磁盘上不存在」且「候选路径确实存在」时才改写。
+_CSV_PATH_REPAIR_MAP = {
+    "，": ",",   # 全角逗号 → ASCII 逗号 (旧 escape_csv 替换)
+}
+
+
+def _normalize_csv_path(path: str) -> str:
+    """旧版 escape_csv 损坏路径的候选修复 (全角逗号→ASCII逗号)。
+
+    注意: 这只是"生成候选", 是否采用必须由磁盘存在性校验决定, 见 _resolve_csv_field。
+    """
+    for old, new in _CSV_PATH_REPAIR_MAP.items():
+        if old in path:
+            path = path.replace(old, new)
+    return path
+
+
+def _has_comma(path: str) -> bool:
+    """路径中是否含半角或全角逗号 (不含逗号则无需任何修复尝试)。"""
+    return "," in path or "，" in path
+
+
+def _csv_path_candidates(path: str):
+    """生成待验证的候选路径 (按优先级)。
+
+    1) 全角→半角: 修复旧版 escape_csv 写坏的 CSV
+    2) 半角→全角: 修复被旧版 _repair_csv_in_place 误改的 CSV (本修复上线前的历史数据)
+    """
+    cand = _normalize_csv_path(path)
+    if cand != path:
+        yield cand
+    if "," in path:
+        reverse = path.replace(",", "，")
+        if reverse != path:
+            yield reverse
+
+
+def _csv_path_to_disk(full_path: str, partition_map: dict) -> str:
+    """把 CSV 中的源盘路径 (D:\\xx) 映射为目标设备上的实际路径。"""
+    if not full_path:
+        return ""
+    drive = ""
+    if len(full_path) >= 2 and full_path[1] == ":":
+        drive = full_path[0].upper()
+        rel = full_path[3:]
+    else:
+        rel = full_path
+    if partition_map and drive:
+        raw = partition_map.get(drive, "")
+        pe_drive = raw.rstrip("\\") + "\\" if raw else ""
+    else:
+        pe_drive = ""
+    return os.path.join(pe_drive, rel) if pe_drive else full_path
+
+
+def _disk_exists_for_csv_path(full_path: str, partition_map: dict) -> bool:
+    """判断 CSV 路径在目标设备上是否真实存在 (兼容 >260 长路径)。"""
+    actual = _csv_path_to_disk(full_path, partition_map)
+    if not actual:
+        return False
+    for candidate in (actual, "\\\\?\\" + actual):
+        try:
+            if os.path.isfile(candidate):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _resolve_csv_field(original: str, partition_map: dict) -> tuple:
+    """确定 CSV 路径字段的最终取值: (最终值, 是否被修改)。
+
+    策略: 原路径在磁盘上存在 → 原样保留 (绝不改动!)。
+           不存在 → 依次尝试候选路径, 只有候选真实存在才采用。
+           无 partition_map 时无法验证 → 一律保留原值 (安全优先)。
+    """
+    if not original or not partition_map or not _has_comma(original):
+        return original, False
+    if _disk_exists_for_csv_path(original, partition_map):
+        return original, False
+    for cand in _csv_path_candidates(original):
+        if _disk_exists_for_csv_path(cand, partition_map):
+            return cand, True
+    return original, False
+
+
+def _repair_csv_in_place(csv_path: str, log_callback=None, partition_map=None) -> int:
+    """原地修复 CSV 中被 escape_csv 损坏的路径。返回修复的字段数。
+
+    partition_map: 必须提供 (如 {"D": "I:", "E": "J:", "F": "K:"}),
+                   用于确认"原路径不存在 + 候选路径存在"时才改写;
+                   不提供则不做任何修改 (避免误伤真实含全角逗号的文件名)。
+    """
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    repaired = 0
+    try:
+        enc = _detect_csv_encoding(csv_path)
+        with open(csv_path, "r", encoding=enc, newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                return 0
+
+            # 定位需要修复的列
+            try:
+                col_fullpath = header.index("FullPath")
+            except ValueError:
+                try:
+                    col_fullpath = header.index("fullpath")
+                except ValueError:
+                    col_fullpath = 1  # 默认 B 列
+
+            try:
+                col_filename = header.index("FileName")
+            except ValueError:
+                try:
+                    col_filename = header.index("filename")
+                except ValueError:
+                    col_filename = 2  # 默认 C 列
+
+            if not partition_map:
+                log("  [跳过] 无盘符映射，跳过 CSV 路径修复 (避免误改含全角逗号的文件名)")
+                return 0
+
+            rows = [header]
+            for row in reader:
+                # 只修复 FullPath: 它是唯一可映射到磁盘并验证存在性的列。
+                # FileName 列无法定位磁盘文件, 不做任何改动 (避免误改真实文件名)。
+                if col_fullpath < len(row):
+                    original = row[col_fullpath]
+                    fixed, changed = _resolve_csv_field(original, partition_map)
+                    if changed:
+                        row[col_fullpath] = fixed
+                        repaired += 1
+                rows.append(row)
+
+        if repaired > 0:
+            # 写回修复后的 CSV
+            with open(csv_path, "w", encoding=enc, newline="") as f:
+                writer = csv.writer(f, lineterminator="\n")
+                writer.writerows(rows)
+            log(f"  [修复] CSV 路径修复完成: {repaired} 行的 FullPath 已按磁盘实际文件名校正")
+    except Exception as e:
+        log(f"  [注意] CSV 路径修复失败: {e}")
+
+    return repaired
+
+
+# ---- 编码自动检测 ----
+
+def _detect_csv_encoding(csv_path: str) -> str:
+    """根据文件头 BOM 自动检测 CSV 编码。
+
+    支持的 BOM:
+      - FF FE       → UTF-16 LE (Windows PowerShell Out-File -Encoding Unicode 等)
+      - FE FF       → UTF-16 BE
+      - EF BB BF    → UTF-8-SIG
+      - 无 BOM      → UTF-8 (回退)
+
+    返回: 编码名称字符串 (如 "utf-16-le", "utf-8-sig")
+    """
+    if not os.path.isfile(csv_path):
+        return "utf-8-sig"
+    try:
+        with open(csv_path, "rb") as f:
+            head = f.read(4)
+    except OSError:
+        return "utf-8-sig"
+
+    if len(head) >= 2:
+        if head[:2] == b"\xff\xfe":
+            return "utf-16-le"
+        if head[:2] == b"\xfe\xff":
+            return "utf-16-be"
+    if len(head) >= 3 and head[:3] == b"\xef\xbb\xbf":
+        return "utf-8-sig"
+    return "utf-8"
 
 # 客户端 SSL 上下文: 不校验自签名证书 (与 file_transfer.py 一致)
 _SSL_CTX = ssl.create_default_context()
@@ -31,7 +222,7 @@ SKIP_PREFIXES = ("$",)
 TRANSFER_PORT = 9999
 
 # 校验线程数 (文件多时 I/O 是瓶颈，多线程可大幅加速)
-DEFAULT_VERIFY_WORKERS = 12
+DEFAULT_VERIFY_WORKERS = 512
 
 
 def is_running_in_winpe() -> bool:
@@ -146,6 +337,371 @@ def find_csv_file(folder_path: str) -> str:
     raise FileNotFoundError(f"在 {folder_path} 中未找到 FullFilelist_DEF.csv")
 
 
+def _find_csv_from_ini(f_drive_pe: str) -> str | None:
+    """从 systemconfig.ini 读取配置路径，定位对应的 FullFilelist_DEF.csv。
+
+    发送端导出配置时会将路径写入 F:\\systemconfig.ini (如 LastExportPath=F:\\Appl\\2026-07-28\\)。
+    接收端数据传输完成后, F 盘内容完整复制, systemconfig.ini 也随之到达。
+    此函数读取 ini, 将路径中的原始盘符(F:)映射为 PE 下实际盘符(f_drive_pe),
+    然后查找对应的 CSV 文件。
+
+    f_drive_pe: PE 下 F 盘的实际盘符，如 "K:"
+    返回 CSV 完整路径，找不到则返回 None。
+    """
+    ini_path = os.path.join(f_drive_pe.rstrip("\\") + "\\", "systemconfig.ini")
+    if not os.path.isfile(ini_path):
+        return None
+
+    config_path = None
+    try:
+        with open(ini_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("LastExportPath=") or line.startswith("PATH="):
+                    p = line.split("=", 1)[1].strip()
+                    # 路径中的盘符是原始盘符(如 F:), PE 下需映射为 f_drive_pe
+                    if len(p) >= 3 and p[1:3] == ":\\":
+                        rel = p[3:]  # Appl\\2026-07-28\\
+                        mapped = os.path.join(f_drive_pe.rstrip("\\") + "\\", rel)
+                        if os.path.isdir(mapped):
+                            config_path = mapped
+                    elif os.path.isdir(p):
+                        config_path = p
+    except Exception:
+        pass
+
+    if config_path:
+        csv_path = os.path.join(config_path, "FullFilelist_DEF.csv")
+        if os.path.isfile(csv_path):
+            return csv_path
+        # 也搜索不区分大小写
+        try:
+            for fname in os.listdir(config_path):
+                if fname.lower() == "fullfilelist_def.csv":
+                    return os.path.join(config_path, fname)
+        except OSError:
+            pass
+    return None
+
+
+# ---- 文件类型查询 (fileinfo.com) ----
+
+# 模块级缓存: 已查询过的扩展名 → 文件类型描述
+_EXTENSION_CACHE: dict = {}
+_ext_cache_lock = threading.Lock()
+
+# 常用 Windows 扩展名内置映射 (减少网络请求, 即时返回)
+_BUILTIN_EXTENSIONS: dict[str, str] = {
+    # 可执行文件 / 库
+    "exe": "Executable File",
+    "dll": "Dynamic Link Library",
+    "sys": "System File",
+    "drv": "Device Driver",
+    "ocx": "ActiveX Control",
+    "ax": "ActiveX Control",
+    "cpl": "Control Panel Applet",
+    "scr": "Screen Saver",
+    "msi": "Windows Installer Package",
+    "msp": "Windows Installer Patch",
+    "com": "Command File",
+    # 脚本 / 批处理
+    "bat": "Batch File",
+    "cmd": "Windows Command Script",
+    "ps1": "PowerShell Script",
+    "vbs": "VBScript File",
+    "js": "JavaScript File",
+    "wsf": "Windows Script File",
+    # 配置文件
+    "ini": "Configuration Settings",
+    "cfg": "Configuration File",
+    "conf": "Configuration File",
+    "inf": "Setup Information File",
+    "reg": "Registry File",
+    "pol": "Policy File",
+    "manifest": "Assembly Manifest",
+    # 文档
+    "doc": "Microsoft Word Document",
+    "docx": "Microsoft Word Document",
+    "xls": "Microsoft Excel Spreadsheet",
+    "xlsx": "Microsoft Excel Spreadsheet",
+    "ppt": "Microsoft PowerPoint Presentation",
+    "pptx": "Microsoft PowerPoint Presentation",
+    "pdf": "Portable Document Format",
+    "txt": "Text Document",
+    "rtf": "Rich Text Format",
+    "csv": "Comma Separated Values File",
+    # 数据 / 数据库
+    "mdb": "Microsoft Access Database",
+    "accdb": "Microsoft Access Database",
+    "db": "Database File",
+    "sqlite": "SQLite Database",
+    "xml": "XML File",
+    "json": "JSON Data File",
+    "dat": "Data File",
+    "bin": "Binary Data File",
+    # 日志 / 临时 / 缓存
+    "log": "Log File",
+    "log1": "Registry Transaction Log",
+    "log2": "Registry Transaction Log",
+    "tmp": "Temporary File",
+    "temp": "Temporary File",
+    "bak": "Backup File",
+    "old": "Old/Backup File",
+    "cache": "Cache File",
+    "etl": "Event Trace Log",
+    "evtx": "Windows Event Log",
+    # 注册表相关
+    "blf": "Registry Transaction Log",
+    "regtrans-ms": "Registry Transaction File",
+    # 快捷方式
+    "lnk": "Windows Shortcut",
+    "url": "Internet Shortcut",
+    "pif": "Program Information File",
+    # 字体
+    "ttf": "TrueType Font",
+    "ttc": "TrueType Collection Font",
+    "otf": "OpenType Font",
+    "fon": "Font File",
+    # 媒体
+    "jpg": "JPEG Image",
+    "jpeg": "JPEG Image",
+    "png": "PNG Image",
+    "gif": "GIF Image",
+    "bmp": "Bitmap Image",
+    "ico": "Icon File",
+    "svg": "SVG Image",
+    "tif": "TIFF Image",
+    "tiff": "TIFF Image",
+    "wav": "WAV Audio",
+    "mp3": "MP3 Audio",
+    "wma": "Windows Media Audio",
+    "mp4": "MP4 Video",
+    "avi": "AVI Video",
+    "wmv": "Windows Media Video",
+    "mkv": "Matroska Video",
+    "mov": "QuickTime Movie",
+    # 压缩
+    "zip": "Compressed Zip Archive",
+    "rar": "WinRAR Archive",
+    "7z": "7-Zip Archive",
+    "tar": "Tape Archive",
+    "gz": "Gzip Compressed Archive",
+    "cab": "Windows Cabinet File",
+    "msu": "Windows Update Standalone Package",
+    # 系统文件
+    "cat": "Security Catalog",
+    "mui": "Multilingual User Interface File",
+    "pf": "Prefetch File",
+    "dmp": "Memory Dump File",
+    "wer": "Windows Error Report",
+    "hdmp": "Heap Dump File",
+    "mdmp": "Minidump File",
+    # 证书 / 安全
+    "cer": "Security Certificate",
+    "crt": "Security Certificate",
+    "pem": "Privacy Enhanced Mail Certificate",
+    "pfx": "Personal Information Exchange",
+    "der": "DER Encoded Certificate",
+    # 其他常见
+    "chm": "Compiled HTML Help",
+    "hlp": "Windows Help File",
+    "cur": "Cursor File",
+    "ani": "Animated Cursor",
+    "icl": "Icon Library",
+    "theme": "Windows Theme File",
+    "themepack": "Windows Theme Pack",
+    "diagcab": "Troubleshooting Pack",
+    "sdb": "Application Compatibility Database",
+    "nls": "National Language Support File",
+    "luac": "Compiled Lua Script",
+    "lua": "Lua Script",
+    "py": "Python Script",
+    "pyc": "Python Compiled File",
+    "pyd": "Python Dynamic Module",
+    "cs": "C# Source Code",
+    "h": "C/C++ Header File",
+    "cpp": "C++ Source Code",
+    "lib": "Static Library",
+    "obj": "Object File",
+    "pdb": "Program Database",
+    "lib": "Static Library",
+    "exp": "Exports Library File",
+    "res": "Compiled Resource File",
+    "rc": "Resource Script",
+    # 打印机
+    "ppd": "PostScript Printer Description",
+    "gpd": "Generic Printer Description",
+    "inf_loc": "Localized INF File",
+    "pnf": "Precompiled INF File",
+}
+
+
+def _fetch_extension_info(ext: str) -> str:
+    """查询 fileinfo.com 获取扩展名对应的文件类型描述 (线程安全, 带缓存)。
+
+    优先使用内置映射, 其次模块级缓存, 最后通过 HTTP 查询 JSON-LD 结构化数据。
+    """
+    ext_lower = ext.lower()
+    if not ext_lower:
+        return ""
+
+    with _ext_cache_lock:
+        if ext_lower in _BUILTIN_EXTENSIONS:
+            return _BUILTIN_EXTENSIONS[ext_lower]
+        if ext_lower in _EXTENSION_CACHE:
+            return _EXTENSION_CACHE[ext_lower]
+
+    result = f"{ext.upper()} File"
+    try:
+        url = f"https://fileinfo.com/extension/{ext_lower}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        resp = urllib.request.urlopen(req, timeout=10, context=_SSL_CTX)
+        html = resp.read().decode("utf-8", errors="replace")
+
+        # 策略: 解析 JSON-LD 结构化数据 (alternateName = 主文件类型名称)
+        m = re.search(
+            r'<script\s+type="application/ld\+json">(.*?)</script>',
+            html, re.I | re.S,
+        )
+        if m:
+            try:
+                data = json.loads(m.group(1))
+                items = data.get("@graph", [data]) if isinstance(data, dict) else [data]
+                if isinstance(items, list):
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        alt = item.get("alternateName", "")
+                        if alt and alt.lower() != f"{ext_lower} file extension":
+                            result = alt
+                            break
+            except json.JSONDecodeError:
+                pass
+
+    except Exception:
+        pass
+
+    with _ext_cache_lock:
+        _EXTENSION_CACHE[ext_lower] = result
+    return result
+
+
+def _get_file_extension(file_path: str) -> str:
+    """从文件路径提取扩展名 (不含点号, 小写)"""
+    _, ext = os.path.splitext(file_path)
+    return ext.lstrip(".").lower()
+
+
+def add_file_type_column(csv_path: str, log_callback=None) -> bool:
+    """为校验后的 CSV 添加 G 列 (FileType), 通过 fileinfo.com 查询扩展名描述。
+
+    收集 CSV 中所有唯一扩展名 → 并行查询 fileinfo.com (内置映射即时 + 未知扩展名在线查询)
+    → 写入 G 列, 供用户判断缺失文件的重要性。
+
+    返回 True 表示成功添加。
+    """
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    # ---- 读取 CSV ----
+    rows = []
+    header = []
+    enc = _detect_csv_encoding(csv_path)
+    try:
+        with open(csv_path, "r", encoding=enc, newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                log("  CSV 为空，跳过文件类型标记")
+                return False
+            rows = list(reader)
+    except Exception as e:
+        log(f"  读取 CSV 失败: {e}")
+        return False
+
+    if not rows:
+        log("  无数据行，跳过文件类型标记")
+        return False
+
+    # ---- 收集所有唯一扩展名 ----
+    try:
+        col_fullpath = header.index("FullPath")
+    except ValueError:
+        col_fullpath = 1
+
+    extensions: set = set()
+    for row in rows:
+        if len(row) > col_fullpath:
+            ext = _get_file_extension(row[col_fullpath])
+            if ext:
+                extensions.add(ext)
+
+    if not extensions:
+        log("  未检测到任何文件扩展名")
+        return False
+
+    log(f"\n查询文件类型: {len(extensions)} 种扩展名...")
+
+    # ---- 分两阶段查询 ----
+    # 阶段 1: 内置映射 (即时)
+    builtin_hits = [e for e in extensions if e in _BUILTIN_EXTENSIONS]
+    if builtin_hits:
+        log(f"  内置映射命中: {len(builtin_hits)} 种扩展名")
+
+    # 阶段 2: 在线查询未知扩展名 (线程池并发)
+    network_exts = sorted(e for e in extensions if e not in _BUILTIN_EXTENSIONS and e not in _EXTENSION_CACHE)
+    if network_exts:
+        log(f"  在线查询: {len(network_exts)} 种扩展名...")
+        done = [0]
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {
+                executor.submit(_fetch_extension_info, e): e
+                for e in network_exts
+            }
+            for future in as_completed(futures):
+                done[0] += 1
+                if done[0] % 30 == 0 or done[0] == len(network_exts):
+                    log(f"    扩展名查询进度: {done[0]}/{len(network_exts)}")
+
+    # ---- 构建映射表 ----
+    ext_map: dict = {}
+    for ext in extensions:
+        ext_map[ext] = _fetch_extension_info(ext)
+
+    # ---- 写入 G 列 (index 6, column F 留空) ----
+    col_g = 6
+    full_header = list(header)
+    while len(full_header) <= col_g:
+        full_header.append("")
+    full_header[col_g] = "FileType"
+
+    for row in rows:
+        while len(row) <= col_g:
+            row.append("")
+        if len(row) > col_fullpath:
+            ext = _get_file_extension(row[col_fullpath])
+            row[col_g] = ext_map.get(ext, "")
+        else:
+            row[col_g] = ""
+
+    # ---- 写回 CSV ----
+    try:
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(full_header)
+            writer.writerows(rows)
+        log(f"文件类型已写入 G 列 (共 {len(extensions)} 种扩展名, "
+            f"内置 {len(builtin_hits)}, 在线查询 {len(network_exts)})")
+        return True
+    except Exception as e:
+        log(f"  写入文件类型失败: {e}")
+        return False
+
+
 def _patch_csv_gtmc_paths(csv_path: str, gtmc_new_name: str) -> None:
     """
     直接修改 CSV 文件内容: 将 GTMC_User_Profiles 替换为 GTMC_User_ProfilesYYMMDD
@@ -154,7 +710,8 @@ def _patch_csv_gtmc_paths(csv_path: str, gtmc_new_name: str) -> None:
     old_name = "GTMC_User_Profiles"
     new_name = gtmc_new_name
 
-    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+    enc = _detect_csv_encoding(csv_path)
+    with open(csv_path, "r", encoding=enc, newline="") as f:
         content = f.read()
 
     if old_name not in content or new_name in content:
@@ -238,10 +795,19 @@ def _verify_single_row(
 
         # 校验文件存在性
         if not os.path.isfile(actual_path):
-            while len(row) <= col_e:
-                row.append("")
-            row[col_e] = "N"
-            return (idx, row, "N", f"  [N] 文件不存在: {actual_path}")
+            # 兼容旧版 escape_csv: 路径不存在时尝试标点变体 (全角/半角逗号) 后再查
+            alt_path = actual_path
+            for cand in _csv_path_candidates(actual_path):
+                if os.path.isfile(cand):
+                    alt_path = cand
+                    break
+            if alt_path != actual_path:
+                actual_path = alt_path
+            else:
+                while len(row) <= col_e:
+                    row.append("")
+                row[col_e] = "N"
+                return (idx, row, "N", f"  [N] 文件不存在: {actual_path}")
 
         actual_size = os.path.getsize(actual_path)
 
@@ -277,10 +843,13 @@ def _retry_missing_files(
     col_e: int,
     log_callback=None,
     auth_code: str = "",
+    missing_indices_out=None,
 ) -> int:
     """
     校验完成后，对缺失文件进行批量重试下载
-    返回成功下载的文件数
+    返回成功下载的文件数;
+    若传入 missing_indices_out (list), 会将缺失文件在 CSV 数据行中的索引
+    (与 verify_csv 的 rows 索引一致) 收集到该列表, 供二次校验只校验缺失文件
     """
     import socket as _socket
     import struct as _struct
@@ -299,7 +868,7 @@ def _retry_missing_files(
         return _retry_missing_files_inner(
             server_ip, port, partition_map, csv_path,
             col_a, col_b, col_d, col_e,
-            log, auth_code,
+            log, auth_code, missing_indices_out,
         )
     finally:
         _socket.setdefaulttimeout(_old_timeout)
@@ -316,6 +885,7 @@ def _retry_missing_files_inner(
     col_e: int,
     log,
     auth_code: str,
+    missing_indices_out=None,
 ) -> int:
     import struct as _struct
     import time as _time
@@ -325,13 +895,21 @@ def _retry_missing_files_inner(
     _skipped_parents = set()  # 已知无法创建/写入的父目录 (与首次下载一致)
 
     try:
-        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        enc = _detect_csv_encoding(csv_path)
+        with open(csv_path, "r", encoding=enc, newline="") as f:
             reader = csv.reader(f)
             _header = next(reader, None)
-            for idx, row in enumerate(reader):
+            # 数据行索引 (与 verify_csv 的 rows 索引一致: 仅 B 列非空的行占索引)
+            data_idx = 0
+            for raw_row in reader:
+                if len(raw_row) <= col_b:
+                    continue
+                idx = data_idx
+                data_idx += 1
+                row = raw_row
                 if len(row) <= col_e or row[col_e].strip() != "N":
                     continue
-                full_path = row[col_b].strip() if len(row) > col_b else ""
+                full_path = row[col_b].strip()
                 drive_letter = row[col_a].strip().upper() if len(row) > col_a else ""
                 if not drive_letter:
                     continue
@@ -349,6 +927,19 @@ def _retry_missing_files_inner(
                 actual_path = os.path.join(pe_drive, rel_path)
 
                 if os.path.isfile(actual_path):
+                    continue
+
+                # 兼容旧版 escape_csv: 路径不存在时尝试标点变体 (全角/半角逗号) 定位真实文件
+                alt_full = full_path
+                for cand in _csv_path_candidates(full_path):
+                    cand_rel = cand[3:] if len(cand) >= 2 and cand[1] == ":" else cand
+                    if os.path.isfile(os.path.join(pe_drive, cand_rel)):
+                        alt_full = cand
+                        break
+                if alt_full != full_path:
+                    # 文件以变体路径存在, 跳过重试; 同时校正 CSV row 中的路径
+                    row[col_b] = alt_full
+                    full_path = alt_full
                     continue
 
                 # 预检查父目录: 若已知无法创建 (与首次下载跳过的一致), 直接跳过
@@ -374,6 +965,10 @@ def _retry_missing_files_inner(
 
     if _skipped_parents:
         log(f"  跳过 {len(_skipped_parents)} 个无写入权限的目录 (与首次下载一致)")
+
+    # 收集缺失文件的数据行索引, 供二次校验只校验这些文件
+    if isinstance(missing_indices_out, list):
+        missing_indices_out.extend(e[0] for e in missing_entries)
 
     if not missing_entries:
         log("没有可重试的缺失文件")
@@ -419,7 +1014,7 @@ def _retry_missing_files_inner(
                 resp = urllib.request.urlopen(req, timeout=60, context=_SSL_CTX)
 
                 if resp.status != 200:
-                    log(f"  [X] 批量重试 HTTP {resp.status}")
+                    log(f"  [X] 批量重试 HTTPS {resp.status}")
                     break
 
                 raw = resp.read()
@@ -456,6 +1051,20 @@ def _retry_missing_files_inner(
                     for entry in entries:
                         if entry[3] == rel_path:
                             target_path = entry[4]
+                            expected_size = entry[5]
+
+                            # 服务端返回空数据: 区分「文件本身 0 字节」与「服务端读不到」
+                            # 服务端读不到时绝不能写文件 —— 那会在目标盘留下 0KB 垃圾文件
+                            if data_len == 0 and expected_size != 0:
+                                log(f"  [!] 服务端无数据, 不写入(避免0KB文件): {rel_path}")
+                                break
+
+                            # 大小校验: 与 CSV 记录不一致则不写, 防止写入半截/错误内容
+                            if expected_size >= 0 and len(file_data) != expected_size:
+                                log(f"  [!] 大小不匹配, 不写入: {rel_path} "
+                                    f"(期望{expected_size}, 实际{len(file_data)})")
+                                break
+
                             target_dir = os.path.dirname(target_path)
                             if not os.path.isdir(target_dir):
                                 try:
@@ -463,13 +1072,24 @@ def _retry_missing_files_inner(
                                 except OSError:
                                     log(f"  [X] 无法创建目录: {target_dir}")
                                     break
+
+                            # 先写 .tmp 再重命名: 中途失败不会留下损坏的目标文件
+                            tmp_path = target_path + ".tmp"
                             try:
-                                with open(target_path, "wb") as fw:
+                                with open(tmp_path, "wb") as fw:
                                     fw.write(file_data)
+                                if os.path.isfile(target_path):
+                                    os.remove(target_path)
+                                os.rename(tmp_path, target_path)
                                 downloaded += 1
                                 partition_downloaded += 1
                             except OSError:
                                 log(f"  [X] 重试写入失败: {rel_path}")
+                                try:
+                                    if os.path.isfile(tmp_path):
+                                        os.remove(tmp_path)
+                                except OSError:
+                                    pass
                             break
 
                 batch_ok = True
@@ -491,8 +1111,11 @@ def _retry_missing_files_inner(
         if not batch_ok:
             log(f"  回退: 逐个下载 {partition}")
             for entry in entries:
-                _, _, drv, rp, tp, _ = entry
-                if _download_one_file_with_retry(server_ip, port, drv, rp, tp, auth_code, log):
+                _, _, drv, rp, tp, exp_sz = entry
+                if _download_one_file_with_retry(
+                    server_ip, port, drv, rp, tp, auth_code, log,
+                    expected_size=exp_sz,
+                ):
                     downloaded += 1
 
     log(f"重试下载完成: 成功恢复 {downloaded}/{len(missing_entries)} 个文件")
@@ -508,8 +1131,13 @@ def _download_one_file_with_retry(
     auth_code: str = "",
     log_callback=None,
     max_retries: int = 3,
+    expected_size: int = -1,
 ) -> bool:
-    """从源设备下载单个文件（带连接重试 + 超时兜底）"""
+    """从源设备下载单个文件（带连接重试 + 超时兜底）
+
+    expected_size >= 0 时做大小校验; 空响应/大小不符一律不落盘,
+    避免在目标盘留下 0KB 或半截的垃圾文件。
+    """
     import time as _time
     for attempt in range(max_retries):
         try:
@@ -519,12 +1147,29 @@ def _download_one_file_with_retry(
             req = urllib.request.urlopen(url, timeout=30, context=_SSL_CTX)
             target_dir = os.path.dirname(target_path)
             os.makedirs(target_dir, exist_ok=True)
-            with open(target_path, "wb") as f:
+            tmp_path = target_path + ".tmp"
+            with open(tmp_path, "wb") as f:
                 while True:
                     chunk = req.read(1024 * 1024)
                     if not chunk:
                         break
                     f.write(chunk)
+            actual_size = os.path.getsize(tmp_path)
+            if actual_size == 0 and expected_size != 0:
+                # 服务端读不到文件返回空响应: 不落盘, 防止 0KB 垃圾文件
+                os.remove(tmp_path)
+                if log_callback:
+                    log_callback(f"  [!] 服务端无数据, 不写入(避免0KB文件): {rel_path}")
+                return False
+            if expected_size >= 0 and actual_size != expected_size:
+                os.remove(tmp_path)
+                if log_callback:
+                    log_callback(f"  [!] 大小不匹配, 不写入: {rel_path} "
+                                 f"(期望{expected_size}, 实际{actual_size})")
+                return False
+            if os.path.isfile(target_path):
+                os.remove(target_path)
+            os.rename(tmp_path, target_path)
             return True
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
             if attempt < max_retries - 1:
@@ -536,9 +1181,23 @@ def _download_one_file_with_retry(
                 if log_callback:
                     log_callback(f"  [X] 下载失败(已重试{max_retries}次): {rel_path} - {e}")
                 return False
-        except Exception:
+        except Exception as e:
+            # 不再静默吞异常: 记录原因, 并清理可能残留的 .tmp
+            if log_callback:
+                log_callback(f"  [X] 下载异常: {rel_path} - {e}")
+            _remove_tmp(target_path)
             return False
     return False
+
+
+def _remove_tmp(target_path: str) -> None:
+    """清理下载失败残留的 .tmp 文件。"""
+    tmp_path = target_path + ".tmp"
+    try:
+        if os.path.isfile(tmp_path):
+            os.remove(tmp_path)
+    except OSError:
+        pass
 
 
 def _download_one_file(
@@ -563,14 +1222,22 @@ def verify_csv(
     max_workers: int = DEFAULT_VERIFY_WORKERS,
     stop_check=None,
     progress_callback=None,
+    target_indices=None,
+    pre_ok_paths: set | None = None,
+    pre_ok_sizes: dict | None = None,
+    fail_list_out: list | None = None,
 ) -> tuple:
     """
     校验 CSV 文件 (多线程) —— 纯校验，不做重试下载
+    fail_list_out: 可选输出列表, 校验失败文件的 (完整路径, 原因) 明细写入其中
+                   (调用方负责清空; run_verification 会在最终根据 CSV 重建)
     csv_path: FullFilelist_DEF.csv 的完整路径
     partition_map: {"D": "I:", "E": "J:", "F": "K:"}  正常盘符→PE盘符(目标设备)
     max_workers: 校验线程数 (默认 12)
     stop_check: callable, 返回 True 时中止校验
     progress_callback: callable(done, total), 每完成一个文件调用一次
+    target_indices: set 或 None。非 None 时只校验这些数据行索引 (二次校验缺失文件用),
+                    其余行保留 CSV 原值直接写回, 不参与统计
     返回: (通过数, 失败数, 跳过数, 总文件数)
     """
     def log(msg):
@@ -582,7 +1249,8 @@ def verify_csv(
     # 读取 CSV
     rows = []
     try:
-        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        enc = _detect_csv_encoding(csv_path)
+        with open(csv_path, "r", encoding=enc, newline="") as f:
             reader = csv.reader(f)
             header = next(reader, None)
             if not header:
@@ -628,20 +1296,78 @@ def verify_csv(
         return 0, 0, 0, 0
 
     total = len(rows)
-    log(f"共 {total} 个文件待校验，使用 {max_workers} 线程并行校验")
+
+    # 结果按原始顺序存储
+    result_map = {}
+
+    # 二次校验模式: 只校验指定索引 (缺失/重试下载的文件), 其余行保留原值直接写回
+    if target_indices is not None:
+        verify_items = [(i, r) for i, r in enumerate(rows) if i in target_indices]
+        for i, r in enumerate(rows):
+            if i not in target_indices:
+                result_map[i] = r
+        work_total = len(verify_items)
+        log(f"共 {work_total} 个缺失文件待二次校验，使用 {max_workers} 线程并行校验")
+    else:
+        verify_items = [(i, r) for i, r in enumerate(rows)]
+        work_total = total
+        log(f"共 {total} 个文件待校验，使用 {max_workers} 线程并行校验")
 
     passed = 0
     failed = 0
     skipped = 0
     stats_lock = threading.Lock()
 
-    # 结果按原始顺序存储
-    result_map = {}
+    # ---- 边传边校验已确认的文件: 直接标记 Y, 跳过磁盘校验 (增量校验) ----
+    # 仅在首轮全量校验时应用 (target_indices 二次校验模式不应用, 缺失文件仍需重检)
+    pre_ok_count = 0
+    if target_indices is None and pre_ok_paths:
+        filtered_items = []
+        for i, r in verify_items:
+            full = r[col_b].strip() if len(r) > col_b else ""
+            if full and full in pre_ok_paths:
+                # 大小复核: 边传边校验记录的大小与磁盘当前大小一致才跳过,
+                # 不一致(传输后被改动/损坏)则转实际校验
+                size_ok = True
+                if pre_ok_sizes and full in pre_ok_sizes:
+                    try:
+                        drive_letter = r[col_a].strip().upper() if len(r) > col_a else ""
+                        pe_drive = ""
+                        if drive_letter and drive_letter in partition_map:
+                            pe_drive = partition_map[drive_letter].rstrip("\\") + "\\"
+                        elif len(full) >= 2 and full[1] == ":":
+                            src = full[0].upper()
+                            raw = partition_map.get(src, "")
+                            pe_drive = raw.rstrip("\\") + "\\" if raw else ""
+                        rel = full[3:] if len(full) >= 2 and full[1] == ":" else full
+                        actual = os.path.join(pe_drive, rel) if pe_drive else full
+                        if os.path.isfile(actual) and os.path.getsize(actual) != pre_ok_sizes[full]:
+                            size_ok = False
+                    except Exception:
+                        size_ok = True  # 无法复核时保持跳过
+                if size_ok:
+                    while len(r) <= col_e:
+                        r.append("")
+                    if not r[col_e]:
+                        r[col_e] = "Y"
+                    result_map[i] = r
+                    pre_ok_count += 1
+                else:
+                    # 大小不一致: 不跳过, 转实际校验
+                    filtered_items.append((i, r))
+            else:
+                filtered_items.append((i, r))
+        if pre_ok_count:
+            verify_items = filtered_items
+            work_total = len(verify_items) + pre_ok_count
+            passed += pre_ok_count
+            log(f"边传边校验已确认 {pre_ok_count} 个文件, 跳过磁盘校验(已复核大小)")
 
     # 多线程校验
+    verify_row_map = {i: r for i, r in verify_items}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
-        for idx, row in enumerate(rows):
+        for idx, row in verify_items:
             future = executor.submit(
                 _verify_single_row,
                 row, idx, col_a, col_b, col_d, col_e, partition_map,
@@ -649,7 +1375,9 @@ def verify_csv(
             )
             futures[future] = idx
 
-        completed_count = [0]
+        completed_count = [pre_ok_count]
+        if pre_ok_count and progress_callback:
+            progress_callback(pre_ok_count, work_total)
         for future in as_completed(futures):
             # 检查是否需要中止
             if stop_check and stop_check():
@@ -657,8 +1385,8 @@ def verify_csv(
                 for f in futures:
                     f.cancel()
                 executor.shutdown(wait=False, cancel_futures=True)
-                log(f"校验已中止: 已校验 {completed_count[0]}/{total}")
-                return passed, failed, skipped, total
+                log(f"校验已中止: 已校验 {completed_count[0]}/{work_total}")
+                return passed, failed, skipped, work_total
 
             try:
                 idx, updated_row, result, log_msg = future.result()
@@ -677,20 +1405,56 @@ def verify_csv(
                 if log_msg and log_callback:
                     log_callback(log_msg)
 
+                # 收集失败文件明细 (供总结页展示)
+                if fail_list_out is not None and result == "N":
+                    _full = ""
+                    try:
+                        if len(updated_row) > col_b:
+                            _full = updated_row[col_b].strip()
+                    except Exception:
+                        pass
+                    _reason = ""
+                    if log_msg:
+                        _reason = log_msg.strip().lstrip("[N]").strip()
+                    fail_list_out.append((_full, _reason))
+
                 # 每完成一个文件回调进度
                 current = completed_count[0]
                 if progress_callback:
-                    progress_callback(current, total)
+                    progress_callback(current, work_total)
 
                 # 每 500 个输出一次进度
                 if current % 500 == 0:
-                    log(f"校验进度: {current}/{total} (通过:{passed}, 失败:{failed}, 跳过:{skipped})")
+                    log(f"校验进度: {current}/{work_total} (通过:{passed}, 失败:{failed}, 跳过:{skipped})")
 
             except Exception as e:
                 with stats_lock:
                     failed += 1
                     completed_count[0] += 1
                 log(f"  [N] 线程异常: {e}")
+                # 异常行也标记 N 并保留, 防止写回丢行导致后续数据错位
+                try:
+                    ex_idx = futures.get(future)
+                    if ex_idx is not None and ex_idx not in result_map:
+                        ex_row = verify_row_map.get(ex_idx)
+                        if ex_row is not None:
+                            while len(ex_row) <= col_e:
+                                ex_row.append("")
+                            ex_row[col_e] = "N"
+                            result_map[ex_idx] = ex_row
+                except Exception:
+                    pass
+                # 异常行也收集为失败明细
+                if fail_list_out is not None:
+                    _full = ""
+                    try:
+                        _ex_idx = futures.get(future)
+                        _ex_row = verify_row_map.get(_ex_idx) if _ex_idx is not None else None
+                        if _ex_row is not None and len(_ex_row) > col_b:
+                            _full = _ex_row[col_b].strip()
+                    except Exception:
+                        pass
+                    fail_list_out.append((_full, f"校验线程异常: {e}"))
 
     # 按原始顺序重组结果
     updated_rows = [result_map[i] for i in range(len(rows)) if i in result_map]
@@ -711,8 +1475,121 @@ def verify_csv(
     except Exception as e:
         log(f"写入 CSV 失败: {e}")
 
-    log(f"\n校验完成: 通过 {passed}, 失败 {failed}, 跳过 {skipped}, 总计 {total}")
-    return passed, failed, skipped, total
+    log(f"\n校验完成: 通过 {passed}, 失败 {failed}, 跳过 {skipped}, 总计 {work_total}")
+    return passed, failed, skipped, work_total
+
+
+# ==================== 校验报告打包 ====================
+
+def _default_appl_dir() -> str:
+    """校验报告默认保存目录 (F:\\Appl, 与导出配置一致)"""
+    return os.path.join("F:\\", "Appl")
+
+
+def package_verifier_report(csv_path: str, log_callback=None) -> tuple:
+    """校验完成后, 将校验结果 CSV 打包为 <设备名>_verifierReport.zip。
+
+    Args:
+        csv_path: 校验后的 FullFilelist_DEF.csv 完整路径 (含 VerifyResult 列)
+        log_callback: 日志回调 (msg: str) -> None
+    Returns:
+        (ok: bool, zip_path: str)
+    """
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    computer_name = os.environ.get("COMPUTERNAME", "UNKNOWN")
+    zip_name = f"{computer_name}_verifierReport.zip"
+    # 保存在 CSV 同目录 (已映射到 PE 下实际盘符)
+    zip_dir = os.path.dirname(csv_path) or _default_appl_dir()
+    zip_path = os.path.join(zip_dir, zip_name)
+
+    log(f"\n正在打包校验报告...")
+    log(f"  源文件: {csv_path}")
+    log(f"  目标文件: {zip_path}")
+
+    try:
+        os.makedirs(zip_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(csv_path, os.path.basename(csv_path))
+        log(f"  校验报告已打包: {zip_name} ({os.path.getsize(zip_path) / 1024:.1f} KB)")
+        return True, zip_path
+    except Exception as e:
+        log(f"  [失败] 校验报告打包异常: {e}")
+        return False, ""
+
+
+def create_unverifi_zip(log_callback=None, save_dir: str = "") -> tuple:
+    """跳过校验时创建空压缩包 <设备名>_Unverifi.zip (仅占位, 无文件内容)。
+
+    Args:
+        log_callback: 日志回调 (msg: str) -> None
+        save_dir: 保存目录, 为空时默认 F:\\Appl
+    Returns:
+        (ok: bool, zip_path: str)
+    """
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    computer_name = os.environ.get("COMPUTERNAME", "UNKNOWN")
+    zip_name = f"{computer_name}_Unverifi.zip"
+    zip_dir = save_dir or _default_appl_dir()
+    zip_path = os.path.join(zip_dir, zip_name)
+
+    log(f"\n跳过校验: 创建空校验报告占位包...")
+    log(f"  目标文件: {zip_path}")
+
+    try:
+        os.makedirs(zip_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            pass  # 空包 (无任何文件)
+        log(f"  空校验报告已创建: {zip_name}")
+        return True, zip_path
+    except Exception as e:
+        log(f"  [失败] 创建空校验报告异常: {e}")
+        return False, ""
+
+
+def _get_failed_paths_from_csv(csv_path: str, partition_map: dict) -> list:
+    """读取最终 CSV, 返回 VerifyResult=N 的文件在目标设备上的完整路径列表"""
+    failed_paths = []
+    try:
+        enc = _detect_csv_encoding(csv_path)
+        with open(csv_path, "r", encoding=enc, newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                return failed_paths
+            try:
+                col_a = header.index("Drive")
+            except ValueError:
+                col_a = 0
+            try:
+                col_b = header.index("FullPath")
+            except ValueError:
+                col_b = 1
+            try:
+                col_e = header.index("VerifyResult") if "VerifyResult" in header else 4
+            except ValueError:
+                col_e = 4
+            for row in reader:
+                if len(row) <= col_e:
+                    continue
+                if row[col_e] != "N":
+                    continue
+                drive = row[col_a] if len(row) > col_a else ""
+                rel_path = row[col_b] if len(row) > col_b else ""
+                pe_drive = partition_map.get(drive, drive) if partition_map else drive
+                if pe_drive and rel_path:
+                    full = os.path.join(pe_drive, rel_path.lstrip("\\/")).replace("/", "\\")
+                else:
+                    full = rel_path or ""
+                failed_paths.append(full)
+    except Exception:
+        pass
+    return failed_paths
 
 
 # ==================== 公开入口 ====================
@@ -729,6 +1606,10 @@ def run_verification(
     auth_code: str = "",
     winpe: bool | None = None,
     csv_path: str = "",
+    report_zip_out=None,
+    pre_ok_paths: set | None = None,
+    pre_ok_sizes: dict | None = None,
+    fail_list_out: list | None = None,
 ) -> tuple:
     """
     执行完整校验流程
@@ -757,14 +1638,25 @@ def run_verification(
 
     try:
         if csv_path and os.path.isfile(csv_path):
-            # 接收端手动指定了 CSV: 直接采用，跳过文件夹自动识别
+            # 1) 接收端手动指定了 CSV: 直接采用
             log(f"使用手动指定的 CSV 文件: {csv_path}")
         else:
-            folder = find_latest_appl_folder(f_drive_pe)
-            log(f"找到最新 Appl 文件夹: {folder}")
+            # 2) 尝试从 systemconfig.ini 自动定位 (与步骤1导出配置联动)
+            csv_path = _find_csv_from_ini(f_drive_pe)
+            if csv_path:
+                log(f"从 systemconfig.ini 定位到 CSV: {csv_path}")
+            else:
+                # 3) 回退: 搜索最新 Appl 文件夹
+                folder = find_latest_appl_folder(f_drive_pe)
+                log(f"找到最新 Appl 文件夹: {folder}")
+                csv_path = find_csv_file(folder)
+                log(f"找到 CSV 文件: {csv_path}")
 
-            csv_path = find_csv_file(folder)
-            log(f"找到 CSV 文件: {csv_path}")
+        # ---- 修复旧版 escape_csv 造成的路径损坏 (全角逗号 → ASCII 逗号) ----
+        # 必须在 GTMC 路径替换之前执行，因为修复的是原始路径
+        # 传入 partition_map: 只有确认"原路径不存在 + 候选路径存在"才改写,
+        # 避免把文件名本身含全角逗号的正确路径改坏
+        _repair_csv_in_place(csv_path, log, partition_map=partition_map)
 
         # 仅当运行在 WinPE 下 (源端会将 GTMC_User_Profiles 重命名为带日期后缀)
         # 且确实检测到新目录名时，才修改 CSV 文件中的路径；
@@ -775,11 +1667,16 @@ def run_verification(
         elif not winpe:
             log("非 WinPE 环境: 源端未重命名 GTMC_User_Profiles，CSV 路径保持原样")
 
-        # ---- 第一轮: 纯校验 ----
+        # ---- 第一轮: 纯校验 (边传边校验已确认的文件直接标记 Y, 跳过磁盘校验) ----
+        if fail_list_out is not None:
+            fail_list_out.clear()
         passed, failed, skipped, total = verify_csv(
             csv_path, partition_map, log_callback,
             max_workers=max_workers, stop_check=stop_check,
             progress_callback=progress_callback,
+            pre_ok_paths=pre_ok_paths,
+            pre_ok_sizes=pre_ok_sizes,
+            fail_list_out=fail_list_out,
         )
 
         # ---- 第二轮: 如果有缺失文件且源设备可达，重试下载 ----
@@ -790,7 +1687,8 @@ def run_verification(
 
             # 解析 CSV 列 (与 verify_csv 内相同逻辑)
             header = []
-            with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            enc = _detect_csv_encoding(csv_path)
+            with open(csv_path, "r", encoding=enc, newline="") as f:
                 reader = csv.reader(f)
                 header = next(reader, None)
 
@@ -816,12 +1714,14 @@ def run_verification(
                     col_e = 4
 
                 # 批量重试下载
+                missing_indices_out = []
                 recovered = _retry_missing_files(
                     server_ip, TRANSFER_PORT,
                     partition_map, csv_path,
                     col_a, col_b, col_d, col_e,
                     log_callback=log,
                     auth_code=auth_code,
+                    missing_indices_out=missing_indices_out,
                 )
 
                 if recovered > 0:
@@ -831,14 +1731,46 @@ def run_verification(
                         log("二次校验已中止")
                         return False, passed, failed, skipped, total
 
-                    # 只对恢复的文件做二次校验 (全量校验也可以，但避免重复扫描)
-                    passed2, failed2, skipped2, total2 = verify_csv(
+                    # 只对缺失(重试下载)的文件做二次校验, 避免全量重复扫描
+                    passed2, failed2, _, _ = verify_csv(
                         csv_path, partition_map, log_callback,
                         max_workers=max_workers,
                         stop_check=stop_check,
                         progress_callback=progress_callback,
+                        target_indices=set(missing_indices_out),
+                        fail_list_out=fail_list_out,
                     )
-                    passed, failed, skipped, total = passed2, failed2, skipped2, total2
+                    # 合并统计 (保持全量视角): 第一次通过/跳过的 + 二次校验恢复的
+                    passed = passed + passed2
+                    failed = failed2
+
+        # ---- 添加文件类型列 (G 列), 帮助用户判断缺失文件重要性 ----
+        if stop_check and stop_check():
+            log("文件类型标记已中止")
+            return True, passed, failed, skipped, total
+        try:
+            add_file_type_column(csv_path, log)
+        except Exception as e:
+            log(f"文件类型标记失败: {e}")
+
+        # ---- 根据最终 CSV 重建失败文件明细 (与最终统计保持一致) ----
+        if fail_list_out is not None:
+            try:
+                final_failed_paths = _get_failed_paths_from_csv(csv_path, partition_map)
+                reason_map = {p: r for p, r in fail_list_out}
+                fail_list_out.clear()
+                for p in final_failed_paths:
+                    fail_list_out.append((p, reason_map.get(p, "校验失败")))
+            except Exception:
+                pass
+
+        # ---- 校验完成后打包校验报告 <设备名>_verifierReport.zip ----
+        try:
+            report_ok, report_zip = package_verifier_report(csv_path, log)
+            if report_ok and isinstance(report_zip_out, list):
+                report_zip_out.append(report_zip)
+        except Exception as e:
+            log(f"打包校验报告异常: {e}")
 
         return True, passed, failed, skipped, total
 
