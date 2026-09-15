@@ -45,6 +45,10 @@ class WinGUI(ttk.Window):
         #        (边传边校验清单增量确认 + 报告打包 + 自动上传)
         self._device_type = None  # "source" or "target"
         self._role_display = "未选择"
+        # 发送端验证码横幅是否应处于显示状态:
+        # 网络中断时 control 会 hide_auth_code() 隐藏它, 此后 go_step(3) 不得再自动
+        # 重新 pack (否则又会出现"上方让输入验证码 / 下方提示网络中断"的矛盾)
+        self._auth_code_visible = False
 
     def __win(self):
         self.title("数据迁移工具")
@@ -291,7 +295,9 @@ class WinGUI(ttk.Window):
         # (页面 pack_forget 切换后可能丢失横幅显示, 这里按需重新 pack)
         if step == 3:
             ctl_type = getattr(getattr(self, 'ctl', None), '_device_type', '')
-            if ctl_type == "源设备" or self._device_type == "source":
+            # 已被 hide_auth_code() 隐藏时 (如网络中断) 不再自动恢复, 以免与错误提示矛盾
+            if (ctl_type == "源设备" or self._device_type == "source") \
+                    and getattr(self, '_auth_code_visible', False):
                 code = getattr(getattr(self, 'ctl', None), '_auth_code', '') or ''
                 self.show_auth_code(code)
         # 根据步骤设置「下一步」按钮默认状态
@@ -734,9 +740,13 @@ class WinGUI(ttk.Window):
         if hasattr(self, '_config_detect_frame'):
             self._config_detect_frame.pack_forget()
 
-    def show_transfer_error(self, message: str):
+    def show_transfer_error(self, message: str, status_text: str = None):
         """步骤 4: 显示传输错误提示（红色醒目区域）
-        同时将传输状态标签改为红色错误文本"""
+        同时将传输状态标签改为红色错误文本。
+
+        status_text: 状态行文案, 必须与 message 描述的故障一致
+                     (未传时沿用默认的"请返回修改验证码", 即接收端验证码填错的情形)。
+        """
         self.tk_label_transfer_error.config(text=message)
         # 错误区放在"显示详细日志"复选框上方 (进度条已隐藏, 不再作为锚点)
         if hasattr(self, '_transfer_error_frame'):
@@ -747,7 +757,7 @@ class WinGUI(ttk.Window):
                 self._transfer_error_frame.pack(fill=X, pady=(0, 10))
         # 状态标签也变红
         self.tk_label_transfer_status.config(
-            text="请返回修改验证码",
+            text=status_text or "请返回修改验证码",
             fg=C_RED,
             font=("Microsoft YaHei UI", 9, "bold"),
         )
@@ -1609,9 +1619,11 @@ class WinGUI(ttk.Window):
                 )
             else:
                 self._auth_banner_frame.pack(fill=X, pady=(0, 8))
+        self._auth_code_visible = True
 
     def hide_auth_code(self):
-        """隐藏验证码横幅 (接收端调用)"""
+        """隐藏验证码横幅 (接收端调用 / 发送端网络中断时调用)"""
+        self._auth_code_visible = False
         if hasattr(self, 'tk_label_auth_code'):
             self.tk_label_auth_code.config(text="----")
         if hasattr(self, 'tk_label_src_status'):

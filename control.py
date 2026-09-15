@@ -25,6 +25,44 @@ DHCP_ASSIGNED_IP = "169.254.100.2"  # DHCP 分配给源设备的 IP
 # 之间最长约 30 秒 (边传边校验收尾 join), 取 45 秒留足余量, 避免正常收尾被误判为断开
 SOURCE_IDLE_TIMEOUT = 45.0
 
+# ==================== 传输异常提示文案 ====================
+# 规则:
+#   1) 状态行 (tk_label_transfer_status) 与红色错误区必须讲同一件事 —— 不允许出现
+#      "状态行说请修改验证码 / 错误区说网络中断" 这类自相矛盾;
+#   2) 文案里提到的操作必须是当前界面真实可点的 (传输页 step3 的"开始传输/开始接收"
+#      按钮是隐藏的, 因此统一引导用户点左下角「< 上一步」返回后重试);
+#   3) 网络中断时源端必须隐藏验证码横幅, 否则会出现"上方让输入验证码 / 下方又说
+#      网络已中断" 的矛盾提示。
+NET_LOST_TITLE = "网络连接已中断，传输未完成"
+NET_LOST_MSG_SRC = (
+    "网络连接已中断，传输未完成。请检查两台设备之间的网线是否插紧"
+    "（网口指示灯是否亮起）；确认连接恢复后，点击左下角「< 上一步」返回，"
+    "重新点击「开始传输」即可。若反复中断，请依次关闭新旧设备上的本程序后重新运行。"
+)
+NET_LOST_MSG_TGT = (
+    "网络连接已中断，传输未完成。请检查两台设备之间的网线是否插紧"
+    "（网口指示灯是否亮起）；确认连接恢复后，点击左下角「< 上一步」返回，"
+    "重新点击「开始接收」即可。若反复中断，请依次关闭新旧设备上的本程序后重新运行。"
+)
+# 验证码错误 (源端视角: 对方填错, 本机无需操作, 继续等待)
+AUTH_FAIL_TITLE = "等待新设备重新输入正确的验证码"
+AUTH_FAIL_MSG_SRC = (
+    "验证码错误：新设备填写的验证码与本机显示的不一致。请在新设备上核对本机显示的 "
+    "4 位验证码（字母不区分大小写）后重新输入并点击「开始接收」。"
+    "本机无需任何操作，会继续等待新设备连接。"
+)
+# 验证码错误 (接收端视角: 本机填错, 需返回修改)
+AUTH_FAIL_MSG_TGT = (
+    "验证码错误：请填写旧设备（发送端）屏幕上显示的 4 位验证码"
+    "（字母不区分大小写），再重新点击「开始接收」。"
+)
+# 传输中途失败 (部分文件未传完, 可能由网络中断引起)
+TRANSFER_INCOMPLETE_TITLE = "传输未完成，请检查网络后重新接收"
+TRANSFER_INCOMPLETE_MSG = (
+    "传输未完成：部分文件未能传输完毕。请检查两台设备之间的网线是否插紧"
+    "（网口指示灯是否亮起），确认后点击左下角「< 上一步」返回，重新点击「开始接收」。"
+)
+
 # ==================== 用户协议 (EULA) ====================
 EULA_URL = "http://qitv1113.gtmcl.com:3000/eula.html"  # 应用启动后用默认浏览器打开
 
@@ -1573,20 +1611,12 @@ class Controller:
             self.ui.unlock_screen()
         except Exception:
             pass
-        self._set_status("接收端输入的验证码有误，请在两台设备上确认验证码一致后重试")
+        # 验证码错误: 保留验证码横幅 (供两端对照), 状态行与错误区文案保持一致
         try:
-            self.ui.show_transfer_error(
-                "接收端输入的验证码有误——请在两台设备上确认验证码一致后重新接收"
-            )
+            self.ui.show_transfer_error(AUTH_FAIL_MSG_SRC, status_text=AUTH_FAIL_TITLE)
         except Exception:
             pass
-        # show_transfer_error 会把状态标签写为"请返回修改验证码", 此处细化为验证码错误文案
-        try:
-            self.ui.tk_label_transfer_status.config(
-                text=" 接收端输入的验证码有误，请在两台设备上确认验证码一致后重新接收"
-            )
-        except Exception:
-            pass
+        self._set_status(AUTH_FAIL_TITLE)
         self._log("接收端输入的验证码有误，已提示；保持服务器运行，等待接收端修正验证码后重试")
         # 不停止服务器/不进入完成页: 继续轮询, 接收端修正验证码重试后即恢复正常
         self._source_done_after = self.ui.after(2000, self._poll_source_done)
@@ -1598,18 +1628,32 @@ class Controller:
                 or getattr(self, "_source_interrupted_marked", False)):
             return
         self._source_interrupted_marked = True
+        # 结束本轮传输状态并停掉完成轮询: 否则 _transferring 一直为 True,
+        # 用户按提示返回后点"开始传输"会被"传输正在进行中"直接拦下, 无法重传
+        self._transferring = False
+        if getattr(self, "_source_done_after", None):
+            try:
+                self.ui.after_cancel(self._source_done_after)
+            except Exception:
+                pass
+            self._source_done_after = None
         try:
             self.ui.unlock_screen()
         except Exception:
             pass
         self._set_progress(0)
-        self._set_status("与接收端的连接已中断，传输未完成")
+        # 网络已中断: 先隐藏验证码横幅 —— 断网时"请在新设备上输入此验证码"已无意义,
+        # 否则会出现"上方提示输入验证码 / 下方提示网络中断"的矛盾画面
         try:
-            self.ui.show_transfer_error(
-                "与接收端的连接已中断——请依次关闭新旧设备上的磁盘拷贝应用程序，检查并确认网线物理连接正常后，再重新启动应用"
-            )
+            self.ui.hide_auth_code()
         except Exception:
             pass
+        try:
+            self.ui.show_transfer_error(NET_LOST_MSG_SRC, status_text=NET_LOST_TITLE)
+        except Exception:
+            pass
+        # 状态行写在 show_transfer_error 之后, 确保两处文案一致
+        self._set_status(NET_LOST_TITLE)
         # 恢复"重新启动传输"按钮
         try:
             self.ui.tk_button_mqfzl35t.config(text="重新启动传输", state="normal")
@@ -1622,7 +1666,7 @@ class Controller:
                 self._file_server = None
         except Exception:
             pass
-        self._log("与接收端的连接已中断，传输未完成，请检查网线后重新启动应用")
+        self._log("与接收端的连接已中断，传输未完成；已隐藏验证码提示，请检查网线后重新开始传输")
 
     def _on_source_done_close(self):
         """发送端完成页「完成并关闭」/ 底部「完成」: 清理后台并退出程序"""
@@ -1733,10 +1777,8 @@ class Controller:
             self.ui.unlock_screen()
         except Exception:
             pass
-        self.ui.show_transfer_error(
-            "网络连接已中断——请依次关闭新旧设备上的磁盘拷贝应用程序，检查并确认网线物理连接正常后，再重新启动应用"
-        )
-        self._set_status("网络连接已中断——请依次关闭新旧设备上的磁盘拷贝应用程序，检查并确认网线物理连接正常后，再重新启动应用")
+        self.ui.show_transfer_error(NET_LOST_MSG_TGT, status_text=NET_LOST_TITLE)
+        self._set_status(NET_LOST_TITLE)
         if hasattr(self.ui, 'tk_button_mqfzl35t'):
             try:
                 self.ui.tk_button_mqfzl35t.config(text="重新接收", state="normal")
@@ -2020,9 +2062,8 @@ class Controller:
             self.ui.hide_config_detect()
             self.ui.set_button_next("disabled")
             self.ui.set_button_prev("normal", text="< 返回")
-            self.ui.show_transfer_error(
-                "网络连接已中断——请依次关闭新旧设备上的磁盘拷贝应用程序，检查并确认网线物理连接正常后，再重新启动应用"
-            )
+            self.ui.show_transfer_error(NET_LOST_MSG_TGT, status_text=NET_LOST_TITLE)
+            self._set_status(NET_LOST_TITLE)
             self.ui.tk_button_mqfzl35t.config(text="重新接收", state="normal")
             if hasattr(self, "_dhcp_server") and self._dhcp_server:
                 self._dhcp_server.stop()
@@ -2043,7 +2084,7 @@ class Controller:
                 self.ui.set_button_prev("normal", text="< 返回修改验证码")
                 # 显示醒目红色错误提示
                 self.ui.show_transfer_error(
-                    "验证码错误 — 请输入正确的验证码后重新连接"
+                    AUTH_FAIL_MSG_TGT, status_text="请返回修改验证码"
                 )
             else:
                 self.ui.set_button_prev("normal")
@@ -2068,8 +2109,9 @@ class Controller:
             self.ui.set_button_next("disabled")
             self.ui.set_button_prev("normal", text="< 返回")
             self.ui.show_transfer_error(
-                "传输未完成——请检查网络连接是否中断，确认后重新接收"
+                TRANSFER_INCOMPLETE_MSG, status_text=TRANSFER_INCOMPLETE_TITLE
             )
+            self._set_status(TRANSFER_INCOMPLETE_TITLE)
             self.ui.tk_button_mqfzl35t.config(text="重新接收", state="normal")
             if hasattr(self, "_dhcp_server") and self._dhcp_server:
                 self._dhcp_server.stop()
